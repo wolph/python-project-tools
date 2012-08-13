@@ -10,5 +10,11 @@ if __name__ == '__main__':
 
 from ..plugins import plugins
 
-print plugins
+__all__ = ['plugins']
+
+def main():
+    pass
+
+def get_subparsers(subparser):
+    subparser.set_defaults(func=main)
 

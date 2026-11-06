@@ -85,6 +85,6 @@ A 404 means PyPI has none for that file. That is expected for anything uploaded 
 
 ## What "Signed on <date>" means
 
-Backfilled releases end with a footer such as "Signed on 2026-11-06 with ppt sign, after the release". It says the files were signed on that date, not on the day of the release.
+Releases signed with `ppt sign` end with a footer such as "Signed on 2026-11-06 with ppt sign, after the release". It says the files were signed on that date, not on the day of the release.
 
 The signature therefore proves that the files were the PyPI uploads when they were signed, and that they have not changed since. It does not prove who built them at the time. The Sigstore transparency log records when the bundle was made, so the date in the footer cannot be moved backwards without the log disagreeing.

@@ -1463,13 +1463,15 @@ def test_no_latest_after_the_first_release_stops_the_run(
     assert [created[0] for created in world.created] == ['v1.0']
 
 
-def test_a_failing_target_stops_before_any_other_release(
+def test_a_target_that_fails_before_a_release_falls_through(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     world: World = run_empty_repo(
-        monkeypatch, [None, None], release_tags=False
+        monkeypatch,
+        [None, 'v0.2', 'v0.2', 'v0.2'],
+        release_tags=False,
     )
 
     def download(file: pypi.PypiFile, into: pathlib.Path) -> pathlib.Path:
@@ -1478,67 +1480,166 @@ def test_a_failing_target_stops_before_any_other_release(
         return into / file.filename
 
     monkeypatch.setattr(pypi, 'download', download)
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert '| 1.0 |' in captured.out
+    assert 'tag creation failed: sha256 mismatch' in captured.out
+    assert [created[0] for created in world.created] == [
+        'v0.2',
+        'v0.1',
+        'v0.9rc1',
+    ]
+    assert 'target: v0.2' in captured.out
+
+
+def test_a_target_failing_after_its_release_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = run_empty_repo(monkeypatch, [None, 'v1.0', 'v1.0'])
+
+    def upload_raises(
+        release: github.Release,
+        files: Files,
+        workdir: pathlib.Path,
+        options: sign.SignOptions,
+    ) -> sign.SignOutcome:
+        raise RuntimeError('upload failed')
+
+    monkeypatch.setattr(sign, 'sign_release', upload_raises)
     assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
-    reason: str = (
-        'target 1.0 could not be released first, nothing else created'
-    )
+    reason: str = 'target 1.0 failed after its release was created, stopping'
     captured = capsys.readouterr()
     assert reason in captured.err
     assert f'Stopped: {reason}' in captured.out
-    assert not world.created
+    assert [created[0] for created in world.created] == ['v1.0']
     assert not world.new_tags
-    assert not world.pushed
-    assert not world.signed
     assert not world.marked
     lines: list[str] = [
         line for line in captured.out.splitlines() if line.startswith('| ')
     ]
     # Header, separator, the target, then the three skipped plans.
     assert len(lines) == 6
-    assert '| 1.0 |' in lines[2]
-    assert 'tag creation failed: sha256 mismatch' in lines[2]
+    assert 'release failed: upload failed' in lines[2]
     for line, version in zip(lines[3:], ('0.1', '0.2', '0.9rc1'), strict=True):
         assert line.startswith(f'| {version} |')
         assert '| skipped |' in line
         assert reason in line
 
 
-def test_an_unmatched_target_never_creates_the_untagged_anchor(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    world: World = run_empty_repo(
-        monkeypatch, [None, None], release_tags=False
-    )
-    world.match_sha = None
-    report: backfill.BackfillReport = backfill.run_backfill(
-        'spam', options(tmp_path)
-    )
-    assert report.stopped == (
-        'target 1.0 could not be released first, nothing else created'
-    )
-    assert backfill._exit_status(report) == 2
-    assert not world.created
-    assert not world.new_tags
-    assert [plan.version for plan, _, _ in report.rows] == [
-        '1.0',
-        '0.1',
-        '0.2',
-        '0.9rc1',
-    ]
-    assert all(outcome is None for _, outcome, _ in report.rows)
-    assert report.rows[0][2] == backfill.NO_TARGET_REASON
-
-
-def test_a_target_whose_release_workflow_fires_stops_the_run(
+def test_a_target_whose_release_call_raises_stops_the_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     world: World = run_empty_repo(monkeypatch, [None, None])
+
+    def create_raises(*args: object) -> github.Release:
+        world.created.append((str(args[1]), '', '', False))
+        raise common.FetchError('gateway timeout')
+
+    monkeypatch.setattr(github, 'create_release', create_raises)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert report.stopped.startswith('target 1.0 failed after its release')
+    assert backfill._exit_status(report) == 2
+    assert [created[0] for created in world.created] == ['v1.0']
+
+
+def test_untagged_candidates_fall_through_and_join_the_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Sphinx-PyPI-upload-2: 0.2.2 is on PyPI only and matches no commit."""
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'0.2.2': files_of('0.2.2')})
+    tagged(world, '0.1', '0.1.1', '0.2', '0.2.1')
+    world.match_sha = None
+    # Before the run, after 0.2.1, before marking, after the run.
+    world.latest = [None, 'v0.2.1', 'v0.2.1', 'v0.2.1']
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    expected: list[str] = [
+        'v0.2.1',
+        'v0.1',
+        'v0.1.1',
+        'v0.2',
+        backfill.UNTAGGED_TAG,
+    ]
+    assert [created[0] for created in world.created] == expected
+    assert [signed[0].tag for signed in world.signed] == expected
+    assert world.rebuilt == ['v0.2.1', 'v0.1', 'v0.1.1', 'v0.2']
+    assert world.downloads == ['spam-0.2.2.tar.gz']
+    assert world.marked == []
+    assert world.latest == []
+    printed: str = capsys.readouterr().out
+    rows: list[str] = [
+        line for line in printed.splitlines() if line.startswith('| 0')
+    ]
+    assert [row.split(' | ')[0] for row in rows] == [
+        '| 0.2.1',
+        '| 0.1',
+        '| 0.1.1',
+        '| 0.2',
+        '| 0.2.2',
+    ]
+    assert 'Latest before: none, after: v0.2.1, target: v0.2.1' in printed
+    assert printed.rstrip().endswith('OK')
+
+
+def test_a_candidate_is_never_processed_twice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'0.2.2': files_of('0.2.2')})
+    tagged(world, '0.1', '0.2.1')
+    world.match_sha = None
+    world.latest = [None, 'v0.2.1', 'v0.2.1', 'v0.2.1']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    versions_seen: list[str] = [plan.version for plan, _, _ in report.rows]
+    assert versions_seen == ['0.2.1', '0.1', '0.2.2']
+    assert len(world.created) == 3
+
+
+def test_no_candidate_with_a_commit_makes_the_anchor_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    anchor: str = backfill.UNTAGGED_TAG
+    world: World = run_empty_repo(
+        monkeypatch, [None, anchor, anchor, anchor], release_tags=False
+    )
+    world.match_sha = None
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert [created[0] for created in world.created] == [anchor]
+    assert world.pushed == [anchor]
+    assert world.marked == []
+    printed: str = capsys.readouterr().out
+    assert f'Latest before: none, after: {anchor}, target: {anchor}' in printed
+    assert printed.rstrip().endswith('OK')
+
+
+def test_every_candidate_refused_by_a_workflow_creates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = run_empty_repo(monkeypatch, [None, None, None])
     world.release_workflows = ['.github/workflows/publish.yml']
     report: backfill.BackfillReport = backfill.run_backfill(
         'spam', options(tmp_path)
     )
-    assert report.stopped.startswith('target 1.0 could not be released first')
+    assert not report.stopped
     assert not world.created
+    assert report.latest_target is None
+    assert backfill._exit_status(report) == 1
+    assert [plan.version for plan, _, _ in report.rows] == [
+        '1.0',
+        '0.2',
+        '0.1',
+        '0.9rc1',
+    ]
     assert report.rows[0][2] == (
         'release would fire publish.yml at the tagged commit'
     )
@@ -1599,7 +1700,7 @@ def test_dry_run_prints_the_target_and_the_order_first(
     world: World = run_empty_repo(monkeypatch, [None, None])
     backfill.run_backfill('spam', options(tmp_path, dry_run=True))
     lines: list[str] = capsys.readouterr().out.splitlines()
-    assert lines[0] == 'target: v1.0'
+    assert lines[0] == 'target candidates: 1.0, 0.2, 0.1'
     assert lines[1] == 'order: 1.0, 0.1, 0.2, 0.9rc1'
     assert not world.created
     assert world.latest == []

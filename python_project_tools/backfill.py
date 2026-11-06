@@ -8,8 +8,12 @@ tag. The release marked latest on GitHub never changes. GitHub marks the
 first stable release of an empty repository as latest whatever
 ``--latest=false`` says, so a repository with no latest release releases its
 highest stable version first, and a run stops when the latest release is
-anything else after the first release it created. The target is marked
-latest at the end when GitHub does not report it already. The
+anything else after the first release it created. The target is the
+highest stable version that gets a release of its own: a version whose
+commit cannot be matched joins the untagged anchor and the next one down is
+tried, and only a failure after a release was created stops the run. The
+anchor is the target when no version gets its own release. The target is
+marked latest at the end when GitHub does not report it already. The
 Sigstore bundles of every release are made in one sigstore invocation per
 100 files after the loop. Call the other modules through their attributes
 (``github.create_release``, ``sign.sign_release``) so tests can replace
@@ -66,10 +70,13 @@ LATEST_NOT_TARGET: str = (
     'after creating {created} GitHub reports Latest {actual}, '
     'expected {expected}, stopping'
 )
-TARGET_NOT_RELEASED: str = (
-    'target {version} could not be released first, nothing else created'
+TARGET_FAILED: str = (
+    'target {version} failed after its release was created, stopping'
 )
-NO_TARGET_REASON: str = 'no tag matched and no release was made'
+# What became of a Latest candidate.
+RELEASED: str = 'released'
+FELL_THROUGH: str = 'fell through'
+FAILED_AFTER_CREATING: str = 'failed after creating'
 # Files per sigstore invocation. Each invocation is one browser login.
 SIGSTORE_CHUNK: int = 100
 SUMS_DIR: str = 'sums'
@@ -163,8 +170,8 @@ class LatestMarkedError(RunStoppedError):
     """GitHub's Latest is not the release this run wanted it to be."""
 
 
-class TargetNotReleasedError(RunStoppedError):
-    """The Latest target failed before its release existed."""
+class TargetFailedError(RunStoppedError):
+    """The Latest target failed after its release may have been created."""
 
 
 Row = tuple[Plan, sign.SignOutcome | None, str]
@@ -194,10 +201,13 @@ class _Run:
     latest_before: str | None = None
     untagged: list[Plan] = dataclasses.field(default_factory=list)
     rows: list[Row] = dataclasses.field(default_factory=list)
-    # The plan that must become Latest, chosen before the loop when the
-    # repository has no Latest release.
+    # The plan that must become Latest. With no Latest release it is the
+    # candidate being tried, then the one that got its own release, or the
+    # untagged anchor when no candidate did.
     target: Plan | None = None
     created_any: bool = False
+    # Tags a release was requested for, whether or not the call returned.
+    attempted: set[str] = dataclasses.field(default_factory=set)
     pending: list[_Pending] = dataclasses.field(default_factory=list)
     disabled_workflows: set[str] | None = None
 
@@ -509,6 +519,7 @@ def _create_release(
     that is where GitHub promotes the first stable release despite
     --latest=false, so it must be the target.
     """
+    run.attempted.add(tag)
     created: github.Release = github.create_release(
         run.options.repo, tag, title, notes, prerelease
     )
@@ -905,53 +916,117 @@ def _stopping(run: _Run, plan: Plan, error: RunStoppedError) -> None:
     _add_row(run, (plan, None, str(error)))
 
 
-def _target_released(run: _Run, plan: Plan) -> bool:
-    return plan.tag is not None and plan.tag in run.releases
+def _verdict(run: _Run, plan: Plan, outcome: sign.SignOutcome | None) -> str:
+    """What became of a candidate that was processed.
+
+    A release this run requested that is missing or whose signing failed
+    may have left a release that is not Latest, so only a candidate that
+    created nothing falls through to the next one.
+    """
+    tag: str | None = plan.tag
+    if tag is None:
+        return FELL_THROUGH
+    if tag in run.attempted:
+        failed: bool = outcome is None or outcome.status == 'failed'
+        if tag not in run.releases or failed:
+            return FAILED_AFTER_CREATING
+        return RELEASED
+    return RELEASED if tag in run.releases else FELL_THROUGH
 
 
-def _stop_unreleased_target(
-    run: _Run, plan: Plan, note: str, rest: list[Plan]
+def _stop_failed_target(
+    run: _Run,
+    plan: Plan,
+    outcome: sign.SignOutcome | None,
+    note: str,
+    rest: list[Plan],
 ) -> None:
     """Record the failed target and skip every other plan, then stop.
 
-    Anything created now could become Latest in the target's place.
+    Anything created now could become Latest in the target's place. Plans
+    already sent to the untagged group get a skipped row as well.
     """
-    reason: str = TARGET_NOT_RELEASED.format(version=plan.version)
-    _add_row(run, (plan, None, note or NO_TARGET_REASON))
-    for other in rest:
+    reason: str = TARGET_FAILED.format(version=plan.version)
+    _add_row(run, (plan, outcome, note))
+    for other in [*run.untagged, *rest]:
         _add_row(run, (other, None, reason))
-    raise TargetNotReleasedError(reason)
+    raise TargetFailedError(reason)
 
 
-def _loop(run: _Run, plans: list[Plan]) -> None:
+def _step(run: _Run, plan: Plan) -> tuple[sign.SignOutcome | None, str]:
+    """Process one plan, recording the plan that stopped the run."""
+    try:
+        return _process_plan(run, plan)
+    except RunStoppedError as error:
+        _stopping(run, plan, error)
+        raise
+
+
+def _record(
+    run: _Run, plan: Plan, outcome: sign.SignOutcome | None, note: str
+) -> None:
+    """Queue an untagged version for the anchor, else add its row."""
+    if plan.tag_action == 'untagged' and plan.files_source == 'pypi':
+        run.untagged.append(plan)
+        return
+    _add_row(run, (plan, outcome, note))
+
+
+def _release_target(
+    run: _Run, plans: list[Plan], candidates: list[Plan]
+) -> list[Plan]:
+    """Try the candidates from the highest down until one has its release.
+
+    Returns the plans left for the oldest first pass. A candidate that
+    created nothing (no matching commit, no files, a workflow refusal)
+    falls through. A candidate that failed after creating something stops
+    the run. Without a winner the target is cleared.
+    """
+    tried: list[Plan] = []
+    for plan in candidates:
+        run.target = plan
+        outcome, note = _step(run, plan)
+        tried.append(plan)
+        verdict: str = _verdict(run, plan, outcome)
+        rest: list[Plan] = [p for p in plans if all(p is not t for t in tried)]
+        if verdict == FAILED_AFTER_CREATING:
+            _stop_failed_target(run, plan, outcome, note, rest)
+        _record(run, plan, outcome, note)
+        if verdict == RELEASED:
+            return rest
+    run.target = None
+    return [p for p in plans if all(p is not t for t in tried)]
+
+
+def _finish_untagged(run: _Run) -> None:
+    """Release the untagged anchor last, as the target when nothing else is."""
+    if not run.untagged:
+        return
+    group: Plan = _untagged_group(run)
+    if run.target is None and run.latest_before is None:
+        run.target = group
+    try:
+        row: Row = _handle_untagged(run, group)
+    except RunStoppedError as error:
+        _stopping(run, group, error)
+        raise
+    _add_row(run, row)
+
+
+def _loop(run: _Run, plans: list[Plan], candidates: list[Plan]) -> None:
     """Process every plan into ``run.rows``, then the untagged group.
 
-    A RunStoppedError stops the loop with the rows so far kept.
+    A RunStoppedError stops the loop with the rows so far kept. A dry run
+    only orders the plans, it cannot know which candidate would win.
     """
-    for index, plan in enumerate(plans):
-        try:
-            outcome, note = _process_plan(run, plan)
-        except RunStoppedError as error:
-            _stopping(run, plan, error)
-            raise
-        if (
-            plan is run.target
-            and not run.options.dry_run
-            and not _target_released(run, plan)
-        ):
-            _stop_unreleased_target(run, plan, note, plans[index + 1 :])
-        if plan.tag_action == 'untagged' and plan.files_source == 'pypi':
-            run.untagged.append(plan)
-            continue
-        _add_row(run, (plan, outcome, note))
-    if run.untagged:
-        group: Plan = _untagged_group(run)
-        try:
-            row: Row = _handle_untagged(run, group)
-        except RunStoppedError as error:
-            _stopping(run, group, error)
-            raise
-        _add_row(run, row)
+    if run.options.dry_run:
+        rest: list[Plan] = _first_candidate_first(plans, candidates)
+    else:
+        rest = _release_target(run, plans, candidates)
+    for plan in rest:
+        outcome, note = _step(run, plan)
+        _record(run, plan, outcome, note)
+    _finish_untagged(run)
 
 
 def _chunks(paths: list[pathlib.Path], size: int) -> list[list[pathlib.Path]]:
@@ -1075,49 +1150,55 @@ def _is_stable(plan: Plan) -> bool:
     return not plan.prerelease and not plan.yanked
 
 
-def _pick_target(plans: list[Plan]) -> Plan | None:
-    """The highest stable plan that has files and its own tag.
+def _candidates(run: _Run, plans: list[Plan]) -> list[Plan]:
+    """The Latest candidates, highest first, when there is no Latest yet.
 
-    A plan without a tag and without files can only join the untagged
-    anchor, which never becomes the target.
+    GitHub marks the first stable release of an empty repository Latest, so
+    that release must be the target. A candidate is a stable plan with
+    files (PyPI or a rebuild). Whether it gets a release of its own is only
+    known once it ran, see ``_release_target``. A repository with a Latest
+    release keeps its order and its Latest.
     """
+    if run.latest_before is not None:
+        return []
     candidates: list[Plan] = [
         plan
         for plan in plans
-        if _is_stable(plan)
-        and plan.files_source != 'none'
-        and plan.tag_action != 'untagged'
+        if _is_stable(plan) and plan.files_source != 'none'
     ]
+    return sorted(
+        candidates,
+        key=lambda plan: versions.sort_key(plan.version),
+        reverse=True,
+    )
+
+
+def _first_candidate_first(
+    plans: list[Plan], candidates: list[Plan]
+) -> list[Plan]:
+    """The order when the top candidate gets its release."""
     if not candidates:
-        return None
-    return max(candidates, key=lambda plan: versions.sort_key(plan.version))
-
-
-def _order_plans(run: _Run, plans: list[Plan]) -> list[Plan]:
-    """Choose the target and put it first when there is no Latest yet.
-
-    GitHub marks the first stable release of an empty repository Latest, so
-    that release must be the target. The rest keep the oldest first order.
-    A repository with a Latest release keeps its order and its Latest.
-    """
-    if run.latest_before is not None:
         return plans
-    run.target = _pick_target(plans)
-    if run.target is None:
-        return plans
-    return [run.target, *(plan for plan in plans if plan is not run.target)]
+    return [candidates[0], *(p for p in plans if p is not candidates[0])]
 
 
-def _announce(run: _Run, plans: list[Plan]) -> None:
-    """Print the target and the processing order of a dry run."""
-    if run.target is not None:
-        tag: str = run.target.tag or versions.tag_for(run.target.version)
-        _say(f'target: {tag}')
+def _announce(run: _Run, plans: list[Plan], candidates: list[Plan]) -> None:
+    """Print the target candidates and the order of a dry run."""
+    if candidates:
+        _say(
+            'target candidates: '
+            + ', '.join(plan.version for plan in candidates)
+        )
     elif run.latest_before is not None:
         _say(f'target: {run.latest_before} (the existing Latest)')
     else:
         _say('target: none')
-    _say('order: ' + ', '.join(plan.version for plan in plans))
+    _say(
+        'order: '
+        + ', '.join(
+            plan.version for plan in _first_candidate_first(plans, candidates)
+        )
+    )
 
 
 def _mark_target(run: _Run) -> str | None:
@@ -1142,11 +1223,11 @@ def _execute(run: _Run, plans: list[Plan]) -> tuple[str, str | None]:
 
     Returns why the run stopped (empty when it did not) and the target.
     """
-    ordered: list[Plan] = _order_plans(run, plans)
+    candidates: list[Plan] = _candidates(run, plans)
     if run.options.dry_run:
-        _announce(run, ordered)
+        _announce(run, plans, candidates)
     try:
-        _loop(run, ordered)
+        _loop(run, plans, candidates)
         _sign_pending(run)
     except RunStoppedError as error:
         return str(error), run.latest_before

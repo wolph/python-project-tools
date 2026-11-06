@@ -1027,13 +1027,18 @@ def _process_plan(
 
 
 def _anchor_sha(run: PackageRun) -> str:
+    """A root commit of the history GitHub has, never of a local branch."""
     done = common.run(
-        ['git', 'rev-list', '--max-parents=0', 'HEAD'],
+        [
+            *('git', 'rev-list', '--max-parents=0'),
+            *remote_tags.GITHUB_GLOBS,
+        ],
         cwd=run.options.checkout,
     )
     roots: list[str] = done.stdout.split()
     if done.returncode != 0 or not roots:
-        raise RuntimeError(f'git rev-list: {done.stderr.strip()}')
+        reason: str = done.stderr.strip() or 'no root commit on GitHub'
+        raise RuntimeError(f'git rev-list: {reason}')
     return roots[-1]
 
 

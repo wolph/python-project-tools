@@ -7,6 +7,11 @@ are fetched into ``refs/ppt/remote-tags/`` instead, with a forced refspec
 that only ever writes there: ``refs/tags/`` of the checkout is never
 written, moved or pruned. Every decision reads the private refs. Call
 ``common.run`` through the module so tests can replace it.
+
+GitHub's branches are mirrored the same way into ``refs/remotes/origin/``.
+Together with the private tag refs they are the only history a tag may be
+placed on: a commit that only a local branch, the stash or a local tag
+reaches is not on GitHub, and a pushed tag would publish it.
 """
 
 from __future__ import annotations
@@ -31,6 +36,22 @@ FETCH: tuple[str, ...] = (
     *('git', 'fetch', '--no-tags', '--prune', '--no-prune-tags'),
     *('origin', REFSPEC),
 )
+# The branches of GitHub, fetched without tags. The explicit refspec does
+# not depend on remote.origin.fetch, and --no-prune-tags keeps
+# fetch.pruneTags from adding refs/tags/*:refs/tags/* to it.
+BRANCH_REFSPEC: str = '+refs/heads/*:refs/remotes/origin/*'
+FETCH_BRANCHES: tuple[str, ...] = (
+    *('git', 'fetch', '--no-tags', '--prune', '--no-prune-tags'),
+    *('origin', BRANCH_REFSPEC),
+)
+REMOTE_BRANCHES: str = 'refs/remotes/origin'
+# Everything GitHub is known to have: its branches and its tags.
+GITHUB_NAMESPACES: tuple[str, ...] = (REMOTE_BRANCHES, REMOTE_TAGS)
+# For git log and git rev-list: nothing but GitHub's refs, never --all.
+GITHUB_GLOBS: tuple[str, ...] = tuple(
+    f'--glob={namespace}/*' for namespace in GITHUB_NAMESPACES
+)
+NOT_ON_GITHUB: str = 'commit {sha7} is not on GitHub, not tagging it'
 DIFFER_LIMIT: int = 10
 DIFFER_NOTE: str = 'local tags differ from GitHub: {names}'
 
@@ -40,13 +61,51 @@ def ref(name: str) -> str:
     return f'{REMOTE_TAGS}/{name}'
 
 
-def fetch(checkout: pathlib.Path) -> None:
-    """Mirror the tags of origin into REMOTE_TAGS, raising on failure."""
+def _fetch(checkout: pathlib.Path, command: tuple[str, ...]) -> None:
+    """Run one fetch command, raising with its stderr on failure."""
     done: subprocess.CompletedProcess[str] = common.run(
-        list(FETCH), cwd=checkout
+        list(command), cwd=checkout
     )
     if done.returncode != 0:
-        raise RuntimeError(f'{" ".join(FETCH)}: {done.stderr.strip()}')
+        raise RuntimeError(f'{" ".join(command)}: {done.stderr.strip()}')
+
+
+def fetch(checkout: pathlib.Path) -> None:
+    """Mirror the tags and branches of origin, raising on failure.
+
+    Tags go into REMOTE_TAGS, branches into ``refs/remotes/origin/``.
+    Neither fetch writes, moves or prunes ``refs/tags/``.
+    """
+    _fetch(checkout, FETCH)
+    _fetch(checkout, FETCH_BRANCHES)
+
+
+def on_github(checkout: pathlib.Path, sha: str) -> bool:
+    """Whether a commit is reachable from a ref GitHub is known to have.
+
+    Reachable from ``refs/remotes/origin/*`` or the private tag refs. A
+    commit that only a local branch, the stash or a local tag reaches is
+    not, and tagging it would publish it.
+    """
+    done: subprocess.CompletedProcess[str] = common.run(
+        [
+            *('git', 'for-each-ref', '--format=%(refname)'),
+            *('--contains', sha),
+            *GITHUB_NAMESPACES,
+        ],
+        cwd=checkout,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(
+            f'git for-each-ref --contains {sha}: {done.stderr.strip()}'
+        )
+    return bool(done.stdout.strip())
+
+
+def require_on_github(checkout: pathlib.Path, sha: str) -> None:
+    """Raise RuntimeError unless the commit is on GitHub, see on_github."""
+    if not on_github(checkout, sha):
+        raise RuntimeError(NOT_ON_GITHUB.format(sha7=sha[:7]))
 
 
 def _verify(checkout: pathlib.Path, revision: str) -> str | None:

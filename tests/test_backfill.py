@@ -546,10 +546,11 @@ def test_run_backfill_dry_run_creates_nothing(
     assert not world.pushed
     assert not world.downloads
     assert not world.rebuilt
-    # Only the fetch into the private refs and reads of the refs.
+    # Only the fetches into the private refs and reads of the refs.
     assert world.rec.calls[0] == list(remote_tags.FETCH)
+    assert world.rec.calls[1] == list(remote_tags.FETCH_BRANCHES)
     assert all(
-        call[:2] == ['git', 'for-each-ref'] for call in world.rec.calls[1:]
+        call[:2] == ['git', 'for-each-ref'] for call in world.rec.calls[2:]
     )
     assert len(report.rows) == 3
 
@@ -903,6 +904,24 @@ def test_tags_are_fetched_into_the_private_refs_first_dry_run_too(
     world.latest = ['v1.0', 'v1.0']
     backfill.run_backfill('spam', options(tmp_path, dry_run=True))
     assert world.rec.calls[0] == fetch
+
+
+def test_the_branches_of_origin_are_fetched_after_the_tags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.tags = [github.Tag('v1.0', SHA)]
+    backfill.run_backfill('spam', options(tmp_path))
+    assert world.rec.calls[1] == [
+        *('git', 'fetch', '--no-tags', '--prune', '--no-prune-tags'),
+        *('origin', '+refs/heads/*:refs/remotes/origin/*'),
+    ]
+    fetches: list[list[str]] = [
+        call for call in world.rec.calls if call[:2] == ['git', 'fetch']
+    ]
+    assert len(fetches) == 2
+    assert all('--tags' not in call for call in fetches)
 
 
 def test_a_failed_fetch_exits_2_before_anything_is_created(

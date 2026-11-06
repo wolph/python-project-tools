@@ -61,9 +61,6 @@ WORKFLOW_DIR: str = '.github/workflows'
 LOCAL_TAG_EXISTS: str = (
     'local tag {name} exists and is not on GitHub, not touching it'
 )
-# Every ref but the checkout's own tags, which can point at commits GitHub
-# never saw. GitHub's tags are in remote_tags.REMOTE_TAGS, so they count.
-NOT_LOCAL_TAGS: str = f'--exclude={remote_tags.LOCAL_TAGS}/*'
 
 
 @dataclasses.dataclass
@@ -97,7 +94,7 @@ def _version_paths(checkout: pathlib.Path) -> list[str]:
     listing: str = _git(
         checkout,
         'log',
-        '--all',
+        *remote_tags.GITHUB_GLOBS,
         '--format=',
         '--name-only',
         '--diff-filter=AM',
@@ -112,8 +109,10 @@ def _version_paths(checkout: pathlib.Path) -> list[str]:
 def candidates(checkout: pathlib.Path, version: str) -> list[str]:
     """Commits whose diff adds or removes the version string, newest first.
 
-    Commits only a local tag reaches are left out: pushing a tag at one
-    would publish a commit GitHub never had.
+    Only history GitHub has is searched: its branches and its tags, see
+    remote_tags.GITHUB_GLOBS. A commit that only a local branch, the stash
+    or a local tag reaches is left out, a tag pushed at one would publish
+    it.
     """
     paths: list[str] = _version_paths(checkout)
     if not paths:
@@ -121,8 +120,7 @@ def candidates(checkout: pathlib.Path, version: str) -> list[str]:
     listing: str = _git(
         checkout,
         'log',
-        NOT_LOCAL_TAGS,
-        '--all',
+        *remote_tags.GITHUB_GLOBS,
         '--format=%H',
         f'-S{version}',
         '--',
@@ -162,8 +160,14 @@ def _sdist_files(top: pathlib.Path) -> list[str]:
 
 
 def _history_paths(checkout: pathlib.Path) -> set[str]:
-    """Every path any commit of any ref has touched."""
-    listing: str = _git(checkout, 'log', '--all', '--name-only', '--format=')
+    """Every path any commit GitHub has has touched."""
+    listing: str = _git(
+        checkout,
+        'log',
+        *remote_tags.GITHUB_GLOBS,
+        '--name-only',
+        '--format=',
+    )
     return {line for line in listing.splitlines() if line}
 
 
@@ -376,10 +380,13 @@ def create_tag(
     """Create an annotated tag at ``sha``, signed with ``key``.
 
     Refuses when a local tag of that name exists, whatever it points at:
-    an existing tag is never moved or replaced.
+    an existing tag is never moved or replaced. Refuses too when ``sha``
+    is not reachable from a ref GitHub has, see remote_tags.on_github:
+    pushing the tag would publish that commit and its history.
     """
     if remote_tags.local_object(checkout, tag) is not None:
         raise RuntimeError(LOCAL_TAG_EXISTS.format(name=tag))
+    remote_tags.require_on_github(checkout, sha)
     done = common.run(
         ['git', 'tag', '-s', '-u', key, tag, sha, '-m', message],
         cwd=checkout,

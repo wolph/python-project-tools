@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import types
+import typing
 
 import pytest
 
@@ -247,3 +249,23 @@ def test_a_tag_deleted_on_github_leaves_the_private_refs(
     assert remote_tags.commit(path, 'v1.0') is None
     assert git(path, 'rev-parse', 'refs/tags/v1.0') == scratch_repo.shas[0]
     assert git(path, 'rev-parse', 'origin/master') == scratch_repo.shas[2]
+
+
+def test_the_anchor_is_a_root_commit_github_has(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'checkout', '-q', '--orphan', 'unpublished')
+    git(path, 'commit', '-q', '--allow-empty', '-m', 'private root')
+    local_root: str = git(path, 'rev-parse', 'HEAD')
+    run = typing.cast(
+        'backfill.PackageRun',
+        types.SimpleNamespace(options=types.SimpleNamespace(checkout=path)),
+    )
+    anchor: str = backfill._anchor_sha(run)
+    assert anchor == scratch_repo.shas[0]
+    assert anchor != local_root
+    assert remote_tags.on_github(path, anchor)
+    assert not remote_tags.on_github(path, local_root)
+    with pytest.raises(RuntimeError, match='not on GitHub'):
+        match_tag.create_tag(path, 'v0', local_root, 'msg')

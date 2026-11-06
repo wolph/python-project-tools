@@ -170,6 +170,8 @@ def test_compare_counts_a_file_tracked_elsewhere_as_differing(
     git(path, 'add', '-A')
     git(path, 'commit', '-q', '-m', 'add eggs')
     cut: str = git(path, 'rev-parse', 'HEAD')
+    # History is read from what GitHub has, so the release branch is there.
+    git(path, 'push', '-q', 'origin', 'release-1.1')
     sdist: pathlib.Path = archive(
         scratch_repo, cut, tmp_path / 'spam-1.1.tar.gz'
     )
@@ -369,6 +371,8 @@ def test_main_refuses_push_when_workflow_would_fire(
     # The 1.1 bump commit itself carries a workflow that fires on tags.
     git(scratch_repo.path, 'reset', '-q', '--hard', scratch_repo.shas[1])
     flowed: str = add_workflow(scratch_repo, amend=True)
+    # Only commits GitHub has are candidates, so it has this one too.
+    git(scratch_repo.path, 'push', '-q', '--force', 'origin', 'master')
     fake_pypi(monkeypatch, scratch_repo, flowed)
     pushed: list[str] = []
     monkeypatch.setattr(
@@ -553,7 +557,11 @@ def test_create_tag_is_signed_and_annotated(
 
 def test_create_tag_passes_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
     rec: Recorder = Recorder(
-        {'git tag': completed(), 'git rev-parse': completed('', 1)}
+        {
+            'git tag': completed(),
+            'git rev-parse': completed('', 1),
+            'git for-each-ref': completed('refs/remotes/origin/master\n'),
+        }
     )
     monkeypatch.setattr(common, 'run', rec)
     match_tag.create_tag(pathlib.Path(), 'v1', 'abc', 'msg')
@@ -566,6 +574,134 @@ def test_create_tag_passes_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
         ['git', 'tag', '-s', '-u', default, 'v1', 'abc', '-m', 'msg'],
         ['git', 'tag', '-s', '-u', 'SPAM', 'v2', 'abc', '-m', 'msg'],
     ]
+
+
+def bump_on_branch(
+    repo: ScratchRepo, branch: str, version: str, push: bool
+) -> str:
+    """Commit a version bump on a new branch, back on master afterwards.
+
+    The branch is pushed to origin when ``push`` is set, otherwise it
+    stays local.
+    """
+    path: pathlib.Path = repo.path
+    git(path, 'checkout', '-q', '-b', branch, repo.shas[0])
+    (path / 'spam' / '__init__.py').write_text(f"__version__ = '{version}'\n")
+    git(path, 'commit', '-q', '-am', f'bump {version} on {branch}')
+    sha: str = git(path, 'rev-parse', 'HEAD')
+    if push:
+        git(path, 'push', '-q', 'origin', branch)
+    git(path, 'checkout', '-q', 'master')
+    return sha
+
+
+def test_a_commit_only_a_local_branch_reaches_is_no_candidate(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    local: str = bump_on_branch(scratch_repo, 'local-only', '1.6', push=False)
+    pushed: str = bump_on_branch(scratch_repo, 'on-github', '1.6', push=True)
+    remote_tags.fetch(path)
+    assert match_tag.candidates(path, '1.6') == [pushed]
+    assert local not in match_tag.candidates(path, '1.6')
+    assert not remote_tags.on_github(path, local)
+    assert remote_tags.on_github(path, pushed)
+
+
+def test_a_commit_only_a_local_branch_reaches_alone_finds_nothing(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    bump_on_branch(scratch_repo, 'local-only', '1.6', push=False)
+    remote_tags.fetch(path)
+    assert match_tag.candidates(path, '1.6') == []
+
+
+def test_a_stash_commit_is_never_a_candidate(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    (path / 'spam' / '__init__.py').write_text("__version__ = '1.9'\n")
+    git(path, 'add', '-A')
+    git(path, 'stash', 'push', '-q')
+    stash: str = git(path, 'rev-parse', 'refs/stash')
+    # The staged half of the stash is a plain commit that carries the bump.
+    # --all would have found it.
+    found: list[str] = git(
+        path, 'log', '--all', '--format=%H', '-S1.9'
+    ).split()
+    assert found
+    remote_tags.fetch(path)
+    assert match_tag.candidates(path, '1.9') == []
+    assert not remote_tags.on_github(path, stash)
+    for sha in found:
+        assert not remote_tags.on_github(path, sha)
+
+
+def test_fetch_updates_the_remote_branches_and_leaves_local_tags_alone(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.0', scratch_repo.shas[1])
+    git(path, 'config', 'fetch.prune', 'true')
+    git(path, 'config', 'fetch.pruneTags', 'true')
+    pushed: str = bump_on_branch(scratch_repo, 'topic', '1.6', push=True)
+    git(path, 'update-ref', '-d', 'refs/remotes/origin/topic')
+    before: str = git(path, 'for-each-ref', 'refs/tags')
+    remote_tags.fetch(path)
+    assert git(path, 'rev-parse', 'refs/remotes/origin/topic') == pushed
+    assert git(path, 'for-each-ref', 'refs/tags') == before
+    git(scratch_repo.origin, 'branch', '-q', '-D', 'topic')
+    remote_tags.fetch(path)
+    assert git(path, 'for-each-ref', 'refs/remotes/origin/topic') == ''
+    assert git(path, 'for-each-ref', 'refs/tags') == before
+
+
+def test_create_tag_refuses_a_commit_that_is_not_on_github(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    local: str = bump_on_branch(scratch_repo, 'local-only', '1.6', push=False)
+    origin_before: str = git(scratch_repo.origin, 'for-each-ref')
+    with pytest.raises(
+        RuntimeError,
+        match=f'commit {local[:7]} is not on GitHub, not tagging it',
+    ):
+        match_tag.create_tag(path, 'v1.6', local, 'msg')
+    assert git(path, 'tag', '--list', 'v1.6') == ''
+    assert git(scratch_repo.origin, 'for-each-ref') == origin_before
+
+
+def test_main_does_not_tag_or_push_a_local_only_commit(
+    scratch_repo: ScratchRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    local: str = bump_on_branch(scratch_repo, 'local-only', '1.6', push=False)
+    origin_before: str = git(scratch_repo.origin, 'for-each-ref')
+    # The sdist is exactly that local commit, the best possible match.
+    sdist: pathlib.Path = archive(scratch_repo, local, tmp_path / 'a.tar.gz')
+    file: pypi.PypiFile = pypi.PypiFile(
+        filename='spam-1.6.tar.gz',
+        url='https://files.invalid/spam-1.6.tar.gz',
+        sha256='0' * 64,
+        packagetype='sdist',
+        upload_time=dt.datetime(2020, 1, 1, tzinfo=UTC),
+        size=1,
+        yanked=False,
+    )
+    monkeypatch.setattr(match_tag, '_find_sdist', lambda p, v: file)
+    monkeypatch.setattr(pypi, 'download', lambda f, into: sdist)
+    argv: list[str] = [
+        *('spam', '1.6', '--checkout', str(path)),
+        *('--create', '--push'),
+    ]
+    assert match_tag.main(argv) == 1
+    assert 'no commit matches 1.6' in capsys.readouterr().out
+    assert git(path, 'tag', '--list', 'v1.6') == ''
+    assert git(scratch_repo.origin, 'for-each-ref') == origin_before
 
 
 def test_match_tag_is_registered() -> None:

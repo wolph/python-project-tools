@@ -442,7 +442,11 @@ def test_only_missing_signatures_are_produced(
     out: sign.SignOutcome = sign.sign_release(
         release(have, body=sign.FOOTER_MARKER), files, tmp_path, options
     )
-    assert sorted(out.uploaded) == ['SHA256SUMS.asc', 's.whl.asc']
+    assert sorted(out.uploaded) == [
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+        's.whl.asc',
+    ]
     assert world.sigstore_calls == 0
     assert world.signed == ['s.whl', 'SHA256SUMS']
 
@@ -483,8 +487,7 @@ def test_release_workdir_is_removed_after_success_and_failure(
     options: sign.SignOptions,
 ) -> None:
     install(monkeypatch)
-    project: pypi.Project = project_with({'1.0': files})
-    sign._sign_one(release([]), project, tmp_path, options)
+    sign.sign_release(release([]), files, tmp_path, options)
     assert not (tmp_path / 'v1.0').exists()
 
     def broken(file: pypi.PypiFile, into: pathlib.Path) -> pathlib.Path:
@@ -493,8 +496,8 @@ def test_release_workdir_is_removed_after_success_and_failure(
         raise pypi.IntegrityError('bad hash')
 
     monkeypatch.setattr(pypi, 'download', broken)
-    out: sign.SignOutcome = sign._sign_one(
-        release([]), project, tmp_path, options
+    out: sign.SignOutcome = sign.sign_release(
+        release([]), files, tmp_path, options
     )
     assert out.status == 'failed'
     assert not (tmp_path / 'v1.0').exists()
@@ -530,3 +533,22 @@ def test_all_continues_after_a_signing_error(
     assert 'gpg exploded' in printed
     assert 'v2.0: signed' in printed
     assert world.uploaded
+
+
+def test_sums_pair_is_regenerated_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(
+        monkeypatch, {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES}
+    )
+    have: list[str] = [n for n in ALL_NAMES if n != 'SHA256SUMS.asc']
+    out: sign.SignOutcome = sign.sign_release(
+        release(have, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert sorted(out.uploaded) == ['SHA256SUMS', 'SHA256SUMS.asc']
+    clobbered: list[Upload] = [u for u in world.uploads if u.clobber]
+    assert len(clobbered) == 1
+    assert 'SHA256SUMS' in clobbered[0].names

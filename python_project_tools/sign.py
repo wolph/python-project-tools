@@ -172,17 +172,17 @@ def _make_signatures(
         ]
         if todo:
             produced.extend(signing.sigstore_sign(todo))
-    sums_needed: bool = _needed(SUMS_NAME, present, options)
-    sums_asc_needed: bool = options.gpg and _needed(
-        f'{SUMS_NAME}.asc', present, options
+    # The list and its signature are a pair: if either is missing both are
+    # regenerated, so the uploaded signature matches the uploaded list.
+    pair_missing: bool = _needed(SUMS_NAME, present, options) or (
+        options.gpg and _needed(f'{SUMS_NAME}.asc', present, options)
     )
-    if sums_needed or sums_asc_needed:
+    if pair_missing:
         sums: pathlib.Path = signing.write_sha256sums(
             workdir, dists, options.rebuilt
         )
-        if sums_needed:
-            produced.append(sums)
-        if sums_asc_needed:
+        produced.append(sums)
+        if options.gpg:
             produced.append(signing.gpg_sign(sums, options.gpg_key))
     return produced
 
@@ -196,8 +196,11 @@ def _split_signatures(
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """Produced files to upload plainly and with clobber, plus kept names."""
     new: list[pathlib.Path] = [p for p in produced if p.name not in present]
+    pair: set[str] = {SUMS_NAME, f'{SUMS_NAME}.asc'}
     clobber: list[pathlib.Path] = [
-        p for p in produced if p.name in present and options.replace_assets
+        p
+        for p in produced
+        if p.name in present and (options.replace_assets or p.name in pair)
     ]
     replaced: set[str] = {p.name for p in clobber}
     outcome.kept.extend(
@@ -284,7 +287,10 @@ def sign_release(
     workdir: pathlib.Path,
     options: SignOptions,
 ) -> SignOutcome:
-    """Sign one release, never raising for the handled failure kinds."""
+    """Sign one release, never raising for the handled failure kinds.
+
+    Works in ``workdir / release.tag`` and removes it afterwards.
+    """
     outcome: SignOutcome = SignOutcome(
         tag=release.tag,
         version=versions.normalise(release.tag),
@@ -303,6 +309,7 @@ def sign_release(
     rebuilt_names: list[str] = [
         f.name for f in files if isinstance(f, pathlib.Path)
     ]
+    workdir = workdir / release.tag
     try:
         workdir.mkdir(parents=True, exist_ok=True)
         dists: list[pathlib.Path] = _local_dists(files, workdir)
@@ -330,6 +337,8 @@ def sign_release(
         outcome.status = 'failed'
         outcome.reason = str(error)
         return outcome
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
     return _finish(outcome)
 
 
@@ -425,16 +434,9 @@ def _sign_one(
             status='failed',
             reason=f'{release.tag} matches no PyPI version',
         )
-    release_dir: pathlib.Path = workdir / release.tag
-    try:
-        outcome: SignOutcome = sign_release(
-            release,
-            pypi.files_for(project, version),
-            release_dir,
-            options,
-        )
-    finally:
-        shutil.rmtree(release_dir, ignore_errors=True)
+    outcome: SignOutcome = sign_release(
+        release, pypi.files_for(project, version), workdir, options
+    )
     outcome.version = version
     return outcome
 

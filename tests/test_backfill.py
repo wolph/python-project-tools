@@ -84,6 +84,7 @@ class World:
         self.match_sha: str | None = SHA
         self.tag_workflows: list[str] = []
         self.rebuild_error: str | None = None
+        self.rebuild_raises: dict[str, Exception] = {}
         self.sign_status: str = 'signed'
         self.rec: Recorder = Recorder({})
 
@@ -123,6 +124,8 @@ def _rebuild(
     world: World, checkout: pathlib.Path, tag: str, out: pathlib.Path
 ) -> list[pathlib.Path]:
     world.rebuilt.append(tag)
+    if tag in world.rebuild_raises:
+        raise world.rebuild_raises[tag]
     if world.rebuild_error:
         raise rebuild.RebuildError(world.rebuild_error)
     out.mkdir(parents=True, exist_ok=True)
@@ -142,9 +145,12 @@ def _choose(
     return None if world.match_sha is None else cands[0]
 
 
-def install(monkeypatch: pytest.MonkeyPatch, world: World) -> World:
+def install(
+    monkeypatch: pytest.MonkeyPatch, world: World, fake_sign: bool = True
+) -> World:
     world.rec = Recorder(
         {
+            'git fetch': completed(),
             'git show': completed('', 128),
             'git rev-list': completed(ROOT + '\n'),
             'git rev-parse': completed('', 1),
@@ -170,9 +176,10 @@ def install(monkeypatch: pytest.MonkeyPatch, world: World) -> World:
         'create_release',
         lambda *a: _create_release(world, *a),
     )
-    monkeypatch.setattr(
-        sign, 'sign_release', lambda *a: _sign_release(world, *a)
-    )
+    if fake_sign:
+        monkeypatch.setattr(
+            sign, 'sign_release', lambda *a: _sign_release(world, *a)
+        )
     monkeypatch.setattr(rebuild, 'rebuild', lambda *a: _rebuild(world, *a))
     monkeypatch.setattr(match_tag, 'candidates', lambda checkout, v: [SHA])
     monkeypatch.setattr(
@@ -186,13 +193,15 @@ def install(monkeypatch: pytest.MonkeyPatch, world: World) -> World:
         'workflow_with_tag_trigger',
         lambda checkout, sha: list(world.tag_workflows),
     )
-    monkeypatch.setattr(
-        match_tag,
-        'create_tag',
-        lambda checkout, tag, sha, message: world.new_tags.append(
-            (tag, sha, message)
-        ),
-    )
+
+    def create_tag(
+        checkout: pathlib.Path, tag: str, sha: str, message: str
+    ) -> None:
+        world.new_tags.append((tag, sha, message))
+        # A tag that was just created exists in the checkout.
+        world.rec.replies['git rev-parse'] = completed(sha + '\n')
+
+    monkeypatch.setattr(match_tag, 'create_tag', create_tag)
     monkeypatch.setattr(
         match_tag, 'push_tag', lambda checkout, tag: world.pushed.append(tag)
     )
@@ -345,6 +354,8 @@ def test_changelog_section_reads_markdown_headings(
         check: bool = False,
         cwd: pathlib.Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ['git', 'rev-parse']:
+            return completed(SHA)
         found: bool = args == ['git', 'show', 'v1.2:CHANGES.md']
         return completed(text if found else '', 0 if found else 128)
 
@@ -386,7 +397,7 @@ def test_run_backfill_dry_run_creates_nothing(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    world: World = install(monkeypatch, World())
+    world: World = install(monkeypatch, World(), fake_sign=False)
     world.project = project_with(
         {'1.0': files_of('1.0'), '1.1': files_of('1.1'), '1.2': []}
     )
@@ -402,6 +413,7 @@ def test_run_backfill_dry_run_creates_nothing(
         'would download 2 files',
         'would rebuild',
         'would sign',
+        'would upload spam-1.0.tar.gz.asc',
     ):
         assert phrase in printed
     assert not world.created
@@ -409,8 +421,7 @@ def test_run_backfill_dry_run_creates_nothing(
     assert not world.pushed
     assert not world.downloads
     assert not world.rebuilt
-    assert world.signed
-    assert all(opts.dry_run for _, _, opts in world.signed)
+    assert world.rec.calls == []
     assert len(report.rows) == 3
 
 
@@ -632,6 +643,7 @@ def test_changelog_text_becomes_the_release_notes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     world: World = install(monkeypatch, World())
+    world.rec.replies['git rev-parse'] = completed(SHA)
     world.rec.replies['git show v1.0:CHANGELOG.rst'] = completed(
         '1.0:\n\n- spam\n\n0.9:\n\n- eggs\n'
     )
@@ -689,3 +701,157 @@ def test_to_markdown_lists_every_column() -> None:
 
 def test_backfill_is_registered() -> None:
     assert cli.COMMANDS['backfill'] is backfill.main
+
+
+def test_changelog_section_tolerates_a_non_utf8_changelog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    def run(
+        args: list[str],
+        check: bool = False,
+        cwd: pathlib.Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ['git', 'rev-parse']:
+            return completed(SHA)
+        raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+
+    monkeypatch.setattr(common, 'run', run)
+    assert backfill.changelog_section(tmp_path, 'v1.2', '1.2') is None
+
+
+def test_changelog_section_is_none_when_the_tag_is_not_local(
+    scratch_repo: ScratchRepo,
+) -> None:
+    assert backfill.changelog_section(scratch_repo.path, 'v9', '9') is None
+
+
+def test_an_oserror_fails_one_version_and_the_loop_continues(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': [], '1.1': files_of('1.1')})
+    world.tags = [github.Tag('v1.0', SHA), github.Tag('v1.1', SHA)]
+    world.rebuild_raises['v1.0'] = FileNotFoundError('uv: not found')
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    first, second = report.rows
+    assert first[1] is None
+    assert 'uv: not found' in first[2]
+    assert second[1] is not None
+    assert second[1].status == 'signed'
+    assert [created[0] for created in world.created] == ['v1.1']
+
+
+def test_a_stray_key_error_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': []})
+    world.tags = [github.Tag('v1.0', SHA)]
+    world.rebuild_raises['v1.0'] = KeyError('bug')
+    with pytest.raises(KeyError):
+        backfill.run_backfill('spam', options(tmp_path))
+
+
+def test_tags_are_fetched_first_unless_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.tags = [github.Tag('v1.0', SHA)]
+    backfill.run_backfill('spam', options(tmp_path))
+    assert world.rec.calls[0] == ['git', 'fetch', 'origin', '--tags']
+    world.rec.calls.clear()
+    world.latest = ['v1.0', 'v1.0']
+    backfill.run_backfill('spam', options(tmp_path, dry_run=True))
+    assert not any(call[:2] == ['git', 'fetch'] for call in world.rec.calls)
+
+
+def test_a_failed_fetch_exits_2_before_anything_is_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.rec.replies['git fetch'] = subprocess.CompletedProcess(
+        [], 1, '', 'no remote'
+    )
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.tags = [github.Tag('v1.0', SHA)]
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert 'no remote' in capsys.readouterr().err
+    assert not world.created
+    assert not world.signed
+
+
+def test_a_tag_missing_from_the_checkout_gets_stock_notes_and_a_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.tags = [github.Tag('v1.0', SHA)]
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert 'No changelog section' in world.created[0][2]
+    assert report.rows[0][2] == 'tag not in checkout, stock notes used'
+
+
+def test_a_local_tag_at_the_matched_commit_is_pushed_not_recreated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.rec.replies['git rev-parse'] = completed(SHA + '\n')
+    world.project = project_with({'1.2': files_of('1.2')})
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.new_tags
+    assert world.pushed == ['v1.2']
+    assert world.created[0][0] == 'v1.2'
+    assert report.rows[0][2] == ''
+
+
+def test_a_local_tag_elsewhere_skips_the_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    other: str = 'b' * 40
+    world: World = install(monkeypatch, World())
+    world.rec.replies['git rev-parse'] = completed(other + '\n')
+    world.project = project_with({'1.2': files_of('1.2')})
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.new_tags
+    assert not world.pushed
+    assert not world.created
+    _, outcome, note = report.rows[0]
+    assert outcome is None
+    assert note == (
+        f'local tag v1.2 points at {other}, not at the matched commit'
+    )
+
+
+def test_an_unreadable_latest_after_the_run_reports_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.tags = [github.Tag('v1.0', SHA)]
+    calls: list[int] = []
+
+    def latest(repo: str) -> github.Release | None:
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError('gh is down')
+        return release('v1.0')
+
+    monkeypatch.setattr(github, 'latest_release', latest)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert report.latest_after == 'unknown'
+    text: str = backfill.to_markdown(report)
+    assert 'Latest before: v1.0, after: unknown' in text
+    assert text.rstrip().endswith('CHANGED')

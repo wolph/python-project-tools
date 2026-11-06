@@ -18,6 +18,7 @@ import pathlib
 import re
 import shutil
 import sys
+import tarfile
 import tempfile
 
 from packaging.version import InvalidVersion, Version
@@ -35,6 +36,8 @@ from python_project_tools import (
 
 UNTAGGED_TAG: str = 'pypi-untagged-releases'
 UNTAGGED_TITLE: str = 'PyPI versions without a matching tag'
+UNKNOWN: str = 'unknown'
+NO_LOCAL_TAG_NOTE: str = 'tag not in checkout, stock notes used'
 STOCK_NOTES: str = (
     'Release {version}. No changelog section was found at tag {tag}.'
 )
@@ -71,10 +74,12 @@ COLUMNS: tuple[str, ...] = (
 )
 # Failures a single version can raise without stopping the run.
 STEP_ERRORS: tuple[type[Exception], ...] = (
-    LookupError,
     RuntimeError,
     common.FetchError,
     pypi.IntegrityError,
+    OSError,  # a missing git or uv binary, a full disk
+    tarfile.TarError,  # a bad git archive
+    UnicodeDecodeError,  # a changelog or git output that is not UTF-8
 )
 
 Files = list[pypi.PypiFile] | list[pathlib.Path]
@@ -231,10 +236,24 @@ def plan_versions(
 
 
 def _show(checkout: pathlib.Path, tag: str, name: str) -> list[str] | None:
-    done = common.run(['git', 'show', f'{tag}:{name}'], cwd=checkout)
+    try:
+        done = common.run(['git', 'show', f'{tag}:{name}'], cwd=checkout)
+    except UnicodeDecodeError:
+        return None
     if done.returncode != 0:
         return None
     return done.stdout.splitlines()
+
+
+def _local_tag_sha(checkout: pathlib.Path, tag: str) -> str | None:
+    """The commit a local tag points at, or None when it does not exist."""
+    done = common.run(
+        ['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'],
+        cwd=checkout,
+    )
+    if done.returncode != 0:
+        return None
+    return done.stdout.strip()
 
 
 def _rst_block(lines: list[str], version: str) -> list[str] | None:
@@ -275,8 +294,11 @@ def changelog_section(
 
     Matches ``VERSION:`` headings (reStructuredText changelogs) and
     ``## VERSION`` headings (Markdown) and runs to the next heading of the
-    same kind. Returns None when no changelog mentions the version.
+    same kind. Returns None when the tag is not in the checkout, when no
+    changelog mentions the version or when a changelog is not UTF-8.
     """
+    if _local_tag_sha(checkout, tag) is None:
+        return None
     for name in CHANGELOG_NAMES:
         lines: list[str] | None = _show(checkout, tag, name)
         if lines is None:
@@ -326,7 +348,14 @@ def _find_match(run: _Run, plan: Plan) -> tuple[str, pypi.PypiFile] | None:
     return None if best is None else (best.sha, sdist)
 
 
-def _make_tag(run: _Run, plan: Plan, sha: str, sdist: pypi.PypiFile) -> None:
+def _make_tag(
+    run: _Run, plan: Plan, sha: str, sdist: pypi.PypiFile
+) -> str | None:
+    """Create and push the tag, reusing a local tag at the same commit.
+
+    Returns a note when a local tag of that name points somewhere else.
+    """
+    checkout: pathlib.Path = run.options.checkout
     name: str = versions.tag_for(plan.version)
     message: str = match_tag.TAG_MESSAGE.format(
         package=run.package,
@@ -335,11 +364,17 @@ def _make_tag(run: _Run, plan: Plan, sha: str, sdist: pypi.PypiFile) -> None:
         sha256=sdist.sha256,
         date=dt.date.today().isoformat(),
     )
-    match_tag.create_tag(run.options.checkout, name, sha, message)
-    match_tag.push_tag(run.options.checkout, name)
+    local: str | None = _local_tag_sha(checkout, name)
+    if local is not None and local != sha:
+        return f'local tag {name} points at {local}, not at the matched commit'
+    if local is None:
+        match_tag.create_tag(checkout, name, sha, message)
+    if not any(tag.name == name for tag in run.tags):
+        match_tag.push_tag(checkout, name)
     plan.tag = name
     plan.tag_action = 'create'
     run.tags.append(github.Tag(name, sha))
+    return None
 
 
 def _plan_tag(run: _Run, plan: Plan) -> str | None:
@@ -359,21 +394,29 @@ def _plan_tag(run: _Run, plan: Plan) -> str | None:
         )
         if flows and not run.options.allow_workflow_trigger:
             return 'tag not pushed, workflow would fire: ' + ', '.join(flows)
-        _make_tag(run, plan, sha, sdist)
+        return _make_tag(run, plan, sha, sdist)
     except STEP_ERRORS as error:
         return f'tag creation failed: {error}'
     return None
 
 
-def _ensure_release(run: _Run, plan: Plan) -> github.Release:
-    """The release of a plan, created with changelog notes when missing."""
+def _ensure_release(run: _Run, plan: Plan) -> tuple[github.Release, str]:
+    """The release of a plan, created with changelog notes when missing.
+
+    The note is non-empty when the tag is not in the checkout, so the notes
+    are the stock sentence.
+    """
     assert plan.tag is not None
     existing: github.Release | None = run.releases.get(plan.tag)
     if existing is not None:
-        return existing
-    section: str | None = changelog_section(
-        run.options.checkout, plan.tag, plan.version
-    )
+        return existing, ''
+    checkout: pathlib.Path = run.options.checkout
+    note: str = ''
+    section: str | None = None
+    if _local_tag_sha(checkout, plan.tag) is None:
+        note = NO_LOCAL_TAG_NOTE
+    else:
+        section = changelog_section(checkout, plan.tag, plan.version)
     created: github.Release = github.create_release(
         run.options.repo,
         plan.tag,
@@ -382,7 +425,7 @@ def _ensure_release(run: _Run, plan: Plan) -> github.Release:
         plan.prerelease,
     )
     run.releases[plan.tag] = created
-    return created
+    return created, note
 
 
 def _rebuilt_dir(run: _Run, tag: str) -> pathlib.Path:
@@ -411,7 +454,7 @@ def _release_and_sign(
     assert plan.tag is not None
     try:
         files, rebuilt = _files_for_plan(run, plan)
-        release: github.Release = _ensure_release(run, plan)
+        release, note = _ensure_release(run, plan)
         options: sign.SignOptions = dataclasses.replace(
             run.sign_options, rebuilt=rebuilt
         )
@@ -425,7 +468,7 @@ def _release_and_sign(
     finally:
         shutil.rmtree(_rebuilt_dir(run, plan.tag), ignore_errors=True)
     outcome.version = plan.version
-    return outcome, ''
+    return outcome, note
 
 
 def _dry_run_plan(
@@ -620,6 +663,21 @@ def _latest_tag(repo: str) -> str | None:
     return None if latest is None else latest.tag
 
 
+def _latest_after(repo: str) -> str | None:
+    """The latest release after the run, UNKNOWN when GitHub cannot say."""
+    try:
+        return _latest_tag(repo)
+    except (RuntimeError, common.FetchError):
+        return UNKNOWN
+
+
+def _fetch_tags(checkout: pathlib.Path) -> None:
+    """Fetch the remote tags, never overwriting a local one."""
+    done = common.run(['git', 'fetch', 'origin', '--tags'], cwd=checkout)
+    if done.returncode != 0:
+        raise RuntimeError(f'git fetch origin --tags: {done.stderr.strip()}')
+
+
 def _sign_options(package: str, options: BackfillOptions) -> sign.SignOptions:
     return sign.SignOptions(
         repo=options.repo,
@@ -637,8 +695,11 @@ def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
 
     The caller runs ``preflight`` first. Raises LookupError for an unknown
     package or ``only`` version, and RuntimeError or common.FetchError when
-    GitHub or PyPI cannot be read.
+    the tags cannot be fetched or GitHub or PyPI cannot be read, all before
+    anything is created.
     """
+    if not options.dry_run:
+        _fetch_tags(options.checkout)
     project: pypi.Project = pypi.project(package)
     tags: list[github.Tag] = github.tags(options.repo)
     releases: list[github.Release] = github.releases(options.repo)
@@ -667,7 +728,7 @@ def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
         repo=options.repo,
         rows=rows,
         latest_before=before,
-        latest_after=_latest_tag(options.repo),
+        latest_after=_latest_after(options.repo),
     )
 
 
@@ -701,7 +762,10 @@ def _row_cells(row: Row) -> list[str]:
 
 
 def _latest_changed(report: BackfillReport) -> bool:
-    return report.latest_before != report.latest_after
+    return (
+        report.latest_after == UNKNOWN
+        or report.latest_before != report.latest_after
+    )
 
 
 def to_markdown(report: BackfillReport) -> str:

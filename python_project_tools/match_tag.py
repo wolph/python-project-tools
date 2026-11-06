@@ -9,6 +9,7 @@ tests can replace it.
 from __future__ import annotations
 
 import argparse
+import configparser
 import dataclasses
 import datetime as dt
 import pathlib
@@ -196,22 +197,76 @@ def strip_egg_info(text: str) -> str:
     return ''.join(kept)
 
 
+def _keep_case(optionstr: str) -> str:
+    """Leave option names as written, configparser lower-cases them."""
+    return optionstr
+
+
+def _setup_cfg_sections(text: str) -> dict[str, dict[str, str]]:
+    """Parse ``setup.cfg`` text into sections without the setuptools tags.
+
+    Key case is kept and duplicates are tolerated. The tag keys of an
+    [egg_info] section are dropped, and the section with them when nothing
+    else is left. Raises configparser.Error on unparsable text.
+    """
+    parser: configparser.RawConfigParser = configparser.RawConfigParser(
+        strict=False, interpolation=None
+    )
+    parser.optionxform = _keep_case
+    parser.read_string(text)
+    defaults: dict[str, str] = dict(parser.defaults())
+    sections: dict[str, dict[str, str]] = {}
+    if defaults:
+        sections[parser.default_section] = defaults
+    for name in parser.sections():
+        sections[name] = {
+            key: value
+            for key, value in parser.items(name)
+            if key not in defaults or value != defaults[key]
+        }
+    egg: dict[str, str] | None = sections.get('egg_info')
+    if egg is not None:
+        for key in EGG_INFO_KEYS:
+            egg.pop(key, None)
+        if not egg:
+            del sections['egg_info']
+    return {
+        name: {key: value.strip() for key, value in body.items()}
+        for name, body in sections.items()
+    }
+
+
+def setup_cfg_equivalent(a: str, b: str) -> bool:
+    """Whether two ``setup.cfg`` texts hold the same configuration.
+
+    Old setuptools rewrites the file through configparser when building an
+    sdist: spacing around "=" changes, blank lines go and an [egg_info] tag
+    block appears. Both texts are parsed and compared as sections of
+    stripped values, ignoring the [egg_info] tag keys. When either side
+    does not parse, the texts are compared with strip_egg_info instead.
+    """
+    try:
+        return _setup_cfg_sections(a) == _setup_cfg_sections(b)
+    except configparser.Error:
+        return strip_egg_info(a).rstrip() == strip_egg_info(b).rstrip()
+
+
 def _same_bytes(name: str, tracked: bytes, built: bytes) -> bool:
     """Whether a tracked file matches its sdist copy.
 
-    ``setup.cfg`` at the top level is compared without the [egg_info]
-    block setuptools adds while building the sdist.
+    ``setup.cfg`` at the top level is compared as configuration, see
+    setup_cfg_equivalent. Every other file must match byte for byte.
     """
     if tracked == built:
         return True
     if name != 'setup.cfg':
         return False
     try:
-        left: str = strip_egg_info(tracked.decode('utf-8'))
-        right: str = strip_egg_info(built.decode('utf-8'))
+        left: str = tracked.decode('utf-8')
+        right: str = built.decode('utf-8')
     except UnicodeDecodeError:
         return False
-    return left.rstrip() == right.rstrip()
+    return setup_cfg_equivalent(left, right)
 
 
 def compare(

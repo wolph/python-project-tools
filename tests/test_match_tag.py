@@ -306,6 +306,56 @@ def test_compare_ignores_the_egg_info_block_in_setup_cfg(
     assert found.matched >= 1
 
 
+TISSUE_TRACKED: str = (
+    '[nosetests]\nverbosity=3\ndetailed-errors=1\ndebug=nose.loader\n'
+    'pdb=1\n\nwith-tissue=1\ntissue-fail-on-error=1\n'
+)
+TISSUE_SDIST: str = (
+    '[nosetests]\nverbosity = 3\ndetailed-errors = 1\n'
+    'debug = nose.loader\npdb = 1\nwith-tissue = 1\n'
+    'tissue-fail-on-error = 1\n\n' + EGG_INFO
+)
+
+
+def test_setup_cfg_equivalent_for_the_tissue_0_9_1_rewrite() -> None:
+    assert match_tag.setup_cfg_equivalent(TISSUE_TRACKED, TISSUE_SDIST)
+
+
+def test_setup_cfg_equivalent_for_empty_against_egg_info_only() -> None:
+    assert match_tag.setup_cfg_equivalent('', EGG_INFO)
+
+
+def test_setup_cfg_not_equivalent_for_a_changed_value() -> None:
+    changed: str = TISSUE_SDIST.replace('verbosity = 3', 'verbosity = 2')
+    assert not match_tag.setup_cfg_equivalent(TISSUE_TRACKED, changed)
+
+
+def test_setup_cfg_not_equivalent_for_an_extra_egg_info_key() -> None:
+    extra: str = '[egg_info]\ntag_build = \negg_base = src\n'
+    assert not match_tag.setup_cfg_equivalent('', extra)
+    assert not match_tag.setup_cfg_equivalent(extra, EGG_INFO)
+
+
+def test_setup_cfg_unparsable_falls_back_to_text() -> None:
+    broken: str = 'no section header\n'
+    assert match_tag.setup_cfg_equivalent(broken, broken + EGG_INFO)
+    assert not match_tag.setup_cfg_equivalent(broken, 'other header\n')
+
+
+def test_compare_accepts_the_tissue_0_9_1_rewrite(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    (path / 'setup.cfg').write_text(TISSUE_TRACKED)
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'nosetests')
+    sha: str = git(path, 'rev-parse', 'HEAD')
+    rebuilt: pathlib.Path = rebuild_with_setup_cfg(
+        scratch_repo, sha, tmp_path, TISSUE_SDIST
+    )
+    assert match_tag.compare(path, sha, rebuilt).differing == []
+
+
 def test_strip_egg_info_removes_the_setuptools_block() -> None:
     assert match_tag.strip_egg_info(EGG_INFO) == ''
 

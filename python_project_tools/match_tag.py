@@ -36,6 +36,13 @@ GENERATED: tuple[str, ...] = (
     'MANIFEST.in',
 )
 
+# The only keys setuptools writes into the [egg_info] block of setup.cfg.
+EGG_INFO_KEYS: frozenset[str] = frozenset(
+    {'tag_build', 'tag_date', 'tag_svn_revision'}
+)
+SECTION_LINE: re.Pattern[str] = re.compile(r'^\[([^\]]*)\]')
+KEY_NAME: re.Pattern[str] = re.compile(r'^([^\s=:#;][^=:]*?)\s*[=:]')
+
 TAG_MESSAGE: str = (
     'Retroactive tag for PyPI release {package} {version}.\n\n'
     'Matched against {filename} (sha256 {sha256}) on {date}: every tracked '
@@ -149,6 +156,64 @@ def _history_paths(checkout: pathlib.Path) -> set[str]:
     return {line for line in listing.splitlines() if line}
 
 
+def _section_keys(body: list[str]) -> set[str] | None:
+    """Keys set in an ini section body, or None when a line is unreadable."""
+    keys: set[str] = set()
+    for line in body:
+        if not line.strip() or line[0] in '#;' or line[0].isspace():
+            continue  # blank, comment or continuation line
+        found: re.Match[str] | None = KEY_NAME.match(line)
+        if found is None:
+            return None
+        keys.add(found.group(1).strip().lower())
+    return keys
+
+
+def strip_egg_info(text: str) -> str:
+    """Remove the [egg_info] block setuptools appends to ``setup.cfg``.
+
+    Only a section whose keys are all in EGG_INFO_KEYS goes, together with
+    the blank lines after it. An [egg_info] section with any other key is
+    real configuration and stays, as does every other section.
+    """
+    lines: list[str] = text.splitlines(keepends=True)
+    kept: list[str] = []
+    index: int = 0
+    while index < len(lines):
+        header: re.Match[str] | None = SECTION_LINE.match(lines[index])
+        end: int = index + 1
+        while (
+            header and end < len(lines) and not SECTION_LINE.match(lines[end])
+        ):
+            end += 1
+        if header and header.group(1).strip() == 'egg_info':
+            keys: set[str] | None = _section_keys(lines[index + 1 : end])
+            if keys is not None and keys <= EGG_INFO_KEYS:
+                index = end
+                continue
+        kept.append(lines[index])
+        index += 1
+    return ''.join(kept)
+
+
+def _same_bytes(name: str, tracked: bytes, built: bytes) -> bool:
+    """Whether a tracked file matches its sdist copy.
+
+    ``setup.cfg`` at the top level is compared without the [egg_info]
+    block setuptools adds while building the sdist.
+    """
+    if tracked == built:
+        return True
+    if name != 'setup.cfg':
+        return False
+    try:
+        left: str = strip_egg_info(tracked.decode('utf-8'))
+        right: str = strip_egg_info(built.decode('utf-8'))
+    except UnicodeDecodeError:
+        return False
+    return left.rstrip() == right.rstrip()
+
+
 def compare(
     checkout: pathlib.Path, sha: str, sdist: pathlib.Path
 ) -> Candidate:
@@ -173,7 +238,9 @@ def compare(
                 if name not in GENERATED and name in history:
                     differing.append(name)
                 continue
-            if _blob(checkout, sha, name) == (top / name).read_bytes():
+            if _same_bytes(
+                name, _blob(checkout, sha, name), (top / name).read_bytes()
+            ):
                 matched += 1
             else:
                 differing.append(name)

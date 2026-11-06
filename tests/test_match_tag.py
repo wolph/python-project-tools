@@ -18,6 +18,9 @@ needs_gpg = pytest.mark.skipif(
 )
 
 UTC: dt.timezone = dt.timezone.utc
+EGG_INFO: str = (
+    '[egg_info]\ntag_build = \ntag_date = 0\ntag_svn_revision = 0\n\n'
+)
 
 
 def archive(repo: ScratchRepo, sha: str, target: pathlib.Path) -> pathlib.Path:
@@ -257,6 +260,64 @@ def test_compare_reports_a_tracked_setup_cfg_that_differs(
     )
     assert match_tag.compare(path, first, sdist).differing == ['setup.cfg']
     assert match_tag.compare(path, second, sdist).differing == []
+
+
+def rebuild_with_setup_cfg(
+    repo: ScratchRepo, sha: str, tmp_path: pathlib.Path, text: str
+) -> pathlib.Path:
+    """An sdist of ``sha`` whose setup.cfg holds ``text``."""
+    unpacked: pathlib.Path = tmp_path / 'unpacked'
+    with tarfile.open(archive(repo, sha, tmp_path / 'a.tar.gz')) as tar:
+        tar.extractall(unpacked, filter='data')
+    (unpacked / 'spam-1.1' / 'setup.cfg').write_text(text)
+    rebuilt: pathlib.Path = tmp_path / 'b.tar.gz'
+    with tarfile.open(rebuilt, 'w:gz') as tar:
+        tar.add(unpacked / 'spam-1.1', arcname='spam-1.1')
+    return rebuilt
+
+
+def test_compare_reports_a_real_setup_cfg_change_beside_egg_info(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    (path / 'setup.cfg').write_text('[metadata]\nname = spam\n')
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'setup.cfg')
+    sha: str = git(path, 'rev-parse', 'HEAD')
+    rebuilt: pathlib.Path = rebuild_with_setup_cfg(
+        scratch_repo, sha, tmp_path, '[metadata]\nname = eggs\n\n' + EGG_INFO
+    )
+    assert match_tag.compare(path, sha, rebuilt).differing == ['setup.cfg']
+
+
+def test_compare_ignores_the_egg_info_block_in_setup_cfg(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    (path / 'setup.cfg').write_text('')
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'empty setup.cfg')
+    sha: str = git(path, 'rev-parse', 'HEAD')
+    rebuilt: pathlib.Path = rebuild_with_setup_cfg(
+        scratch_repo, sha, tmp_path, EGG_INFO
+    )
+    found: match_tag.Candidate = match_tag.compare(path, sha, rebuilt)
+    assert found.differing == []
+    assert found.matched >= 1
+
+
+def test_strip_egg_info_removes_the_setuptools_block() -> None:
+    assert match_tag.strip_egg_info(EGG_INFO) == ''
+
+
+def test_strip_egg_info_keeps_other_sections() -> None:
+    text: str = '[metadata]\nname = spam\n\n' + EGG_INFO
+    assert match_tag.strip_egg_info(text) == '[metadata]\nname = spam\n\n'
+
+
+def test_strip_egg_info_keeps_a_block_with_real_configuration() -> None:
+    text: str = '[egg_info]\ntag_build = dev\negg_base = src\n'
+    assert match_tag.strip_egg_info(text) == text
 
 
 def fake_pypi(

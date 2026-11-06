@@ -26,7 +26,7 @@ BUNDLE_SUFFIX: str = '.sigstore.json'
 # The OIDC login waits for a browser callback that may never come.
 SIGSTORE_TIMEOUT_SECONDS: int = 900
 # On top of the login: the signer paces and backs off per file.
-SIGSTORE_SECONDS_PER_FILE: int = 3
+SIGSTORE_SECONDS_PER_FILE: int = 6
 SIGSTORE_TIMEOUT_MESSAGE: str = (
     'sigstore did not finish within {seconds} s, the browser login never '
     'completed or signing ran out of time'

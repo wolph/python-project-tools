@@ -145,7 +145,7 @@ def test_sigstore_sign_runs_the_signer_once_with_a_manifest(
         ]
     ]
     # Login time plus three seconds per file.
-    assert fake.timeouts == [900 + 3 * 3]
+    assert fake.timeouts == [900 + 3 * 6]
     assert out == [signing.bundle_path(path) for path in paths]
     assert all(signing.bundle_covers(path) for path in paths)
     # The manifest lived in a temporary directory that is gone.
@@ -160,7 +160,7 @@ def test_sigstore_sign_lists_a_repeated_file_once(
     (wheel,) = wheels('a.whl', root=tmp_path)
     out: list[pathlib.Path] = signing.sigstore_sign([wheel, wheel])
     assert [entry['input'] for entry in fake.manifests[0]] == [str(wheel)]
-    assert fake.timeouts == [903]
+    assert fake.timeouts == [906]
     assert out == [signing.bundle_path(wheel)] * 2
 
 
@@ -386,10 +386,10 @@ def test_sigstore_sign_times_out_with_a_clear_error(
     with pytest.raises(RuntimeError) as raised:
         signing.sigstore_sign(wheels('a.whl', 'b.whl', root=tmp_path))
     assert str(raised.value) == (
-        'sigstore did not finish within 906 s, the browser login never '
+        'sigstore did not finish within 912 s, the browser login never '
         'completed or signing ran out of time'
     )
-    assert seen == [906]
+    assert seen == [912]
     assert capsys.readouterr().err == (
         'ppt: Sigstore login needed, a browser tab opens for 2 files\n'
     )

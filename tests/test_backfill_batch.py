@@ -326,7 +326,9 @@ def test_parse_batch_reads_pairs_and_skips_comments(
 def test_parse_batch_expands_the_home_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
+    # expanduser reads HOME on POSIX and USERPROFILE on Windows
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path))
     (tmp_path / 'spam').mkdir()
     assert backfill_batch.parse_batch('spam ~/spam\n') == [
         backfill_batch.BatchEntry('spam', tmp_path / 'spam')

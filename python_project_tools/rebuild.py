@@ -59,21 +59,37 @@ def _built(out: pathlib.Path) -> list[pathlib.Path]:
     )
 
 
+def _commit_time(checkout: pathlib.Path, tag: str) -> str:
+    """The commit time of a tag in seconds since the epoch, as text."""
+    done: subprocess.CompletedProcess[str] = common.run(
+        ['git', 'log', '-1', '--format=%ct', tag], cwd=checkout
+    )
+    stamp: str = done.stdout.strip() if done.returncode == 0 else ''
+    if not stamp.isdigit():
+        raise RebuildError(f'git log {tag}: {done.stderr.strip()}')
+    return stamp
+
+
 def rebuild(
     checkout: pathlib.Path, tag: str, out: pathlib.Path
 ) -> list[pathlib.Path]:
     """Build the wheel and sdist of a tag into ``out`` and return them.
 
     The tag is exported with ``git archive`` into a temporary directory that
-    is removed afterwards. Raises RebuildError when git or uv fail or when
-    ``out`` holds no wheel or sdist afterwards.
+    is removed afterwards. ``SOURCE_DATE_EPOCH`` is the tag's commit time,
+    so backends that honour it write the same timestamps on every rebuild.
+    Raises RebuildError when git or uv fail or when ``out`` holds no wheel
+    or sdist afterwards.
     """
     out.mkdir(parents=True, exist_ok=True)
+    epoch: str = _commit_time(checkout, tag)
     work: pathlib.Path = pathlib.Path(tempfile.mkdtemp(prefix='ppt-rebuild-'))
     try:
         tree: pathlib.Path = _export(checkout, tag, work)
         done: subprocess.CompletedProcess[str] = common.run(
-            ['uv', 'build', '--out-dir', str(out)], cwd=tree
+            ['uv', 'build', '--out-dir', str(out)],
+            cwd=tree,
+            env={'SOURCE_DATE_EPOCH': epoch},
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)

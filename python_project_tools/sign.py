@@ -24,6 +24,22 @@ VERIFY_URL: str = (
 )
 SUMS_NAME: str = signing.SHA256SUMS_NAME
 EXISTING_DIR: str = 'existing'
+BUNDLES_DIR: str = 'bundles'
+PENDING: str = 'bundles pending'
+FILES_PYPI: str = (
+    'The files above are the exact PyPI uploads for this version, verified '
+    'by sha256 against PyPI before signing.'
+)
+FILES_WITH_REBUILT: str = (
+    'The files above are the PyPI uploads for this version where PyPI has '
+    'them, verified by sha256 against PyPI before signing, except the '
+    'rebuilt files listed below, which were built from the tag and are '
+    'marked in SHA256SUMS.'
+)
+FILES_MULTI_VERSION: str = (
+    'The files above are the exact PyPI uploads of the versions listed in '
+    'these notes, each verified by sha256 against PyPI before signing.'
+)
 HANDLED_ERRORS: tuple[type[Exception], ...] = (
     pypi.IntegrityError,
     signing.SigningError,
@@ -41,8 +57,15 @@ class SignOutcome:
     uploaded: list[str]
     kept: list[str]  # same name, same bytes, already there
     conflicts: list[str]  # same name, different bytes
-    status: str  # 'signed', 'already signed', 'failed'
+    # 'signed', 'already signed', 'failed', or 'bundles pending' until
+    # finish_pending has uploaded the deferred Sigstore bundles.
+    status: str
     reason: str
+    # Copies of the dists that still need a Sigstore bundle, outside the
+    # per-release directory, when SignOptions.sigstore_later is set.
+    pending_bundles: list[pathlib.Path] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -58,24 +81,45 @@ class SignOptions:
     dry_run: bool = False
     rebuilt: dict[str, str] = dataclasses.field(default_factory=dict)
     signed_on: dt.date = dataclasses.field(default_factory=dt.date.today)
+    # Leave the Sigstore bundles to the caller, who signs the files of many
+    # releases in one invocation and then calls finish_pending.
+    sigstore_later: bool = False
+    # The release holds the files of several versions (the untagged anchor).
+    multi_version: bool = False
+
+
+def _files_sentence(options: SignOptions, rebuilt_names: list[str]) -> str:
+    """What the footer says about where the files came from."""
+    if options.multi_version:
+        return FILES_MULTI_VERSION
+    if rebuilt_names:
+        return FILES_WITH_REBUILT
+    return FILES_PYPI
 
 
 def footer(options: SignOptions, rebuilt_names: list[str]) -> str:
-    """The note appended to a release body once it is signed."""
-    rebuilt: str = ', '.join(rebuilt_names) or 'none'
-    return (
-        f'{FOOTER_MARKER}\n'
+    """The note appended to a release body once it is signed.
+
+    One sentence per line, so Markdown renders one paragraph. The marker
+    line comes first, and rebuilt files are listed after the paragraph.
+    """
+    lines: list[str] = [
+        FOOTER_MARKER,
         f'Signed on {options.signed_on.isoformat()} with `ppt sign`, after '
-        'the release. The files above are\n'
-        'the exact PyPI uploads for this version, verified by sha256 '
-        'against PyPI\n'
-        'before signing. Each file has a GPG signature (`.asc`, key '
-        f'{options.gpg_key}) and a\n'
-        'Sigstore bundle (`.sigstore.json`). `SHA256SUMS.asc` signs the '
-        'checksum\n'
-        f'list. Rebuilt files, if any: {rebuilt}. How to verify: '
-        f'{VERIFY_URL}\n'
-    )
+        'the release.',
+        _files_sentence(options, rebuilt_names),
+        f'Each file has a GPG signature (`.asc`, key {options.gpg_key}) and '
+        'a Sigstore bundle (`.sigstore.json`).',
+        '`SHA256SUMS.asc` signs the checksum list.',
+    ]
+    if not rebuilt_names and not options.multi_version:
+        lines.append('Rebuilt files, if any: none.')
+    lines.append(f'How to verify: {VERIFY_URL}')
+    text: str = '\n'.join(lines) + '\n'
+    if rebuilt_names:
+        listing: str = ''.join(f'- {name}\n' for name in rebuilt_names)
+        text += f'\nRebuilt files:\n\n{listing}'
+    return text
 
 
 def _fail(message: str) -> None:
@@ -155,9 +199,14 @@ def _make_signatures(
     workdir: pathlib.Path,
     options: SignOptions,
     present: set[str],
-) -> list[pathlib.Path]:
-    """Produce only the signature and sums files the release still lacks."""
+) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
+    """Produce only the signature and sums files the release still lacks.
+
+    Returns the produced files and the dists whose Sigstore bundle was left
+    for later (empty unless ``options.sigstore_later``).
+    """
     produced: list[pathlib.Path] = []
+    deferred: list[pathlib.Path] = []
     if options.gpg:
         produced.extend(
             signing.gpg_sign(p, options.gpg_key)
@@ -168,9 +217,11 @@ def _make_signatures(
         todo: list[pathlib.Path] = [
             p
             for p in dists
-            if _needed(f'{p.name}.sigstore.json', present, options)
+            if _needed(signing.bundle_path(p).name, present, options)
         ]
-        if todo:
+        if options.sigstore_later:
+            deferred = todo
+        elif todo:
             produced.extend(signing.sigstore_sign(todo))
     # The list and its signature are a pair: if either is missing both are
     # regenerated, so the uploaded signature matches the uploaded list.
@@ -184,7 +235,20 @@ def _make_signatures(
         produced.append(sums)
         if options.gpg:
             produced.append(signing.gpg_sign(sums, options.gpg_key))
-    return produced
+    return produced, deferred
+
+
+def _stage_pending(
+    deferred: list[pathlib.Path], directory: pathlib.Path
+) -> list[pathlib.Path]:
+    """Copy dists that still need a bundle out of the per-release dir."""
+    directory.mkdir(parents=True, exist_ok=True)
+    staged: list[pathlib.Path] = []
+    for path in deferred:
+        target: pathlib.Path = directory / path.name
+        shutil.copy2(path, target)
+        staged.append(target)
+    return staged
 
 
 def _split_signatures(
@@ -241,11 +305,47 @@ def _append_footer(
 
 
 def _finish(outcome: SignOutcome) -> SignOutcome:
-    if outcome.uploaded:
+    if outcome.pending_bundles:
+        outcome.status = PENDING
+    elif outcome.uploaded:
         outcome.status = 'signed'
     else:
         outcome.status = 'already signed'
     return outcome
+
+
+def finish_pending(
+    release: github.Release,
+    outcome: SignOutcome,
+    rebuilt_names: list[str],
+    options: SignOptions,
+) -> SignOutcome:
+    """Upload the deferred Sigstore bundles of one release, then the footer.
+
+    The caller has run ``signing.sigstore_sign`` on
+    ``outcome.pending_bundles``, so each bundle sits next to its copy. The
+    footer waits until now because it promises a bundle for every file.
+    """
+    try:
+        bundles: list[pathlib.Path] = [
+            signing.bundle_path(path) for path in outcome.pending_bundles
+        ]
+        missing: list[str] = [b.name for b in bundles if not b.exists()]
+        if missing:
+            raise signing.SigningError(
+                'sigstore wrote no bundle for ' + ', '.join(missing)
+            )
+        present: set[str] = {a.name for a in release.assets}
+        new: list[pathlib.Path] = [b for b in bundles if b.name not in present]
+        clobber: list[pathlib.Path] = [b for b in bundles if b.name in present]
+        _upload(release, new, clobber, options, outcome)
+        _append_footer(release, rebuilt_names, options)
+    except HANDLED_ERRORS as error:
+        outcome.status = 'failed'
+        outcome.reason = str(error)
+        return outcome
+    outcome.pending_bundles = []
+    return _finish(outcome)
 
 
 def _dry_run(
@@ -306,46 +406,70 @@ def sign_release(
         return outcome
     if options.dry_run:
         return _dry_run(release, files, options, outcome)
-    rebuilt_names: list[str] = [
-        f.name for f in files if isinstance(f, pathlib.Path)
-    ]
-    workdir = workdir / release.tag
+    release_dir: pathlib.Path = workdir / release.tag
     try:
-        workdir.mkdir(parents=True, exist_ok=True)
-        dists: list[pathlib.Path] = _local_dists(files, workdir)
-        new, clobber = _compare_dists(
-            release, dists, workdir, options, outcome
-        )
-        if outcome.conflicts and not options.replace_assets:
-            outcome.status = 'failed'
-            outcome.reason = 'conflicting assets left alone: ' + ', '.join(
-                outcome.conflicts
-            )
+        release_dir.mkdir(parents=True, exist_ok=True)
+        if not _sign_files(
+            release, files, release_dir, workdir, options, outcome
+        ):
             return outcome
-        present: set[str] = {a.name for a in release.assets}
-        produced: list[pathlib.Path] = _make_signatures(
-            dists, workdir, options, present
-        )
-        sig_new, sig_clobber = _split_signatures(
-            produced, present, [d.name for d in dists], options, outcome
-        )
-        _upload(
-            release, new + sig_new, clobber + sig_clobber, options, outcome
-        )
-        _append_footer(release, rebuilt_names, options)
     except HANDLED_ERRORS as error:
         outcome.status = 'failed'
         outcome.reason = str(error)
         return outcome
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(release_dir, ignore_errors=True)
     return _finish(outcome)
+
+
+def _sign_files(
+    release: github.Release,
+    files: list[pypi.PypiFile] | list[pathlib.Path],
+    release_dir: pathlib.Path,
+    workdir: pathlib.Path,
+    options: SignOptions,
+    outcome: SignOutcome,
+) -> bool:
+    """The steps of ``sign_release``, False when conflicts stop it.
+
+    Deferred bundles are staged in ``workdir / 'bundles' / tag``, which
+    outlives ``release_dir``, and the footer then waits for them.
+    """
+    dists: list[pathlib.Path] = _local_dists(files, release_dir)
+    new, clobber = _compare_dists(
+        release, dists, release_dir, options, outcome
+    )
+    if outcome.conflicts and not options.replace_assets:
+        outcome.status = 'failed'
+        outcome.reason = 'conflicting assets left alone: ' + ', '.join(
+            outcome.conflicts
+        )
+        return False
+    present: set[str] = {a.name for a in release.assets}
+    produced, deferred = _make_signatures(dists, release_dir, options, present)
+    sig_new, sig_clobber = _split_signatures(
+        produced, present, [d.name for d in dists], options, outcome
+    )
+    _upload(release, new + sig_new, clobber + sig_clobber, options, outcome)
+    rebuilt_names: list[str] = [
+        f.name for f in files if isinstance(f, pathlib.Path)
+    ]
+    if deferred:
+        outcome.pending_bundles = _stage_pending(
+            deferred, workdir / BUNDLES_DIR / release.tag
+        )
+    else:
+        _append_footer(release, rebuilt_names, options)
+    return True
 
 
 def releases_missing_signatures(
     repo: str, project: pypi.Project
 ) -> list[github.Release]:
-    """Releases of a PyPI version that lack a ``.asc`` for any of its files."""
+    """Releases of a PyPI version where any file lacks a signature.
+
+    A file needs both its ``.asc`` and its ``.sigstore.json``.
+    """
     all_releases: list[github.Release] = github.releases(repo)
     tags: list[github.Tag] = [github.Tag(r.tag, '') for r in all_releases]
     by_tag: dict[str, github.Release] = {r.tag: r for r in all_releases}
@@ -358,7 +482,15 @@ def releases_missing_signatures(
         seen.add(tag.name)
         release: github.Release = by_tag[tag.name]
         names: set[str] = {a.name for a in release.assets}
-        if any(f'{f.filename}.asc' not in names for f in files):
+        wanted: set[str] = {
+            name
+            for f in files
+            for name in (
+                f'{f.filename}.asc',
+                f'{f.filename}{signing.BUNDLE_SUFFIX}',
+            )
+        }
+        if not wanted <= names:
             missing.append(release)
     return missing
 

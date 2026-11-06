@@ -13,6 +13,7 @@ import dataclasses
 import hashlib
 import http.client
 import json
+import os
 import pathlib
 import subprocess
 import urllib.error
@@ -45,11 +46,39 @@ def run(
     args: list[str],
     check: bool = False,
     cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+    capture: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a command and capture its output as text."""
-    return subprocess.run(
-        args, capture_output=True, text=True, check=check, cwd=cwd
+    """Run a command and capture its output as text.
+
+    ``env`` is merged over ``os.environ``. With ``capture=False`` the
+    command talks to the terminal directly and stdout and stderr are None.
+    """
+    merged: dict[str, str] | None = (
+        None if env is None else {**os.environ, **env}
     )
+    return subprocess.run(
+        args,
+        capture_output=capture,
+        text=True,
+        check=check,
+        cwd=cwd,
+        env=merged,
+    )
+
+
+def run_bytes(args: list[str], cwd: pathlib.Path | None = None) -> bytes:
+    """Run a command and return its stdout undecoded, raising on failure.
+
+    For output that is not text, such as the blob of a binary file.
+    """
+    done: subprocess.CompletedProcess[bytes] = subprocess.run(
+        args, capture_output=True, cwd=cwd
+    )
+    if done.returncode != 0:
+        error: str = done.stderr.decode(errors='replace').strip()
+        raise RuntimeError(f'{" ".join(args)}: {error}')
+    return done.stdout
 
 
 def gh_json(args: list[str]) -> object | None:

@@ -7,12 +7,16 @@ Pure mechanics with no policy. Every subprocess goes through
 from __future__ import annotations
 
 import pathlib
+import shutil
+import tempfile
 
 from python_project_tools import common
 
 DEFAULT_GPG_KEY: str = '149325FD15904E9C4EB89E95E81444E9CE1F695D'
-SIGSTORE_ARGV: list[str] = ['uvx', 'sigstore']
+# Pinned, so a new sigstore release cannot change what a run signs with.
+SIGSTORE_ARGV: list[str] = ['uvx', 'sigstore==4.5.1']
 SHA256SUMS_NAME: str = 'SHA256SUMS'
+BUNDLE_SUFFIX: str = '.sigstore.json'
 
 
 class SigningError(Exception):
@@ -53,40 +57,88 @@ def gpg_verify(path: pathlib.Path, signature: pathlib.Path) -> bool:
     return done.returncode == 0
 
 
-def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
-    """Sign all files in one sigstore invocation, return the bundle paths.
+def bundle_path(path: pathlib.Path) -> pathlib.Path:
+    """Where the Sigstore bundle of a file lives: ``<file>.sigstore.json``."""
+    return path.with_name(path.name + BUNDLE_SUFFIX)
 
-    The OIDC flow is interactive, so one invocation means one login.
+
+def _sigstore_run(directory: pathlib.Path, paths: list[pathlib.Path]) -> None:
+    """One sigstore invocation for files that all live in ``directory``.
+
+    Output is not captured, so the browser prompt and the fallback URL of
+    the OIDC flow reach the terminal.
     """
-    if not paths:
-        return []
-    parents: set[pathlib.Path] = {path.parent for path in paths}
-    if len(parents) != 1:
-        raise SigningError(
-            'sigstore needs all files in one directory, got '
-            + ', '.join(sorted(str(parent) for parent in parents))
-        )
     done = common.run(
         [
             *SIGSTORE_ARGV,
             'sign',
             '--output-directory',
-            str(paths[0].parent),
+            str(directory),
             '--overwrite',
             *map(str, paths),
-        ]
+        ],
+        capture=False,
     )
     if done.returncode != 0:
-        raise SigningError(f'sigstore failed: {done.stderr.strip()}')
-    bundles: list[pathlib.Path] = [
-        path.with_name(path.name + '.sigstore.json') for path in paths
-    ]
+        detail: str = (done.stderr or '').strip() or 'see its output above'
+        raise SigningError(
+            f'sigstore failed with exit status {done.returncode}: {detail}'
+        )
+
+
+def _existing_bundles(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+    bundles: list[pathlib.Path] = [bundle_path(path) for path in paths]
     missing: list[str] = [b.name for b in bundles if not b.exists()]
     if missing:
         raise SigningError(
             'sigstore wrote no bundle for ' + ', '.join(missing)
         )
     return bundles
+
+
+def _sign_staged(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+    """Copy files from several directories into one, sign, move back.
+
+    The bundle covers the file's bytes, not its path, so a bundle made for
+    the staged copy is the bundle of the original.
+    """
+    names: list[str] = [path.name for path in paths]
+    duplicates: list[str] = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise SigningError(
+            'sigstore staging needs unique file names, got '
+            + ', '.join(duplicates)
+        )
+    with tempfile.TemporaryDirectory(prefix='ppt-sigstore-') as directory:
+        staging: pathlib.Path = pathlib.Path(directory)
+        staged: list[pathlib.Path] = []
+        for path in paths:
+            copy: pathlib.Path = staging / path.name
+            shutil.copy2(path, copy)
+            staged.append(copy)
+        _sigstore_run(staging, staged)
+        bundles: list[pathlib.Path] = _existing_bundles(staged)
+        targets: list[pathlib.Path] = [bundle_path(path) for path in paths]
+        for bundle, target in zip(bundles, targets, strict=True):
+            shutil.move(bundle, target)
+    return targets
+
+
+def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+    """Sign all files in one sigstore invocation, return the bundle paths.
+
+    The OIDC flow is interactive, so one invocation means one login. Files
+    from several directories are staged in one directory first, so they
+    still take one invocation, and their names must then be unique. Each
+    bundle ends up next to its file.
+    """
+    if not paths:
+        return []
+    parents: set[pathlib.Path] = {path.parent for path in paths}
+    if len(parents) != 1:
+        return _sign_staged(paths)
+    _sigstore_run(paths[0].parent, paths)
+    return _existing_bundles(paths)
 
 
 def write_sha256sums(

@@ -5,11 +5,13 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import shutil
+import tarfile
 
 import pytest
 
-from python_project_tools import cli, match_tag, pypi
+from python_project_tools import cli, common, match_tag, pypi, signing
 from tests.conftest import ScratchRepo, git
+from tests.fakes import Recorder, completed
 
 needs_gpg = pytest.mark.skipif(
     shutil.which('gpg') is None, reason='gpg is not installed'
@@ -106,6 +108,157 @@ def test_workflow_with_tag_trigger_detects_publish(
     assert without == []
 
 
+TAG_PUSH_CASES: list[tuple[str, bool]] = [
+    # The 2020 pattern: a bare push trigger, the tag check inside the job.
+    (
+        'on: push\njobs:\n  publish:\n'
+        "    if: startsWith(github.ref, 'refs/tags')\n",
+        True,
+    ),
+    ('on: [push, pull_request]\n', True),
+    ('on: [pull_request]\n', False),
+    ('on: [pull_request,\n  create]\n', True),
+    ('on: pull_request  # not push\n', False),
+    ('on:\n  push:\n', True),
+    ('on:\n  push:\n    paths: [spam]\n', True),
+    ('on:\n  push:\n    branches: [master]\n', False),
+    ('on:\n  push:\n    branches-ignore: [eggs]\n  pull_request:\n', False),
+    ('on:\n  push:\n    branches: [master]\n    tags: ["v*"]\n', True),
+    ('on:\n  push:\n    tags-ignore: [spam]\n', True),
+    ('on:\n  push:\n    branches:\n    - master\n  release:\n', False),
+    ('on:\n  create:\n', True),
+    ('on:\n  - push\n  - pull_request\n', True),
+    ('on:\n- pull_request\n- create\n', True),
+    ('on:\n  pull_request:\n    branches: [master]\n', False),
+    ('"on":\n  push:\n    branches:\n      - master\njobs: {}\n', False),
+    ('on:\n  push: {branches: [master]}\n', False),
+    ('on:\n  push: {tags: [v1]}\n', True),
+    # A top-level flow map is read loosely: push in it always counts.
+    ('on: {push: {branches: [master]}}\n', True),
+    ('on: {pull_request: {branches: [master]}}\n', False),
+    ('on: {pull_request: {}, create: {}}\n', True),
+    ('on:\n  push:  # all\n    branches: [master]\n    # tags: [v1]\n', False),
+    # No readable on key at all: over-report.
+    ('jobs: {}\n', True),
+]
+
+
+@pytest.mark.parametrize(('text', 'expected'), TAG_PUSH_CASES)
+def test_fires_on_tag_push(text: str, expected: bool) -> None:
+    assert match_tag.fires_on_tag_push(text) is expected
+
+
+def test_workflow_with_tag_trigger_reads_bare_push(
+    scratch_repo: ScratchRepo,
+) -> None:
+    flows: pathlib.Path = scratch_repo.path / '.github' / 'workflows'
+    flows.mkdir(parents=True)
+    (flows / 'old.yml').write_text(
+        'on: push\njobs:\n  publish:\n'
+        "    if: startsWith(github.ref, 'refs/tags')\n"
+    )
+    (flows / 'ci.yaml').write_text('on:\n  push:\n    branches: [master]\n')
+    (flows / 'notes.txt').write_text('on: push\n')
+    git(scratch_repo.path, 'add', '-A')
+    git(scratch_repo.path, 'commit', '-q', '-m', 'old workflow')
+    head: str = git(scratch_repo.path, 'rev-parse', 'HEAD')
+    assert match_tag.workflow_with_tag_trigger(scratch_repo.path, head) == [
+        'old.yml'
+    ]
+
+
+def test_workflow_with_release_trigger_returns_paths(
+    scratch_repo: ScratchRepo,
+) -> None:
+    flows: pathlib.Path = scratch_repo.path / '.github' / 'workflows'
+    flows.mkdir(parents=True)
+    (flows / 'publish.yml').write_text('on: {release: {types: [created]}}\n')
+    (flows / 'ci.yml').write_text('on: [push]\n')
+    git(scratch_repo.path, 'add', '-A')
+    git(scratch_repo.path, 'commit', '-q', '-m', 'release workflow')
+    head: str = git(scratch_repo.path, 'rev-parse', 'HEAD')
+    found: list[str] = match_tag.workflow_with_release_trigger(
+        scratch_repo.path, head
+    )
+    assert found == ['.github/workflows/publish.yml']
+    assert (
+        match_tag.workflow_with_release_trigger(
+            scratch_repo.path, scratch_repo.shas[0]
+        )
+        == []
+    )
+
+
+def test_compare_counts_a_file_tracked_elsewhere_as_differing(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    # A is the 1.1 bump, B adds a file on top and the release came from B.
+    path: pathlib.Path = scratch_repo.path
+    bump: str = scratch_repo.shas[1]
+    git(path, 'checkout', '-q', '-b', 'release-1.1', bump)
+    (path / 'spam' / 'eggs.py').write_text('EGGS = 1\n')
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'add eggs')
+    cut: str = git(path, 'rev-parse', 'HEAD')
+    sdist: pathlib.Path = archive(
+        scratch_repo, cut, tmp_path / 'spam-1.1.tar.gz'
+    )
+    at_bump: match_tag.Candidate = match_tag.compare(path, bump, sdist)
+    assert at_bump.differing == ['spam/eggs.py']
+    at_cut: match_tag.Candidate = match_tag.compare(path, cut, sdist)
+    assert at_cut.differing == []
+    uploaded: dt.datetime = at_bump.committed
+    assert match_tag.choose([at_bump, at_cut], uploaded) is at_cut
+
+
+def test_compare_skips_untracked_generated_and_build_files(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    # setup.cfg is tracked elsewhere in history, but not at the candidate,
+    # so as a GENERATED name it is still skipped.
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'checkout', '-q', '-b', 'later', scratch_repo.shas[2])
+    (path / 'setup.cfg').write_text('[metadata]\nname = spam\n')
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'setup.cfg')
+    sdist: pathlib.Path = archive(
+        scratch_repo, scratch_repo.shas[1], tmp_path / 'plain.tar.gz'
+    )
+    extracted: pathlib.Path = tmp_path / 'x'
+    with tarfile.open(sdist) as tar:
+        tar.extractall(extracted, filter='data')
+    top: pathlib.Path = extracted / 'spam-1.1'
+    (top / 'PKG-INFO').write_text('Metadata-Version: 2.1\n')
+    (top / 'setup.cfg').write_text('[egg_info]\ntag_build =\n')
+    (top / 'spam' / '_build.py').write_text('generated\n')
+    rebuilt: pathlib.Path = tmp_path / 'spam-1.1.tar.gz'
+    with tarfile.open(rebuilt, 'w:gz') as tar:
+        tar.add(top, arcname='spam-1.1')
+    found: match_tag.Candidate = match_tag.compare(
+        scratch_repo.path, scratch_repo.shas[1], rebuilt
+    )
+    assert found.differing == []
+    assert found.matched == 3
+
+
+def test_compare_reports_a_tracked_setup_cfg_that_differs(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    (path / 'setup.cfg').write_text('[metadata]\nname = spam\n')
+    git(path, 'add', '-A')
+    git(path, 'commit', '-q', '-m', 'setup.cfg')
+    first: str = git(path, 'rev-parse', 'HEAD')
+    (path / 'setup.cfg').write_text('[metadata]\nname = eggs\n')
+    git(path, 'commit', '-q', '-am', 'rename')
+    second: str = git(path, 'rev-parse', 'HEAD')
+    sdist: pathlib.Path = archive(
+        scratch_repo, second, tmp_path / 'spam-1.2.tar.gz'
+    )
+    assert match_tag.compare(path, first, sdist).differing == ['setup.cfg']
+    assert match_tag.compare(path, second, sdist).differing == []
+
+
 def fake_pypi(
     monkeypatch: pytest.MonkeyPatch, repo: ScratchRepo, sha: str
 ) -> None:
@@ -143,8 +296,11 @@ def test_main_refuses_push_when_workflow_would_fire(
     monkeypatch.setattr(
         match_tag, 'push_tag', lambda checkout, tag: pushed.append(tag)
     )
+    keys: list[str] = []
     monkeypatch.setattr(
-        match_tag, 'create_tag', lambda checkout, tag, sha, message: None
+        match_tag,
+        'create_tag',
+        lambda checkout, tag, sha, message, key: keys.append(key),
     )
     argv: list[str] = [
         'spam',
@@ -157,8 +313,10 @@ def test_main_refuses_push_when_workflow_would_fire(
     assert match_tag.main(argv) == 2
     assert 'allow-workflow-trigger' in capsys.readouterr().err
     assert pushed == []
-    assert match_tag.main([*argv, '--allow-workflow-trigger']) == 0
+    allowed: list[str] = [*argv, '--allow-workflow-trigger']
+    assert match_tag.main([*allowed, '--gpg-key', 'SPAM']) == 0
     assert pushed == ['v1.1']
+    assert keys == ['SPAM']
 
 
 def test_main_without_match_exits_one(
@@ -200,7 +358,7 @@ def test_main_refuses_an_existing_tag(
     monkeypatch.setattr(
         match_tag,
         'create_tag',
-        lambda checkout, tag, sha, msg: created.append(tag),
+        lambda checkout, tag, sha, msg, key: created.append(tag),
     )
     argv: list[str] = [
         'spam',
@@ -233,15 +391,31 @@ def test_main_without_sdist_exits_one(
 def test_create_tag_is_signed_and_annotated(
     scratch_repo: ScratchRepo, gnupg_home: str
 ) -> None:
-    git(scratch_repo.path, 'config', 'user.signingkey', gnupg_home)
+    # No user.signingkey: the key comes from the argument alone.
     match_tag.create_tag(
-        scratch_repo.path, 'v1.1', scratch_repo.shas[1], 'spam message'
+        scratch_repo.path,
+        'v1.1',
+        scratch_repo.shas[1],
+        'spam message',
+        key=gnupg_home,
     )
     assert git(scratch_repo.path, 'cat-file', '-t', 'v1.1') == 'tag'
     body: str = git(scratch_repo.path, 'cat-file', 'tag', 'v1.1')
     assert 'BEGIN PGP SIGNATURE' in body
     resolved: str = git(scratch_repo.path, 'rev-parse', 'v1.1^{}')
     assert resolved == scratch_repo.shas[1]
+
+
+def test_create_tag_passes_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec: Recorder = Recorder({'git tag': completed()})
+    monkeypatch.setattr(common, 'run', rec)
+    match_tag.create_tag(pathlib.Path(), 'v1', 'abc', 'msg')
+    match_tag.create_tag(pathlib.Path(), 'v2', 'abc', 'msg', key='SPAM')
+    default: str = signing.DEFAULT_GPG_KEY
+    assert rec.calls == [
+        ['git', 'tag', '-s', '-u', default, 'v1', 'abc', '-m', 'msg'],
+        ['git', 'tag', '-s', '-u', 'SPAM', 'v2', 'abc', '-m', 'msg'],
+    ]
 
 
 def test_match_tag_is_registered() -> None:

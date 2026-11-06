@@ -64,12 +64,85 @@ def test_releases_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
-def test_latest_release_none_on_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    rec: Recorder = Recorder(
-        {f'gh api repos/{REPO}/releases/latest': completed('', 1)}
-    )
+LATEST: str = f'gh api repos/{REPO}/releases/latest'
+
+
+@pytest.mark.parametrize(
+    ('stdout', 'stderr'),
+    [
+        ('', 'gh: Not Found (HTTP 404)'),
+        ('{"message": "Not Found", "status": "404"}', 'gh: HTTP 404'),
+    ],
+)
+def test_latest_release_none_on_404(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, stderr: str
+) -> None:
+    rec: Recorder = Recorder({LATEST: completed(stdout, 1, stderr)})
     monkeypatch.setattr(common, 'run', rec)
     assert github.latest_release(REPO) is None
+
+
+def test_latest_release_raises_on_other_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec: Recorder = Recorder(
+        {LATEST: completed('', 1, 'gh: Bad credentials (HTTP 401)')}
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    with pytest.raises(RuntimeError, match='HTTP 401'):
+        github.latest_release(REPO)
+    rec.replies[LATEST] = completed('', 1, 'connection reset')
+    with pytest.raises(RuntimeError, match='connection reset'):
+        github.latest_release(REPO)
+    rec.replies[LATEST] = completed('not json')
+    with pytest.raises(RuntimeError):
+        github.latest_release(REPO)
+
+
+def test_latest_release_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec: Recorder = Recorder({LATEST: completed(_release_json('v2.0'))})
+    monkeypatch.setattr(common, 'run', rec)
+    found: github.Release | None = github.latest_release(REPO)
+    assert found is not None
+    assert found.tag == 'v2.0'
+
+
+def test_mark_latest(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec: Recorder = Recorder({'gh release edit': completed()})
+    monkeypatch.setattr(common, 'run', rec)
+    github.mark_latest(REPO, 'v1.0')
+    assert rec.calls == [
+        ['gh', 'release', 'edit', 'v1.0', '--repo', REPO, '--latest']
+    ]
+    rec.replies['gh release edit'] = completed('', 1, 'no such release')
+    with pytest.raises(RuntimeError, match='no such release'):
+        github.mark_latest(REPO, 'v1.0')
+
+
+def test_workflow_paths_by_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    listing: str = json.dumps(
+        {
+            'workflows': [
+                {'path': f'{WORKFLOWS}/a.yml', 'state': 'active'},
+                {'path': f'{WORKFLOWS}/b.yml', 'state': 'disabled_manually'},
+                {'path': f'{WORKFLOWS}/c.yml', 'state': 'disabled_inactivity'},
+                {'path': f'{WORKFLOWS}/d.yml', 'state': 'deleted'},
+            ]
+        }
+    )
+    rec: Recorder = Recorder(
+        {
+            f'gh api --paginate repos/{REPO}/actions/workflows': completed(
+                listing
+            )
+        }
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    assert github.active_workflow_paths(REPO) == {f'{WORKFLOWS}/a.yml'}
+    assert github.disabled_workflow_paths(REPO) == {
+        f'{WORKFLOWS}/b.yml',
+        f'{WORKFLOWS}/c.yml',
+    }
 
 
 def test_create_release_passes_latest_false_and_verify_tag(
@@ -168,7 +241,13 @@ def test_release_triggered_workflows_reads_active_files(
         ('on:\n  release:\n', True),
         ('on:\n  release: {types: [created]}\n', True),
         ('on: [push, release]\n', True),
+        ('on: [release]\n', True),
+        ('on: {release: {types: [published]}}\n', True),
+        ('on: {push: {branches: [master]}, release: {}}\n', True),
+        ('"on": {release: null}\n', True),
+        ('on: {push: {branches: [master]}}\n', False),
         ('on: release\n', True),
+        ('on: release  # publish\n', True),
         ('on:\n  push:\n', False),
         ('on:\n  workflow_dispatch:\n# release: later\n', False),
     ],

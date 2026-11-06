@@ -284,11 +284,62 @@ def test_footer_names_rebuilt_files(
     assert len(world.edits) == 1
     body: str = world.edits[0]
     assert body.startswith('Release notes\n\n' + sign.FOOTER_MARKER)
-    assert 'Rebuilt files, if any: s.whl.' in body
+    assert sign.FILES_WITH_REBUILT in body
+    assert body.endswith('Rebuilt files:\n\n- s.whl\n')
     assert 'Signed on 2026-11-06' in body
     assert signing.DEFAULT_GPG_KEY in body
     assert sign.VERIFY_URL in body
-    assert 'Rebuilt files, if any: none.' in sign.footer(options, [])
+
+
+def _footer_lines(text: str) -> list[str]:
+    return text.splitlines()
+
+
+def test_footer_for_pypi_files_only(options: sign.SignOptions) -> None:
+    lines: list[str] = _footer_lines(sign.footer(options, []))
+    key: str = signing.DEFAULT_GPG_KEY
+    assert lines == [
+        sign.FOOTER_MARKER,
+        'Signed on 2026-11-06 with `ppt sign`, after the release.',
+        'The files above are the exact PyPI uploads for this version, '
+        'verified by sha256 against PyPI before signing.',
+        f'Each file has a GPG signature (`.asc`, key {key}) and a Sigstore '
+        'bundle (`.sigstore.json`).',
+        '`SHA256SUMS.asc` signs the checksum list.',
+        'Rebuilt files, if any: none.',
+        f'How to verify: {sign.VERIFY_URL}',
+    ]
+
+
+def test_footer_with_rebuilt_files(options: sign.SignOptions) -> None:
+    text: str = sign.footer(options, ['s.whl', 's.tar.gz'])
+    lines: list[str] = _footer_lines(text)
+    assert lines[0] == sign.FOOTER_MARKER
+    assert lines[2] == (
+        'The files above are the PyPI uploads for this version where PyPI '
+        'has them, verified by sha256 against PyPI before signing, except '
+        'the rebuilt files listed below, which were built from the tag and '
+        'are marked in SHA256SUMS.'
+    )
+    assert 'Rebuilt files, if any: none.' not in text
+    assert f'How to verify: {sign.VERIFY_URL}' in lines
+    assert text.endswith('\nRebuilt files:\n\n- s.whl\n- s.tar.gz\n')
+
+
+def test_footer_for_the_multi_version_release(
+    options: sign.SignOptions,
+) -> None:
+    options.multi_version = True
+    text: str = sign.footer(options, [])
+    lines: list[str] = _footer_lines(text)
+    assert lines[0] == sign.FOOTER_MARKER
+    assert lines[2] == (
+        'The files above are the exact PyPI uploads of the versions listed '
+        'in these notes, each verified by sha256 against PyPI before signing.'
+    )
+    assert 'Rebuilt files' not in text
+    assert signing.DEFAULT_GPG_KEY in text
+    assert lines[-1] == f'How to verify: {sign.VERIFY_URL}'
 
 
 def test_dry_run_performs_nothing(
@@ -343,22 +394,88 @@ def test_releases_missing_signatures_picks_releases_without_asc(
     monkeypatch: pytest.MonkeyPatch,
     files: list[pypi.PypiFile],
 ) -> None:
-    signed: github.Release = release(
-        ['s.whl', 's.whl.asc', 's.tar.gz', 's.tar.gz.asc'], tag='v1.0'
-    )
+    signed: github.Release = release(ALL_NAMES, tag='v1.0')
     half: github.Release = release(['s.whl', 's.whl.asc'], tag='v2.0')
     bare: github.Release = release([], tag='v3.0')
+    gpg_only: github.Release = release(
+        ['s.whl', 's.whl.asc', 's.tar.gz', 's.tar.gz.asc'], tag='v5.0'
+    )
+    no_gpg: github.Release = release(
+        [n for n in ALL_NAMES if n != 's.tar.gz.asc'], tag='v6.0'
+    )
     stray: github.Release = release([], tag='v9.9')
     monkeypatch.setattr(
-        github, 'releases', lambda repo: [signed, half, bare, stray]
+        github,
+        'releases',
+        lambda repo: [signed, half, bare, gpg_only, no_gpg, stray],
     )
     project: pypi.Project = project_with(
-        {'1.0': files, '2.0': files, '3.0': files, '4.0': []}
+        {
+            '1.0': files,
+            '2.0': files,
+            '3.0': files,
+            '4.0': [],
+            '5.0': files,
+            '6.0': files,
+        }
     )
     missing: list[github.Release] = sign.releases_missing_signatures(
         'o/r', project
     )
-    assert [r.tag for r in missing] == ['v2.0', 'v3.0']
+    assert [r.tag for r in missing] == ['v2.0', 'v3.0', 'v5.0', 'v6.0']
+
+
+def test_sigstore_later_defers_bundles_and_footer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    options.sigstore_later = True
+    target: github.Release = release([])
+    out: sign.SignOutcome = sign.sign_release(target, files, tmp_path, options)
+    assert world.sigstore_calls == 0
+    assert not any(n.endswith('.sigstore.json') for n in out.uploaded)
+    assert 's.whl.asc' in out.uploaded
+    assert 'SHA256SUMS.asc' in out.uploaded
+    assert out.status == sign.PENDING
+    assert world.edits == []
+    bundles_dir: pathlib.Path = tmp_path / 'bundles' / 'v1.0'
+    assert out.pending_bundles == [
+        bundles_dir / 's.whl',
+        bundles_dir / 's.tar.gz',
+    ]
+    assert (bundles_dir / 's.whl').read_bytes() == WHL_BYTES
+    assert not (tmp_path / 'v1.0').exists()
+    for path in out.pending_bundles:
+        signing.bundle_path(path).write_text('bundle')
+    done: sign.SignOutcome = sign.finish_pending(target, out, [], options)
+    assert done.status == 'signed'
+    assert done.pending_bundles == []
+    assert world.uploads[-1] == Upload(
+        ['s.whl.sigstore.json', 's.tar.gz.sigstore.json'], False
+    )
+    assert len(world.edits) == 1
+    assert world.edits[0].startswith(sign.FOOTER_MARKER)
+
+
+def test_finish_pending_fails_without_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    options.sigstore_later = True
+    target: github.Release = release([])
+    out: sign.SignOutcome = sign.sign_release(target, files, tmp_path, options)
+    uploads: int = len(world.uploads)
+    done: sign.SignOutcome = sign.finish_pending(target, out, [], options)
+    assert done.status == 'failed'
+    assert 'sigstore wrote no bundle' in done.reason
+    assert len(world.uploads) == uploads
+    assert world.edits == []
 
 
 def test_main_signs_one_tag_and_exits_zero(

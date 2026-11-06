@@ -19,11 +19,15 @@ import typing
 from python_project_tools import common
 
 # Ways a workflow file can say it runs on a release event.
+_ON_KEY: str = r'^[ \t]*(?:on|"on"|\'on\'):[ \t]*'
 _RELEASE_TRIGGERS: tuple[re.Pattern[str], ...] = (
     re.compile(r'^[ \t]*release:[ \t]*(?:\{|#|$)', re.MULTILINE),
-    re.compile(r'^[ \t]*on:[ \t]*release[ \t]*$', re.MULTILINE),
-    re.compile(r'^[ \t]*on:[ \t]*\[[^\]]*\brelease\b', re.MULTILINE),
+    re.compile(_ON_KEY + r'release[ \t]*(?:#|$)', re.MULTILINE),
+    # Flow styles: on: [push, release] and on: {release: {...}}.
+    re.compile(_ON_KEY + r'\[[^\]]*\brelease\b', re.MULTILINE),
+    re.compile(_ON_KEY + r'\{.*\brelease\b', re.MULTILINE),
 )
+_DISABLED_PREFIX: str = 'disabled'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,14 +123,41 @@ def releases(repo: str) -> list[Release]:
     return [_release(item) for item in raw]
 
 
+def _not_found(done: subprocess.CompletedProcess[str]) -> bool:
+    text: str = f'{done.stderr or ""}\n{done.stdout or ""}'
+    return 'HTTP 404' in text or 'Not Found' in text
+
+
 def latest_release(repo: str) -> Release | None:
-    """The release GitHub marks as latest, or None when there is none."""
-    raw: object | None = common.gh_json(
-        ['api', f'repos/{repo}/releases/latest']
+    """The release GitHub marks as latest, or None when there is none.
+
+    Only a 404 means "none". Any other failure raises RuntimeError, so an
+    outage never reads as "this repository has no latest release".
+    """
+    path: str = f'repos/{repo}/releases/latest'
+    done: subprocess.CompletedProcess[str] = common.run(['gh', 'api', path])
+    if done.returncode != 0:
+        if _not_found(done):
+            return None
+        raise RuntimeError(f'gh api {path} failed: {done.stderr.strip()}')
+    try:
+        raw: object = json.loads(done.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f'gh api {path}: {error}') from error
+    if isinstance(raw, dict):
+        return _release(typing.cast('dict[str, typing.Any]', raw))
+    raise RuntimeError(f'gh api {path}: not a release object')
+
+
+def mark_latest(repo: str, tag: str) -> None:
+    """Mark a release as the latest one."""
+    done: subprocess.CompletedProcess[str] = common.run(
+        ['gh', 'release', 'edit', tag, '--repo', repo, '--latest']
     )
-    if not isinstance(raw, dict):
-        return None
-    return _release(raw)
+    if done.returncode != 0:
+        raise RuntimeError(
+            f'gh release edit {tag} --latest failed: {done.stderr.strip()}'
+        )
 
 
 def _write_notes(directory: str, notes: str) -> pathlib.Path:
@@ -222,21 +253,48 @@ def _workflow_text(repo: str, path: str) -> str | None:
         return None
 
 
-def release_triggered_workflows(repo: str) -> list[str]:
-    """File names of active workflows that run on a release event."""
+def _workflow_states(repo: str) -> dict[str, str]:
+    """``{path: state}`` of every workflow GitHub knows for a repository."""
     pages: list[typing.Any] = typing.cast(
         'list[typing.Any]',
         _paginated(f'repos/{repo}/actions/workflows'),
     )
+    return {
+        str(workflow['path']): str(workflow.get('state', ''))
+        for page in pages
+        for workflow in page.get('workflows', [])
+    }
+
+
+def active_workflow_paths(repo: str) -> set[str]:
+    """Paths (``.github/workflows/x.yml``) of the active workflows."""
+    return {
+        path
+        for path, state in _workflow_states(repo).items()
+        if state == 'active'
+    }
+
+
+def disabled_workflow_paths(repo: str) -> set[str]:
+    """Paths of the workflows GitHub lists as disabled.
+
+    ``disabled_manually``, ``disabled_inactivity`` and ``disabled_fork``
+    all count. A deleted or unlisted workflow is not in this set.
+    """
+    return {
+        path
+        for path, state in _workflow_states(repo).items()
+        if state.startswith(_DISABLED_PREFIX)
+    }
+
+
+def release_triggered_workflows(repo: str) -> list[str]:
+    """File names of active workflows that run on a release event."""
     names: list[str] = []
-    for page in pages:
-        for workflow in page.get('workflows', []):
-            if workflow.get('state') != 'active':
-                continue
-            path: str = str(workflow['path'])
-            text: str | None = _workflow_text(repo, path)
-            if text is not None and _triggers_on_release(text):
-                names.append(pathlib.PurePosixPath(path).name)
+    for path in sorted(active_workflow_paths(repo)):
+        text: str | None = _workflow_text(repo, path)
+        if text is not None and _triggers_on_release(text):
+            names.append(pathlib.PurePosixPath(path).name)
     return names
 
 

@@ -53,18 +53,28 @@ def _sigstore_fake(
     skip: str = '',
 ) -> tuple[Recorder, collections.abc.Callable[..., object]]:
     """A Recorder plus a run replacement that also writes the bundles."""
-    rec: Recorder = Recorder({'uvx sigstore sign': completed()})
+    rec: Recorder = Recorder({'uvx sigstore==4.5.1 sign': completed()})
 
     def fake_run(
         args: list[str],
         check: bool = False,
         cwd: pathlib.Path | None = None,
+        env: dict[str, str] | None = None,
+        capture: bool = True,
     ) -> object:
+        # The OIDC prompt must reach the terminal.
+        assert capture is False
         reply: object = rec(args, check=check, cwd=cwd)
+        out: pathlib.Path = pathlib.Path(
+            args[args.index('--output-directory') + 1]
+        )
         for name in args[args.index('--overwrite') + 1 :]:
             if skip and name.endswith(skip):
                 continue
-            pathlib.Path(name + '.sigstore.json').write_text('{}')
+            source: pathlib.Path = pathlib.Path(name)
+            (out / (source.name + '.sigstore.json')).write_text(
+                f'bundle of {source.read_bytes().decode()}'
+            )
         return reply
 
     return rec, fake_run
@@ -77,7 +87,10 @@ def test_sigstore_sign_invokes_once_for_all_files(
     monkeypatch.setattr(common, 'run', fake_run)
     wheel: pathlib.Path = tmp_path / 'a.whl'
     sdist: pathlib.Path = tmp_path / 'a.tar.gz'
+    wheel.write_bytes(b'wheel')
+    sdist.write_bytes(b'sdist')
     out: list[pathlib.Path] = signing.sigstore_sign([wheel, sdist])
+    assert signing.SIGSTORE_ARGV == ['uvx', 'sigstore==4.5.1']
     assert rec.calls == [
         [
             *signing.SIGSTORE_ARGV,
@@ -101,24 +114,58 @@ def test_sigstore_sign_raises_when_bundle_missing(
 ) -> None:
     _, fake_run = _sigstore_fake(skip='a.tar.gz')
     monkeypatch.setattr(common, 'run', fake_run)
+    (tmp_path / 'a.whl').write_bytes(b'wheel')
+    (tmp_path / 'a.tar.gz').write_bytes(b'sdist')
     with pytest.raises(signing.SigningError, match=r'a\.tar\.gz\.sigstore'):
         signing.sigstore_sign([tmp_path / 'a.whl', tmp_path / 'a.tar.gz'])
 
 
-def test_sigstore_sign_rejects_mixed_directories(
+def test_sigstore_sign_stages_files_from_several_directories(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rec, fake_run = _sigstore_fake()
     monkeypatch.setattr(common, 'run', fake_run)
-    with pytest.raises(signing.SigningError, match='one directory'):
-        signing.sigstore_sign([tmp_path / 'a.whl', tmp_path / 'sub' / 'b.whl'])
+    first: pathlib.Path = tmp_path / 'v1.0' / 'a.whl'
+    second: pathlib.Path = tmp_path / 'v2.0' / 'b.whl'
+    for path in (first, second):
+        path.parent.mkdir()
+        path.write_bytes(path.name.encode())
+    out: list[pathlib.Path] = signing.sigstore_sign([first, second])
+    assert len(rec.calls) == 1
+    argv: list[str] = rec.calls[0]
+    staging: pathlib.Path = pathlib.Path(
+        argv[argv.index('--output-directory') + 1]
+    )
+    assert staging not in (first.parent, second.parent)
+    assert argv[argv.index('--overwrite') + 1 :] == [
+        str(staging / 'a.whl'),
+        str(staging / 'b.whl'),
+    ]
+    assert not staging.exists()
+    assert out == [
+        tmp_path / 'v1.0' / 'a.whl.sigstore.json',
+        tmp_path / 'v2.0' / 'b.whl.sigstore.json',
+    ]
+    assert out[0].read_text() == 'bundle of a.whl'
+    assert out[1].read_text() == 'bundle of b.whl'
+
+
+def test_sigstore_sign_refuses_duplicate_names_across_directories(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec, fake_run = _sigstore_fake()
+    monkeypatch.setattr(common, 'run', fake_run)
+    with pytest.raises(signing.SigningError, match='unique file names'):
+        signing.sigstore_sign([tmp_path / 'a.whl', tmp_path / 'sub' / 'a.whl'])
     assert rec.calls == []
 
 
 def test_sigstore_sign_raises_on_nonzero_exit(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rec: Recorder = Recorder({'uvx sigstore sign': completed(returncode=1)})
+    rec: Recorder = Recorder(
+        {'uvx sigstore==4.5.1 sign': completed(returncode=1)}
+    )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match='sigstore failed'):
         signing.sigstore_sign([tmp_path / 'a.whl'])

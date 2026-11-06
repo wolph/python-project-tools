@@ -18,6 +18,7 @@ from python_project_tools import (
     pypi,
     rebuild,
     sign,
+    signing,
 )
 from tests.conftest import ScratchRepo, git
 from tests.fakes import Recorder, completed
@@ -87,6 +88,13 @@ class World:
         self.rebuild_raises: dict[str, Exception] = {}
         self.sign_status: str = 'signed'
         self.rec: Recorder = Recorder({})
+        self.repo_meta: object | None = {'archived': False}
+        self.marked: list[str] = []
+        self.release_workflows: list[str] = []
+        self.release_shas: list[str] = []
+        self.disabled: set[str] = set()
+        self.tag_keys: list[str] = []
+        self.assets: dict[str, bytes] = {}
 
 
 def _sign_release(
@@ -195,9 +203,14 @@ def install(
     )
 
     def create_tag(
-        checkout: pathlib.Path, tag: str, sha: str, message: str
+        checkout: pathlib.Path,
+        tag: str,
+        sha: str,
+        message: str,
+        key: str = '',
     ) -> None:
         world.new_tags.append((tag, sha, message))
+        world.tag_keys.append(key)
         # A tag that was just created exists in the checkout.
         world.rec.replies['git rev-parse'] = completed(sha + '\n')
 
@@ -205,7 +218,41 @@ def install(
     monkeypatch.setattr(
         match_tag, 'push_tag', lambda checkout, tag: world.pushed.append(tag)
     )
+    install_github(monkeypatch, world)
     return world
+
+
+def install_github(monkeypatch: pytest.MonkeyPatch, world: World) -> None:
+    """The repository metadata, Latest marking and workflow fakes."""
+
+    def gh_json(args: list[str]) -> object | None:
+        assert args == ['api', 'repos/WoLpH/spam'], args
+        return world.repo_meta
+
+    def download_asset(
+        asset: github.Asset, into: pathlib.Path
+    ) -> pathlib.Path:
+        into.mkdir(parents=True, exist_ok=True)
+        target: pathlib.Path = into / asset.name
+        target.write_bytes(world.assets[asset.name])
+        return target
+
+    monkeypatch.setattr(common, 'gh_json', gh_json)
+    monkeypatch.setattr(
+        github, 'mark_latest', lambda repo, tag: world.marked.append(tag)
+    )
+    monkeypatch.setattr(
+        github, 'disabled_workflow_paths', lambda repo: set(world.disabled)
+    )
+
+    def release_trigger(checkout: pathlib.Path, sha: str) -> list[str]:
+        world.release_shas.append(sha)
+        return list(world.release_workflows)
+
+    monkeypatch.setattr(
+        match_tag, 'workflow_with_release_trigger', release_trigger
+    )
+    monkeypatch.setattr(github, 'download_asset', download_asset)
 
 
 def options(
@@ -226,12 +273,53 @@ def options(
 def test_preflight_refuses_enabled_release_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_github(monkeypatch, World())
     monkeypatch.setattr(
         github, 'release_triggered_workflows', lambda repo: ['release.yml']
     )
     assert backfill.preflight('WoLpH/spam') == [
         'release.yml is enabled and triggers on release events'
     ]
+
+
+@pytest.mark.parametrize(
+    ('meta', 'expected'),
+    [
+        ({'archived': False}, []),
+        ({}, []),
+        (
+            {'archived': True},
+            [
+                'WoLpH/spam is archived, run: gh repo unarchive WoLpH/spam',
+            ],
+        ),
+        (None, ['could not read repos/WoLpH/spam']),
+    ],
+)
+def test_preflight_refuses_an_archived_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    meta: object | None,
+    expected: list[str],
+) -> None:
+    world: World = World()
+    world.repo_meta = meta
+    install_github(monkeypatch, world)
+    monkeypatch.setattr(github, 'release_triggered_workflows', lambda repo: [])
+    assert backfill.preflight('WoLpH/spam') == expected
+
+
+def test_main_exits_2_for_an_archived_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.repo_meta = {'archived': True}
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert 'gh repo unarchive WoLpH/spam' in capsys.readouterr().err
+    assert not world.created
+    assert not world.rec.calls
 
 
 def test_main_exits_2_before_creating_anything_when_preflight_fails(
@@ -855,3 +943,427 @@ def test_an_unreadable_latest_after_the_run_reports_changed(
     text: str = backfill.to_markdown(report)
     assert 'Latest before: v1.0, after: unknown' in text
     assert text.rstrip().endswith('CHANGED')
+
+
+def tagged(world: World, *names: str) -> None:
+    """Tags for these versions on GitHub, no releases."""
+    world.tags = [github.Tag(f'v{name}', SHA) for name in names]
+
+
+def test_no_latest_before_marks_the_highest_stable_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with(
+        {
+            '1.0': files_of('1.0'),
+            '1.1': files_of('1.1'),
+            '1.2rc1': files_of('1.2rc1'),
+            '1.3': files_of('1.3', yanked=True),
+        }
+    )
+    tagged(world, '1.0', '1.1', '1.2rc1', '1.3')
+    # Before the run, after the first release, after the run.
+    world.latest = [None, None, 'v1.1']
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert [created[0] for created in world.created] == [
+        'v1.0',
+        'v1.1',
+        'v1.2rc1',
+        'v1.3',
+    ]
+    assert world.marked == ['v1.1']
+    printed: str = capsys.readouterr().out
+    assert 'Latest before: none, after: v1.1, target: v1.1' in printed
+    assert printed.rstrip().endswith('OK')
+
+
+def test_no_latest_before_and_latest_elsewhere_after_is_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with(
+        {'1.0': files_of('1.0'), '1.1': files_of('1.1')}
+    )
+    tagged(world, '1.0', '1.1')
+    world.latest = [None, None, 'v1.0']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.marked == ['v1.1']
+    assert report.latest_target == 'v1.1'
+    assert backfill.to_markdown(report).rstrip().endswith('CHANGED')
+    assert backfill._exit_status(report) == 1
+
+
+def test_no_latest_before_and_only_prereleases_marks_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'2.0rc1': files_of('2.0rc1')})
+    tagged(world, '2.0rc1')
+    world.latest = [None, None, None]
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.marked == []
+    assert report.latest_target is None
+    text: str = backfill.to_markdown(report)
+    assert 'Latest before: none, after: none, target: none' in text
+    assert text.rstrip().endswith('OK')
+
+
+def test_latest_appearing_mid_run_stops_with_exit_2(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with(
+        {'1.0': files_of('1.0'), '1.1': files_of('1.1')}
+    )
+    tagged(world, '1.0', '1.1')
+    world.latest = [None, 'v1.0', 'v1.0']
+    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    message: str = (
+        'GitHub marked v1.0 as Latest despite --latest=false, stopping'
+    )
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert '| 1.0 | v1.0 | exists | create | pypi | skipped |' in (
+        captured.out
+    )
+    assert f'Stopped: {message}' in captured.out
+    assert 'Latest before: none, after: v1.0, target: none' in captured.out
+    assert captured.out.rstrip().endswith('CHANGED')
+    assert [created[0] for created in world.created] == ['v1.0']
+    assert not world.signed
+    assert not world.marked
+
+
+def test_an_unreadable_latest_mid_run_stops_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    tagged(world, '1.0')
+    calls: list[int] = []
+
+    def latest(repo: str) -> github.Release | None:
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError('gh is down')
+        return None
+
+    monkeypatch.setattr(github, 'latest_release', latest)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert 'could not read Latest after creating v1.0' in report.stopped
+    assert backfill._exit_status(report) == 2
+    assert not world.signed
+
+
+def test_latest_before_unchanged_is_ok_and_never_marked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with(
+        {'1.0': files_of('1.0'), '1.1': files_of('1.1')}
+    )
+    tagged(world, '1.0', '1.1')
+    # Only two reads: no mid-run check when a Latest existed before.
+    world.latest = ['v1.0', 'v1.0']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert len(world.created) == 2
+    assert world.marked == []
+    assert report.latest_target == 'v1.0'
+    text: str = backfill.to_markdown(report)
+    assert 'Latest before: v1.0, after: v1.0, target: v1.0' in text
+    assert text.rstrip().endswith('OK')
+
+
+def test_a_release_workflow_at_the_tag_commit_refuses_the_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    tagged(world, '1.0')
+    world.release_workflows = ['.github/workflows/publish.yml']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.release_shas == [SHA]
+    assert not world.created
+    assert not world.signed
+    _, outcome, note = report.rows[0]
+    assert outcome is None
+    assert note == 'release would fire publish.yml at the tagged commit'
+    assert backfill._exit_status(report) == 1
+    # Disabled on GitHub, the same workflow no longer blocks the release.
+    world.disabled = {'.github/workflows/publish.yml'}
+    world.latest = ['v1.0', 'v1.0']
+    allowed: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert [created[0] for created in world.created] == ['v1.0']
+    assert allowed.rows[0][1] is not None
+
+
+def test_an_existing_release_skips_the_release_workflow_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    tagged(world, '1.0')
+    world.releases = [release('v1.0')]
+    world.release_workflows = ['.github/workflows/publish.yml']
+    backfill.run_backfill('spam', options(tmp_path))
+    assert world.release_shas == []
+    assert len(world.signed) == 1
+
+
+def test_a_release_workflow_at_the_anchor_refuses_the_untagged_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.match_sha = None
+    world.release_workflows = ['.github/workflows/publish.yml']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.created
+    assert world.release_shas == [ROOT]
+    assert report.rows[0][2] == (
+        'release would fire publish.yml at the tagged commit'
+    )
+
+
+def test_the_untagged_release_gets_the_multi_version_footer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.match_sha = None
+    backfill.run_backfill('spam', options(tmp_path))
+    _, _, sign_options = world.signed[0]
+    assert sign_options.multi_version
+
+
+def test_tags_are_signed_with_the_configured_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.2': files_of('1.2')})
+    backfill.run_backfill('spam', options(tmp_path))
+    assert world.tag_keys == [signing.DEFAULT_GPG_KEY]
+    world = install(monkeypatch, World())
+    world.project = project_with({'1.2': files_of('1.2')})
+    keyed: backfill.BackfillOptions = dataclasses.replace(
+        options(tmp_path), gpg_key='SPAM'
+    )
+    backfill.run_backfill('spam', keyed)
+    assert world.tag_keys == ['SPAM']
+
+
+def signed_assets(*names: str) -> list[github.Asset]:
+    return [github.Asset(n, 1, f'https://assets.example/{n}') for n in names]
+
+
+WHEEL: str = 'spam-1.0-py3-none-any.whl'
+
+
+def test_an_already_signed_release_is_not_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': []})
+    tagged(world, '1.0')
+    names: list[str] = [
+        WHEEL,
+        f'{WHEEL}.asc',
+        f'{WHEEL}.sigstore.json',
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+    ]
+    world.releases = [
+        dataclasses.replace(release('v1.0'), assets=signed_assets(*names))
+    ]
+    world.assets['SHA256SUMS'] = (
+        f'# rebuilt from tag v1.0\n{"0" * 64}  {WHEEL}\n'
+    ).encode()
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.rebuilt == []
+    assert not world.signed
+    _, outcome, note = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'already signed'
+    assert sorted(outcome.kept) == sorted(names)
+    assert note == backfill.REBUILD_SKIPPED_NOTE
+    assert backfill._exit_status(report) == 0
+
+
+@pytest.mark.parametrize(
+    'missing', [f'{WHEEL}.sigstore.json', f'{WHEEL}.asc', 'SHA256SUMS', WHEEL]
+)
+def test_a_partly_signed_release_is_still_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, missing: str
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': []})
+    tagged(world, '1.0')
+    names: list[str] = [
+        WHEEL,
+        f'{WHEEL}.asc',
+        f'{WHEEL}.sigstore.json',
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+    ]
+    world.releases = [
+        dataclasses.replace(
+            release('v1.0'),
+            assets=signed_assets(*(n for n in names if n != missing)),
+        )
+    ]
+    world.assets['SHA256SUMS'] = f'{"0" * 64}  {WHEEL}\n'.encode()
+    backfill.run_backfill('spam', options(tmp_path))
+    assert world.rebuilt == ['v1.0']
+
+
+class Signer:
+    """gpg, sigstore and upload fakes for a run with the real sign_release."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.sigstore_calls: list[list[pathlib.Path]] = []
+        self.uploads: list[tuple[str, list[str]]] = []
+        self.edits: list[str] = []
+        self.sigstore_error: str = ''
+        monkeypatch.setattr(pypi, 'download', self.download)
+        monkeypatch.setattr(signing, 'gpg_sign', self.gpg_sign)
+        monkeypatch.setattr(signing, 'sigstore_sign', self.sigstore_sign)
+        monkeypatch.setattr(github, 'upload_assets', self.upload_assets)
+        monkeypatch.setattr(github, 'edit_notes', self.edit_notes)
+
+    @staticmethod
+    def download(file: pypi.PypiFile, into: pathlib.Path) -> pathlib.Path:
+        into.mkdir(parents=True, exist_ok=True)
+        target: pathlib.Path = into / file.filename
+        target.write_bytes(file.filename.encode())
+        return target
+
+    @staticmethod
+    def gpg_sign(path: pathlib.Path, key: str) -> pathlib.Path:
+        out: pathlib.Path = path.with_name(path.name + '.asc')
+        out.write_text('signature')
+        return out
+
+    def sigstore_sign(self, paths: list[pathlib.Path]) -> list[pathlib.Path]:
+        self.sigstore_calls.append(list(paths))
+        if self.sigstore_error:
+            raise signing.SigningError(self.sigstore_error)
+        bundles: list[pathlib.Path] = [signing.bundle_path(p) for p in paths]
+        for bundle in bundles:
+            bundle.write_text('bundle')
+        return bundles
+
+    def upload_assets(
+        self,
+        repo: str,
+        tag: str,
+        paths: list[pathlib.Path],
+        clobber: bool = False,
+    ) -> None:
+        self.uploads.append((tag, [p.name for p in paths]))
+
+    def edit_notes(self, repo: str, tag: str, body: str) -> None:
+        self.edits.append(tag)
+
+    def bundle_uploads(self) -> list[tuple[str, list[str]]]:
+        return [
+            (tag, names)
+            for tag, names in self.uploads
+            if all(n.endswith('.sigstore.json') for n in names)
+        ]
+
+
+def test_one_sigstore_invocation_for_the_whole_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    world.project = project_with(
+        {v: files_of(v) for v in ('1.0', '1.1', '1.2')}
+    )
+    tagged(world, '1.0', '1.1', '1.2')
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert len(signer.sigstore_calls) == 1
+    assert len(signer.sigstore_calls[0]) == 6
+    assert signer.bundle_uploads() == [
+        (
+            f'v{v}',
+            [
+                f'spam-{v}.tar.gz.sigstore.json',
+                f'spam-{v}-py3-none-any.whl.sigstore.json',
+            ],
+        )
+        for v in ('1.0', '1.1', '1.2')
+    ]
+    # Every gpg upload comes before the first bundle upload.
+    first_bundle: int = signer.uploads.index(signer.bundle_uploads()[0])
+    assert all(
+        not any(n.endswith('.sigstore.json') for n in names)
+        for _, names in signer.uploads[:first_bundle]
+    )
+    # The footer promises bundles, so it waits for them.
+    assert signer.edits == ['v1.0', 'v1.1', 'v1.2']
+    statuses: list[str] = [
+        outcome.status for _, outcome, _ in report.rows if outcome
+    ]
+    assert statuses == ['signed', 'signed', 'signed']
+    assert backfill._exit_status(report) == 0
+
+
+def test_a_failed_sigstore_run_fails_every_waiting_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    signer.sigstore_error = 'login cancelled'
+    world.project = project_with({v: files_of(v) for v in ('1.0', '1.1')})
+    tagged(world, '1.0', '1.1')
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert signer.bundle_uploads() == []
+    assert signer.edits == []
+    for _, outcome, _ in report.rows:
+        assert outcome is not None
+        assert outcome.status == 'failed'
+        assert outcome.reason == 'sigstore failed: login cancelled'
+    assert backfill._exit_status(report) == 1
+
+
+def test_chunks_cap_the_size_and_keep_names_apart() -> None:
+    paths: list[pathlib.Path] = [
+        pathlib.Path(f'v{n}') / f'f{n}.whl' for n in range(250)
+    ]
+    sizes: list[int] = [len(c) for c in backfill._chunks(paths, 100)]
+    assert sizes == [100, 100, 50]
+    clash: list[pathlib.Path] = [
+        pathlib.Path('a') / 'x.whl',
+        pathlib.Path('b') / 'x.whl',
+        pathlib.Path('a') / 'y.whl',
+    ]
+    assert backfill._chunks(clash, 100) == [
+        [clash[0], clash[2]],
+        [clash[1]],
+    ]

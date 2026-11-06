@@ -6,6 +6,8 @@ import email.message
 import hashlib
 import io
 import pathlib
+import subprocess
+import sys
 import urllib.error
 from collections.abc import Callable
 
@@ -40,6 +42,39 @@ def _http_error(code: int) -> urllib.error.HTTPError:
         hdrs=email.message.Message(),
         fp=io.BytesIO(),
     )
+
+
+def test_run_merges_env_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('PPT_SPAM', 'spam')
+    script: str = (
+        'import os; print(os.environ["PPT_SPAM"], os.environ["PPT_EGGS"])'
+    )
+    done: subprocess.CompletedProcess[str] = common.run(
+        [sys.executable, '-c', script], env={'PPT_EGGS': 'eggs'}
+    )
+    assert done.stdout.split() == ['spam', 'eggs']
+
+
+def test_run_without_capture_leaves_output_alone() -> None:
+    done: subprocess.CompletedProcess[str] = common.run(
+        [sys.executable, '-c', 'pass'], capture=False
+    )
+    assert done.returncode == 0
+    assert done.stdout is None
+    assert done.stderr is None
+
+
+def test_run_bytes_returns_undecoded_output() -> None:
+    script: str = 'import sys; sys.stdout.buffer.write(bytes([0, 255]))'
+    assert common.run_bytes([sys.executable, '-c', script]) == b'\x00\xff'
+
+
+def test_run_bytes_raises_with_stderr() -> None:
+    script: str = 'import sys; sys.exit("spam went wrong")'
+    with pytest.raises(RuntimeError, match='spam went wrong'):
+        common.run_bytes([sys.executable, '-c', script])
 
 
 def test_sha256_of_matches_hashlib(tmp_path: pathlib.Path) -> None:

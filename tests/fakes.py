@@ -7,11 +7,11 @@ import subprocess
 
 
 def completed(
-    stdout: str = '', returncode: int = 0
+    stdout: str = '', returncode: int = 0, stderr: str = ''
 ) -> subprocess.CompletedProcess[str]:
     """Build a canned reply for the Recorder."""
     return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=''
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
 
 
@@ -28,6 +28,7 @@ class Recorder:
     ) -> None:
         self.replies: dict[str, subprocess.CompletedProcess[str]] = replies
         self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
 
     @staticmethod
     def _joined(args: list[str]) -> str:
@@ -43,8 +44,11 @@ class Recorder:
         args: list[str],
         check: bool = False,
         cwd: pathlib.Path | None = None,
+        env: dict[str, str] | None = None,
+        capture: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(args))
+        self.envs.append(env)
         joined: str = self._joined(args)
         matches: list[str] = [
             key for key in self.replies if joined.startswith(key)

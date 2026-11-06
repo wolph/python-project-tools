@@ -10,9 +10,11 @@ import tarfile
 import pytest
 
 from python_project_tools import common, rebuild
-from tests.fakes import completed
+from tests.conftest import ScratchRepo, git
+from tests.fakes import Recorder, completed
 
 TREE: str = 'spam.txt'
+COMMIT_TIME: int = 1577836800  # 2020-01-01T00:00:00Z
 
 
 class FakeRun:
@@ -20,6 +22,7 @@ class FakeRun:
 
     def __init__(self, uv_returncode: int = 0, build: bool = True) -> None:
         self.calls: list[tuple[list[str], pathlib.Path | None]] = []
+        self.envs: list[dict[str, str] | None] = []
         self.uv_returncode: int = uv_returncode
         self.build: bool = build
         self.tree_files: list[str] = []
@@ -29,8 +32,13 @@ class FakeRun:
         args: list[str],
         check: bool = False,
         cwd: pathlib.Path | None = None,
+        env: dict[str, str] | None = None,
+        capture: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ['git', 'log']:
+            return completed(f'{COMMIT_TIME}\n')
         self.calls.append((list(args), cwd))
+        self.envs.append(env)
         if args[:2] == ['git', 'archive']:
             return self._archive(args)
         return self._uv_build(args, cwd)
@@ -84,6 +92,23 @@ def test_rebuild_runs_uv_build_in_an_archive(
     assert uv[1] is not None
     assert uv[1] != checkout
     assert fake.tree_files == [TREE]
+    assert fake.envs == [None, {'SOURCE_DATE_EPOCH': str(COMMIT_TIME)}]
+
+
+def test_rebuild_reads_the_commit_time_of_the_tag(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec: Recorder = Recorder({'git log': completed('', 128, 'bad revision')})
+    monkeypatch.setattr(common, 'run', rec)
+    with pytest.raises(rebuild.RebuildError, match='bad revision'):
+        rebuild.rebuild(tmp_path, 'v9.9', tmp_path / 'out')
+    assert rec.calls == [['git', 'log', '-1', '--format=%ct', 'v9.9']]
+
+
+def test_rebuild_epoch_comes_from_git(scratch_repo: ScratchRepo) -> None:
+    git(scratch_repo.path, 'tag', 'v1.1', scratch_repo.shas[1])
+    expected: str = git(scratch_repo.path, 'log', '-1', '--format=%ct', 'v1.1')
+    assert rebuild._commit_time(scratch_repo.path, 'v1.1') == expected
 
 
 def test_rebuild_removes_the_extraction_directory(

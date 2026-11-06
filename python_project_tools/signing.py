@@ -6,25 +6,34 @@ Pure mechanics with no policy. Every subprocess goes through
 
 from __future__ import annotations
 
+import json
 import pathlib
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 
-from python_project_tools import common
+from python_project_tools import common, sigstore_signer
 
 DEFAULT_GPG_KEY: str = '149325FD15904E9C4EB89E95E81444E9CE1F695D'
 # Pinned, so a new sigstore release cannot change what a run signs with.
-SIGSTORE_ARGV: list[str] = ['uvx', 'sigstore==4.5.1']
+# The signer script runs on that environment's Python, isolated with -I so
+# neither the environment nor the script's directory adds imports.
+SIGSTORE_ARGV: list[str] = ['uvx', '--from', 'sigstore==4.5.1', 'python', '-I']
+SIGNER_SCRIPT: pathlib.Path = pathlib.Path(sigstore_signer.__file__)
 SHA256SUMS_NAME: str = 'SHA256SUMS'
 BUNDLE_SUFFIX: str = '.sigstore.json'
 # The OIDC login waits for a browser callback that may never come.
 SIGSTORE_TIMEOUT_SECONDS: int = 900
+# On top of the login: the signer paces and backs off per file.
+SIGSTORE_SECONDS_PER_FILE: int = 3
 SIGSTORE_TIMEOUT_MESSAGE: str = (
-    'sigstore did not finish within {seconds} s, the browser login '
-    'probably never reached it'
+    'sigstore did not finish within {seconds} s, the browser login never '
+    'completed or signing ran out of time'
+)
+# Exit statuses of the signer that leave the bundles so far in place.
+SIGSTORE_PARTIAL_EXITS: frozenset[int] = frozenset(
+    {sigstore_signer.EXIT_TOKEN_EXPIRED, sigstore_signer.EXIT_RATE_LIMITED}
 )
 SIGSTORE_LOGIN_NOTICE: str = (
     'ppt: Sigstore login needed, a browser tab opens for {count} files'
@@ -169,44 +178,92 @@ def relay_browser() -> str:
     )
 
 
-def _sigstore_run(directory: pathlib.Path, paths: list[pathlib.Path]) -> None:
-    """One sigstore invocation for files that all live in ``directory``.
+def bundle_covers(path: pathlib.Path) -> bool:
+    """True when the bundle next to ``path`` is a bundle of its bytes.
+
+    The digest check of ``sigstore_signer.bundle_covers``: it tells a
+    bundle the signer wrote for this file from a stale or foreign one, it
+    does not verify the signature.
+    """
+    return sigstore_signer.bundle_covers(path, bundle_path(path))
+
+
+def sigstore_timeout(count: int) -> int:
+    """Seconds a signer run of ``count`` files gets: the login plus pacing."""
+    return SIGSTORE_TIMEOUT_SECONDS + count * SIGSTORE_SECONDS_PER_FILE
+
+
+def _write_manifest(target: pathlib.Path, paths: list[pathlib.Path]) -> None:
+    """The signer's manifest: each file with the bundle next to it."""
+    entries: list[dict[str, str]] = [
+        {
+            'input': str(path.absolute()),
+            'bundle': str(bundle_path(path).absolute()),
+        }
+        for path in paths
+    ]
+    target.write_text(json.dumps(entries, indent=1) + '\n')
+
+
+def _signer_message(status: pathlib.Path) -> str:
+    """The final message the signer left in ``status``, or ''."""
+    try:
+        return status.read_text().strip()
+    except OSError:
+        return ''
+
+
+def _signer_argv(manifest: pathlib.Path, status: pathlib.Path) -> list[str]:
+    return [
+        *SIGSTORE_ARGV,
+        str(SIGNER_SCRIPT),
+        '--manifest',
+        str(manifest),
+        '--status',
+        str(status),
+    ]
+
+
+def _sigstore_run(paths: list[pathlib.Path]) -> None:
+    """One signer run for all ``paths``, so one browser login.
 
     Output is not captured, so the browser prompt and the fallback URL of
     the OIDC flow reach the terminal. A notice on stderr comes first, so
-    whoever watches a log knows a person is needed. An invocation still
-    running after SIGSTORE_TIMEOUT_SECONDS is stopped and raises
-    RuntimeError: a login callback that never arrives would otherwise
-    keep it listening forever.
+    whoever watches a log knows a person is needed. A run still going
+    after ``sigstore_timeout`` is stopped and raises RuntimeError: a login
+    callback that never arrives would otherwise keep it listening forever.
+    An expired token or a rate limit raises RuntimeError with the signer's
+    message, any other failure SigningError. Bundles written before a
+    failure stay next to their files.
     """
     print(  # noqa: T201
         SIGSTORE_LOGIN_NOTICE.format(count=len(paths)),
         file=sys.stderr,
         flush=True,
     )
-    done: subprocess.CompletedProcess[str]
-    try:
-        done = common.run(
-            [
-                *SIGSTORE_ARGV,
-                'sign',
-                '--output-directory',
-                str(directory),
-                '--overwrite',
-                *map(str, paths),
-            ],
-            capture=False,
-            timeout=SIGSTORE_TIMEOUT_SECONDS,
-            env={'BROWSER': relay_browser()},
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(
-            SIGSTORE_TIMEOUT_MESSAGE.format(seconds=SIGSTORE_TIMEOUT_SECONDS)
-        ) from error
+    timeout: int = sigstore_timeout(len(paths))
+    with tempfile.TemporaryDirectory(prefix='ppt-sigstore-') as directory:
+        manifest: pathlib.Path = pathlib.Path(directory) / 'manifest.json'
+        status: pathlib.Path = pathlib.Path(directory) / 'status.txt'
+        _write_manifest(manifest, paths)
+        done: subprocess.CompletedProcess[str]
+        try:
+            done = common.run(
+                _signer_argv(manifest, status),
+                capture=False,
+                timeout=timeout,
+                env={'BROWSER': relay_browser()},
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                SIGSTORE_TIMEOUT_MESSAGE.format(seconds=timeout)
+            ) from error
+        message: str = _signer_message(status) or 'see its output above'
+    if done.returncode in SIGSTORE_PARTIAL_EXITS:
+        raise RuntimeError(message)
     if done.returncode != 0:
-        detail: str = (done.stderr or '').strip() or 'see its output above'
         raise SigningError(
-            f'sigstore failed with exit status {done.returncode}: {detail}'
+            f'sigstore failed with exit status {done.returncode}: {message}'
         )
 
 
@@ -220,48 +277,18 @@ def _existing_bundles(paths: list[pathlib.Path]) -> list[pathlib.Path]:
     return bundles
 
 
-def _sign_staged(paths: list[pathlib.Path]) -> list[pathlib.Path]:
-    """Copy files from several directories into one, sign, move back.
-
-    The bundle covers the file's bytes, not its path, so a bundle made for
-    the staged copy is the bundle of the original.
-    """
-    names: list[str] = [path.name for path in paths]
-    duplicates: list[str] = sorted({n for n in names if names.count(n) > 1})
-    if duplicates:
-        raise SigningError(
-            'sigstore staging needs unique file names, got '
-            + ', '.join(duplicates)
-        )
-    with tempfile.TemporaryDirectory(prefix='ppt-sigstore-') as directory:
-        staging: pathlib.Path = pathlib.Path(directory)
-        staged: list[pathlib.Path] = []
-        for path in paths:
-            copy: pathlib.Path = staging / path.name
-            shutil.copy2(path, copy)
-            staged.append(copy)
-        _sigstore_run(staging, staged)
-        bundles: list[pathlib.Path] = _existing_bundles(staged)
-        targets: list[pathlib.Path] = [bundle_path(path) for path in paths]
-        for bundle, target in zip(bundles, targets, strict=True):
-            shutil.move(bundle, target)
-    return targets
-
-
 def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
-    """Sign all files in one sigstore invocation, return the bundle paths.
+    """Sign all files in one signer run, return the bundle paths.
 
-    The OIDC flow is interactive, so one invocation means one login. Files
-    from several directories are staged in one directory first, so they
-    still take one invocation, and their names must then be unique. Each
-    bundle ends up next to its file.
+    The OIDC flow is interactive, so one run means one login. Each bundle
+    is written next to its file, so files from several directories and
+    files with the same name take the same run. A file whose bundle is
+    already there is skipped by the signer, after checking that the bundle
+    is one of that file. See ``sigstore_signer`` for the pacing.
     """
     if not paths:
         return []
-    parents: set[pathlib.Path] = {path.parent for path in paths}
-    if len(parents) != 1:
-        return _sign_staged(paths)
-    _sigstore_run(paths[0].parent, paths)
+    _sigstore_run(list(dict.fromkeys(paths)))
     return _existing_bundles(paths)
 
 

@@ -4,7 +4,7 @@
 FILE`` backfills every package the file lists, one ``PACKAGE
 CHECKOUT_PATH`` pair per line. Each package runs its preflight, plan and
 loop in turn, then the Sigstore bundles of every package are made in one
-sigstore invocation, so the whole batch needs one browser login. Then each
+signer run, so the whole batch needs one browser login. Then each
 package marks its Latest target and prints its report, in input order. A
 package that is refused or stops does not stop the batch, and the releases
 it created still get their bundles. The single package form is the batch

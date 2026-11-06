@@ -2,8 +2,32 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import pathlib
 import subprocess
+
+
+def covering_bundle(path: pathlib.Path) -> str:
+    """The smallest bundle JSON whose message digest is that of ``path``.
+
+    Enough for ``sigstore_signer.bundle_covers``, which compares only the
+    digest. Real bundles carry the certificate and the log entry as well.
+    """
+    digest: bytes = hashlib.sha256(path.read_bytes()).digest()
+    return json.dumps(
+        {
+            'mediaType': 'application/vnd.dev.sigstore.bundle.v0.3+json',
+            'messageSignature': {
+                'messageDigest': {
+                    'algorithm': 'SHA2_256',
+                    'digest': base64.b64encode(digest).decode(),
+                },
+                'signature': 'c3BhbQ==',
+            },
+        }
+    )
 
 
 def completed(

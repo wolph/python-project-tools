@@ -251,9 +251,9 @@ def test_same_file_names_in_two_packages_get_their_own_bundles(
         ['--batch', str(batch.file('spam', 'eggs'))]
     )
     assert status == 0
-    # sigstore stages one invocation in one directory, so equal names
-    # take an invocation each instead of overwriting each other.
-    assert len(batch.signer.sigstore_calls) == 2
+    # Each bundle is written next to its file, so equal names share the
+    # one signer run without overwriting each other.
+    assert len(batch.signer.sigstore_calls) == 1
     signed: list[pathlib.Path] = [
         path for call in batch.signer.sigstore_calls for path in call
     ]

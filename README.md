@@ -36,3 +36,12 @@ one go, then each package prints its report and a summary table closes the
 run. A package that is refused or stops does not stop the others. The exit
 status is the worst of all packages. `--only`, `--repo` and `--checkout`
 name one package, so they are refused together with `--batch`.
+
+Sigstore signing runs `python_project_tools/sigstore_signer.py` inside the
+pinned `sigstore==4.5.1` environment instead of `sigstore sign`, which signs
+every file at once and was rate limited by the public instance (HTTP 429
+from Rekor and the timestamp authority) on a batch of 1247 files. The script
+signs one file every half second from one login, backs off on 429 and 5xx
+answers and writes each bundle as soon as it exists. When the identity token
+expires or the rate limit persists it stops, the releases whose bundles are
+all there are still finished, and the next run signs only what is missing.

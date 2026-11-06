@@ -19,11 +19,13 @@ commit cannot be matched joins the untagged anchor and the next one down is
 tried, and only a failure after a release was created stops the run. The
 anchor is the target when no version gets its own release. The target is
 marked latest at the end when GitHub does not report it already. The
-Sigstore bundles of every release are made after the loop, in one sigstore
-invocation for up to SIGSTORE_CHUNK files, so one browser login covers the
-run. A run goes through ``start_run``, ``execute_run``, ``sign_pending``
-and ``finish_run``, so ``backfill_batch`` can sign the bundles of several
-packages in one invocation. ``run_backfill`` is the run of one package.
+Sigstore bundles of every release are made after the loop, in one signer
+run for all files, so one browser login covers the run. A signer run that
+stops early keeps the bundles it wrote, and every release whose bundles are
+all there is still finished. A run goes through ``start_run``,
+``execute_run``, ``sign_pending`` and ``finish_run``, so ``backfill_batch``
+can sign the bundles of several packages in one invocation.
+``run_backfill`` is the run of one package.
 The tags on GitHub are the truth: they are fetched into the private
 ``remote_tags.REMOTE_TAGS`` namespace, every tag is read from there, and
 the checkout's own ``refs/tags`` are never written or moved. A new tag
@@ -98,9 +100,6 @@ TARGET_FAILED: str = (
 RELEASED: str = 'released'
 FELL_THROUGH: str = 'fell through'
 FAILED_AFTER_CREATING: str = 'failed after creating'
-# Files per sigstore invocation. Each invocation is one browser login, so
-# the cap only keeps the argv of one invocation a sane length.
-SIGSTORE_CHUNK: int = 2000
 # GitHub can answer releases/latest with 404 for a moment after the first
 # release of a repository, then with that release. The guard reads Latest
 # this many times at most while it is missing, sleeping in between.
@@ -1269,42 +1268,13 @@ def _loop(run: PackageRun, plans: list[Plan], candidates: list[Plan]) -> None:
     _finish_untagged(run)
 
 
-def _chunks(paths: list[pathlib.Path], size: int) -> list[list[pathlib.Path]]:
-    """Groups of at most ``size`` paths, no file name twice in a group.
+def _sign_bundles(paths: list[pathlib.Path]) -> str:
+    """One signer run for every path, returning its error or ''.
 
-    sigstore stages one group in one directory, so names must not clash.
+    A failed run can still have written some bundles, see sign_pending.
     """
-    chunks: list[list[pathlib.Path]] = []
-    names: list[set[str]] = []
-    for path in paths:
-        for chunk, seen in zip(chunks, names, strict=True):
-            if len(chunk) < size and path.name not in seen:
-                chunk.append(path)
-                seen.add(path.name)
-                break
-        else:
-            chunks.append([path])
-            names.append({path.name})
-    return chunks
-
-
-def _sign_bundles(paths: list[pathlib.Path]) -> dict[pathlib.Path, str]:
-    """Sign every path, one sigstore invocation per chunk.
-
-    Returns the error of each path whose chunk failed.
-    """
-    failed: dict[pathlib.Path, str] = {}
-    for chunk in _chunks(paths, SIGSTORE_CHUNK):
-        error: str = _sign_chunk(chunk)
-        if error:
-            failed.update(dict.fromkeys(chunk, error))
-    return failed
-
-
-def _sign_chunk(chunk: list[pathlib.Path]) -> str:
-    """One sigstore invocation, returning its error or an empty string."""
     try:
-        signing.sigstore_sign(chunk)
+        signing.sigstore_sign(paths)
     except (signing.SigningError, RuntimeError, OSError) as error:
         return str(error) or type(error).__name__
     return ''
@@ -1313,25 +1283,26 @@ def _sign_chunk(chunk: list[pathlib.Path]) -> str:
 def sign_pending(runs: list[PackageRun]) -> None:
     """Make the deferred Sigstore bundles of every run and upload them.
 
-    All files of all runs go to one sigstore invocation per SIGSTORE_CHUNK
-    files, so one browser login covers them. A stopped run is included:
-    its releases exist and only their bundles are missing.
+    All files of all runs go to one signer run, so one browser login covers
+    them. A stopped run is included: its releases exist and only their
+    bundles are missing. When the signer fails, a release whose bundles
+    all exist and cover their files is finished anyway, and only the
+    releases still missing a bundle are marked failed.
     """
     pending: list[_Pending] = [entry for run in runs for entry in run.pending]
     if not pending:
         return
-    failed: dict[pathlib.Path, str] = _sign_bundles(
+    error: str = _sign_bundles(
         [path for entry in pending for path in entry.outcome.pending_bundles]
     )
     for entry in pending:
-        errors: list[str] = [
-            failed[path]
+        complete: bool = all(
+            signing.bundle_covers(path)
             for path in entry.outcome.pending_bundles
-            if path in failed
-        ]
-        if errors:
+        )
+        if error and not complete:
             entry.outcome.status = 'failed'
-            entry.outcome.reason = f'sigstore failed: {errors[0]}'
+            entry.outcome.reason = f'sigstore failed: {error}'
         else:
             sign.finish_pending(
                 entry.release,

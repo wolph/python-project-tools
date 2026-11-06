@@ -24,7 +24,7 @@ from python_project_tools import (
     signing,
 )
 from tests.conftest import ScratchRepo, git
-from tests.fakes import Recorder, completed
+from tests.fakes import Recorder, completed, covering_bundle
 
 SHA: str = 'a' * 40
 ROOT: str = 'r' * 40
@@ -1475,6 +1475,56 @@ def test_a_sigstore_timeout_fails_the_waiting_releases_not_the_run(
     assert backfill.exit_status(report) == 1
 
 
+def test_a_stopped_signer_still_finishes_the_releases_it_covered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    calls: list[list[pathlib.Path]] = []
+    message: str = (
+        'identity token expired after 3 of 6 files, run again to sign the rest'
+    )
+
+    def stopped(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+        calls.append(list(paths))
+        for path in paths:
+            if '1.0' in path.name or path.name == 'spam-1.2.tar.gz':
+                signing.bundle_path(path).write_text(covering_bundle(path))
+            if path.name == 'spam-1.2-py3-none-any.whl':
+                # A bundle that is not of this file never counts.
+                signing.bundle_path(path).write_text('bundle')
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(signing, 'sigstore_sign', stopped)
+    world.project = project_with(
+        {v: files_of(v) for v in ('1.0', '1.1', '1.2')}
+    )
+    tagged(world, '1.0', '1.1', '1.2')
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert len(calls) == 1
+    assert len(calls[0]) == 6
+    assert signer.bundle_uploads() == [
+        (
+            'v1.0',
+            [
+                'spam-1.0.tar.gz.sigstore.json',
+                'spam-1.0-py3-none-any.whl.sigstore.json',
+            ],
+        )
+    ]
+    assert signer.edits == ['v1.0']
+    outcomes: dict[str, sign.SignOutcome] = {
+        plan.version: outcome for plan, outcome, _ in report.rows if outcome
+    }
+    assert outcomes['1.0'].status == 'signed'
+    for version in ('1.1', '1.2'):
+        assert outcomes[version].status == 'failed'
+        assert outcomes[version].reason == f'sigstore failed: {message}'
+    assert backfill.exit_status(report) == 1
+
+
 SDIST: str = 'spam-1.0.tar.gz'
 REBUILT_COMMENT: str = (
     '# rebuilt from tag v1.0 on 2026-11-05, not the PyPI bytes'
@@ -1726,23 +1776,6 @@ def test_dry_run_says_a_resumable_release_is_checked_not_rebuilt(
         out
     )
     assert 'would rebuild' not in out
-
-
-def test_chunks_cap_the_size_and_keep_names_apart() -> None:
-    paths: list[pathlib.Path] = [
-        pathlib.Path(f'v{n}') / f'f{n}.whl' for n in range(250)
-    ]
-    sizes: list[int] = [len(c) for c in backfill._chunks(paths, 100)]
-    assert sizes == [100, 100, 50]
-    clash: list[pathlib.Path] = [
-        pathlib.Path('a') / 'x.whl',
-        pathlib.Path('b') / 'x.whl',
-        pathlib.Path('a') / 'y.whl',
-    ]
-    assert backfill._chunks(clash, 100) == [
-        [clash[0], clash[2]],
-        [clash[1]],
-    ]
 
 
 def run_empty_repo(

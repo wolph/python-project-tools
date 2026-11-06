@@ -4,10 +4,11 @@ import argparse
 import sys
 from collections.abc import Callable
 
-from python_project_tools import __version__, check_compat
+from python_project_tools import __version__, check_compat, verify_release
 
 COMMANDS: dict[str, Callable[[list[str]], int]] = {
     'check-compat': check_compat.main,
+    'verify-release': verify_release.main,
 }
 
 

@@ -39,13 +39,9 @@ import urllib.error
 import urllib.request
 import zipfile
 
-try:
-    import tomllib  # ty: ignore[import-not-found]
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # ty: ignore[import-not-found]
-
 from python_project_tools import api_manifest, compat_rules
 from python_project_tools.compat_rules import Finding
+from python_project_tools.toml_compat import tomllib
 
 PYTEST_CONFIGS: tuple[str, ...] = (
     'pytest.ini',
@@ -108,6 +104,17 @@ def fetch(url: str, dest: pathlib.Path | None = None) -> bytes | None:
     return data
 
 
+def unpack_sdist(archive: pathlib.Path, destination: pathlib.Path) -> None:
+    """Extract an sdist, refusing to do so without the safe ``data`` filter."""
+    if not hasattr(tarfile, 'data_filter'):
+        raise RuntimeError(
+            'check-compat needs tarfile.data_filter (Python 3.10.12, '
+            '3.11.4 or later) to unpack sdists safely',
+        )
+    with tarfile.open(archive) as tar:
+        tar.extractall(destination, filter='data')
+
+
 def old_from_pypi(
     name: str, version: str, work: pathlib.Path
 ) -> Release | None:
@@ -131,11 +138,7 @@ def old_from_pypi(
     archive: pathlib.Path = dist / sdists[0]['filename']
     fetch(sdists[0]['url'], archive)
     unpacked: pathlib.Path = work / 'old-sdist'
-    with tarfile.open(archive) as tar:
-        if hasattr(tarfile, 'data_filter'):
-            tar.extractall(unpacked, filter='data')
-        else:
-            tar.extractall(unpacked)
+    unpack_sdist(archive, unpacked)
     roots: list[pathlib.Path] = [p for p in unpacked.iterdir() if p.is_dir()]
     return Release(
         wheel,

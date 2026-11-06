@@ -9,11 +9,12 @@ import json
 import pathlib
 import subprocess
 import sys
+import tarfile
 import textwrap
 
 import pytest
 
-from python_project_tools import api_manifest, compat_rules
+from python_project_tools import api_manifest, check_compat, compat_rules
 
 OLD_SOURCE: str = """
 import enum
@@ -369,3 +370,18 @@ def test_check_compat_is_registered() -> None:
     from python_project_tools import check_compat, cli
 
     assert cli.COMMANDS['check-compat'] is check_compat.main
+
+
+def test_unpack_sdist_refuses_without_data_filter(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload: pathlib.Path = tmp_path / 'spam.txt'
+    payload.write_text('eggs')
+    archive: pathlib.Path = tmp_path / 'spam.tar'
+    with tarfile.open(archive, 'w') as tar:
+        tar.add(payload, arcname='spam.txt')
+    monkeypatch.delattr(tarfile, 'data_filter', raising=False)
+    with pytest.raises(RuntimeError, match='data_filter'):
+        check_compat.unpack_sdist(archive, tmp_path / 'out')
+    assert not (tmp_path / 'out').exists()

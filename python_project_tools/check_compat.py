@@ -11,10 +11,10 @@ Four checks, each against the released artefacts rather than the git history:
 * griffe: ``griffe check`` against the release tag, a static second opinion
   whose extra findings are reported as warnings.
 
-Run from the checkout on Python 3.11 or later, with packaging available. The
-interpreters under test can be older, down to 3.9::
+Run from the checkout. The interpreters under test can be older, down to
+3.9::
 
-    uv run --no-project --python '>=3.11' --with packaging python -I check_compat.py --against 4.1.0
+    ppt check-compat --against 4.1.0
         [--from auto|pypi|tag] [--tag v4.1.0] [--python 3.10 --python 3.14]
         [--skip api,tests,metadata,griffe] [--json findings.json] [--keep]
 
@@ -39,7 +39,10 @@ import urllib.error
 import urllib.request
 import zipfile
 
-import tomllib  # ty: ignore[import-not-found]
+try:
+    import tomllib  # ty: ignore[import-not-found]
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # ty: ignore[import-not-found]
 
 from python_project_tools import api_manifest, compat_rules
 from python_project_tools.compat_rules import Finding
@@ -129,7 +132,10 @@ def old_from_pypi(
     fetch(sdists[0]['url'], archive)
     unpacked: pathlib.Path = work / 'old-sdist'
     with tarfile.open(archive) as tar:
-        tar.extractall(unpacked, filter='data')
+        if hasattr(tarfile, 'data_filter'):
+            tar.extractall(unpacked, filter='data')
+        else:
+            tar.extractall(unpacked)
     roots: list[pathlib.Path] = [p for p in unpacked.iterdir() if p.is_dir()]
     return Release(
         wheel,

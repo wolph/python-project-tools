@@ -1,11 +1,7 @@
 """Tests for the compatibility rules and the API manifest.
 
-Run from the skill directory, on every Python the manifest has to support::
-
-    uv run --no-project --python 3.10 --with packaging --with pytest pytest tests
-
-The orchestrator needs tomllib, so its own test is skipped below 3.11.
-"""  # noqa: E501
+Run with ``uv run pytest tests/test_compat.py``.
+"""
 
 from __future__ import annotations
 
@@ -359,7 +355,6 @@ def test_metadata_rules() -> None:
 
 
 def test_griffe_line() -> None:
-    pytest.importorskip('tomllib')
     from python_project_tools import check_compat
 
     assert check_compat.griffe_line(

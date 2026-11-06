@@ -24,7 +24,10 @@ classifiers = [
     'Topic :: Software Development :: Build Tools',
     'Typing :: Typed',
 ]
-dependencies = ['packaging>=23']
+dependencies = [
+    'packaging>=23',
+    'tomli>=2; python_version < "3.11"',
+]
 
 [project.urls]
 homepage = 'https://github.com/WoLpH/python-project-tools/'

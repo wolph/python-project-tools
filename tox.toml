@@ -1,0 +1,35 @@
+requires = ['tox>=4.21', 'tox-uv>=1']
+
+env_list = ['py310', 'py311', 'py312', 'py313', 'py314', 'ruff', 'ty', 'zizmor']
+skip_missing_interpreters = true
+
+[env_run_base]
+labels = ['test']
+extras = ['tests']
+commands = [['pytest', { replace = 'posargs', extend = true }]]
+
+[env.ruff]
+labels = ['check']
+skip_install = true
+deps = ['ruff==0.15.18']
+pass_env = ['RUFF_OUTPUT_FORMAT']
+commands = [['ruff', 'check'], ['ruff', 'format', '--check']]
+
+[env.ruff-fix]
+labels = ['fix']
+description = 'apply every fix ruff can make'
+skip_install = true
+deps = ['ruff==0.15.18']
+commands = [['ruff', 'check', '--fix', '--exit-zero'], ['ruff', 'format']]
+
+[env.ty]
+labels = ['check']
+extras = ['tests']
+deps = ['ty']
+commands = [['ty', 'check']]
+
+[env.zizmor]
+labels = ['check']
+skip_install = true
+deps = ['zizmor']
+commands = [['zizmor', '--offline', '.github/workflows']]

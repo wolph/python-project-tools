@@ -5,8 +5,6 @@ from __future__ import annotations
 import collections.abc
 import pathlib
 import shutil
-import subprocess
-import tempfile
 
 import pytest
 
@@ -16,49 +14,6 @@ from tests.fakes import Recorder, completed
 needs_gpg = pytest.mark.skipif(
     shutil.which('gpg') is None, reason='gpg is not installed'
 )
-
-
-@pytest.fixture
-def gnupg_home(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> collections.abc.Iterator[str]:
-    """A throwaway GNUPGHOME with one ed25519 key, yielding its fingerprint."""
-    # gpg-agent sockets live under GNUPGHOME and unix socket paths cap at
-    # about 104 bytes, which pytest's tmp_path on macOS already exceeds.
-    # mkdtemp gives a short directory with mode 0o700.
-    home: pathlib.Path = pathlib.Path(tempfile.mkdtemp(prefix='ppt-gpg-'))
-    try:
-        monkeypatch.setenv('GNUPGHOME', str(home))
-        subprocess.run(
-            [
-                'gpg',
-                '--batch',
-                '--passphrase',
-                '',
-                '--quick-generate-key',
-                'ppt test <ppt@example.invalid>',
-                'ed25519',
-                'sign',
-                '1d',
-            ],
-            check=True,
-            capture_output=True,
-        )
-        listing: str = subprocess.run(
-            ['gpg', '--batch', '--list-secret-keys', '--with-colons'],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        fingerprint: str = next(
-            line.split(':')[9]
-            for line in listing.splitlines()
-            if line.startswith('fpr:')
-        )
-        yield fingerprint
-    finally:
-        subprocess.run(['gpgconf', '--kill', 'gpg-agent'], check=False)
-        shutil.rmtree(home, ignore_errors=True)
 
 
 @needs_gpg

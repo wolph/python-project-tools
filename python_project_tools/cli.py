@@ -9,6 +9,7 @@ from python_project_tools import (
     check_compat,
     conda_forge,
     inventory,
+    match_tag,
     sign,
     verify_release,
 )
@@ -17,6 +18,7 @@ COMMANDS: dict[str, Callable[[list[str]], int]] = {
     'check-compat': check_compat.main,
     'conda-forge': conda_forge.main,
     'inventory': inventory.main,
+    'match-tag': match_tag.main,
     'sign': sign.main,
     'verify-release': verify_release.main,
 }

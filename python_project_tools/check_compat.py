@@ -776,7 +776,7 @@ def report(origin: str, findings: list[Finding]) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the command line."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        description=__doc__.split('\n\n')[0]
+        prog='ppt check-compat', description=__doc__.split('\n\n')[0]
     )
     parser.add_argument(
         '--against',

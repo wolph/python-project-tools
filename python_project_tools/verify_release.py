@@ -10,8 +10,8 @@ evidence and the exit status is 1 when any check fails.
 Usage:
     ppt verify-release --version 4.1.0 [--package python-utils]
         [--tag v4.1.0] [--stable-branch master] [--rtd-slug python-utils]
-        [--wait 900] [--skip pypi,github,docs,conda] [--import-name python_utils]
-        [--conda-name python-utils]
+        [--wait 900] [--import-name python_utils] [--conda-name python-utils]
+        [--skip pypi,github,stable,docs,install,conda]
 
 Run from the checkout of the package being released.
 """  # noqa: E501
@@ -297,7 +297,7 @@ def check_conda(package: str, version: str, conda_name: str | None) -> Result:
         return Result(
             'conda-forge',
             'FAIL',
-            f'conda-forge/{name} latest is {latest}, no {version} (see Phase 3)',  # noqa: E501
+            f'conda-forge/{name} latest is {latest}, no {version}',
         )
     return Result(
         'conda-forge',
@@ -362,7 +362,7 @@ def check_install(package: str, version: str, import_name: str) -> Result:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the command line."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        description=(__doc__ or '').split('\n\n')[0]
+        prog='ppt verify-release', description=(__doc__ or '').split('\n\n')[0]
     )
     parser.add_argument(
         '--version', required=True, help='released version, e.g. 4.1.0'

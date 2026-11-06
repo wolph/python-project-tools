@@ -25,3 +25,38 @@ def test_package_name_defaults_to_cwd_pyproject(
     (tmp_path / 'pyproject.toml').write_text("[project]\nname = 'spam-eggs'\n")
     monkeypatch.chdir(tmp_path)
     assert verify_release.read_package_name() == 'spam-eggs'
+
+
+def test_package_name_is_empty_without_pyproject(
+    tmp_path: pathlib.Path,
+) -> None:
+    assert verify_release.read_package_name(tmp_path) == ''
+
+
+def test_package_name_is_empty_without_name_key(
+    tmp_path: pathlib.Path,
+) -> None:
+    (tmp_path / 'pyproject.toml').write_text('[project]\nversion = "1"\n')
+    assert verify_release.read_package_name(tmp_path) == ''
+
+
+def test_package_flag_works_without_pyproject(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    passed: verify_release.Result = verify_release.Result(
+        'spam', 'PASS', 'eggs'
+    )
+    monkeypatch.setattr(verify_release, 'check_tag', lambda tag: passed)
+    monkeypatch.setattr(verify_release, 'check_version', lambda v, t: passed)
+    monkeypatch.setattr(verify_release, 'check_changelog', lambda v, t: passed)
+    argv: list[str] = [
+        '--version',
+        '1.0',
+        '--package',
+        'spam',
+        '--skip',
+        'pypi,github,stable,docs,install,conda',
+    ]
+    assert verify_release.main(argv) == 0

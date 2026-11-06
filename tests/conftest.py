@@ -100,15 +100,18 @@ def scratch_repo(
     git(path, 'config', 'user.name', 'Spam')
     git(path, 'config', 'user.email', 'spam@example.invalid')
     git(path, 'config', 'commit.gpgsign', 'false')
-    (path / 'README.md').write_text('spam and eggs\n')
+    # newline='\n' keeps the blobs identical on Windows, where text mode
+    # would write CRLF.
+    (path / 'README.md').write_text('spam and eggs\n', newline='\n')
     shas: list[str] = []
     for version in ('1.0', '1.1', '1.2'):
         (path / 'spam' / '__init__.py').write_text(
-            f"__version__ = '{version}'\n"
+            f"__version__ = '{version}'\n", newline='\n'
         )
         (path / 'setup.py').write_text(
             'from setuptools import setup\n'
-            f"setup(name='spam', version='{version}')\n"
+            f"setup(name='spam', version='{version}')\n",
+            newline='\n',
         )
         git(path, 'add', '-A')
         git(path, 'commit', '-q', '-m', f'bump {version}')

@@ -11,7 +11,7 @@ Usage:
     ppt verify-release --version 4.1.0 [--package python-utils]
         [--tag v4.1.0] [--stable-branch master] [--rtd-slug python-utils]
         [--wait 900] [--import-name python_utils] [--conda-name python-utils]
-        [--skip pypi,github,stable,docs,install,conda]
+        [--skip pypi,github,stable,docs,install,conda,signatures]
 
 Run from the checkout of the package being released.
 """  # noqa: E501
@@ -29,7 +29,7 @@ import tempfile
 import time
 from collections.abc import Callable
 
-from python_project_tools import common
+from python_project_tools import common, github
 from python_project_tools.toml_compat import tomllib
 
 CHANGELOG_NAMES: tuple[str, ...] = (
@@ -190,6 +190,54 @@ def check_github_release(tag: str) -> common.Result:
         )
     latest: str = 'latest' if release.get('isLatest') else 'not marked latest'
     return common.Result('github-release', 'PASS', f'{url} ({latest})')
+
+
+def check_signatures(tag: str) -> common.Result:
+    """The GitHub release carries GPG and Sigstore signatures for each dist."""
+    viewed: subprocess.CompletedProcess[str] = common.run(
+        [
+            'gh',
+            'repo',
+            'view',
+            '--json',
+            'nameWithOwner',
+            '--jq',
+            '.nameWithOwner',
+        ]
+    )
+    repo: str = viewed.stdout.strip()
+    if viewed.returncode != 0 or not repo:
+        return common.Result(
+            'signatures',
+            'FAIL',
+            f'gh repo view: {viewed.stderr.strip()}',
+        )
+    try:
+        listed: list[github.Release] = github.releases(repo)
+    except RuntimeError as error:
+        return common.Result('signatures', 'FAIL', str(error))
+    matches: list[github.Release] = [
+        item for item in listed if item.tag == tag
+    ]
+    if not matches:
+        return common.Result('signatures', 'FAIL', f'no release for {tag}')
+    names: set[str] = {asset.name for asset in matches[0].assets}
+    dists: list[str] = sorted(
+        name for name in names if name.endswith(('.whl', '.tar.gz'))
+    )
+    wanted: list[str] = ['SHA256SUMS', 'SHA256SUMS.asc']
+    for dist in dists:
+        wanted += [f'{dist}.asc', f'{dist}.sigstore.json']
+    missing: list[str] = [name for name in wanted if name not in names]
+    if missing:
+        return common.Result(
+            'signatures', 'FAIL', f'missing {", ".join(missing)}'
+        )
+    return common.Result(
+        'signatures',
+        'PASS',
+        f'{len(dists)} files with .asc and .sigstore.json, SHA256SUMS signed',
+    )
 
 
 def check_stable_branch(tag: str, branch: str) -> common.Result:
@@ -394,7 +442,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         '--skip',
         default='',
-        help='comma separated: pypi,github,stable,docs,install,conda',
+        help=(
+            'comma separated: pypi,github,stable,docs,install,conda,signatures'
+        ),
     )
     return parser.parse_args(argv)
 
@@ -433,6 +483,8 @@ def main(argv: list[str]) -> int:
         results.append(check_install(package, args.version, import_name))
     if 'conda' not in skip:
         results.append(check_conda(package, args.version, args.conda_name))
+    if 'signatures' not in skip:
+        results.append(check_signatures(tag))
 
     width: int = max(len(result.name) for result in results)
     for result in results:

@@ -11,6 +11,12 @@ of as prose a model has to follow.
 uv tool install --editable ~/workspace/python-project-tools
 ```
 
+## Verifying a release
+
+Releases signed with `ppt sign` carry GPG signatures and Sigstore bundles.
+[VERIFY.md](https://github.com/WoLpH/python-project-tools/blob/master/VERIFY.md)
+shows how to check them.
+
 ## Commands
 
 - `check-compat`: compare the public API of a package against its last release.

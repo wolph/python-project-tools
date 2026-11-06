@@ -73,6 +73,7 @@ class ScratchRepo:
 
     path: pathlib.Path
     shas: list[str]  # oldest first: versions 1.0, 1.1, 1.2
+    origin: pathlib.Path  # a bare repository with master pushed
 
 
 def git(path: pathlib.Path, *args: str) -> str:
@@ -86,7 +87,10 @@ def git(path: pathlib.Path, *args: str) -> str:
 def scratch_repo(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> ScratchRepo:
-    """Three commits bumping __version__ and setup.py to 1.0, 1.1, 1.2."""
+    """Three commits bumping __version__ and setup.py to 1.0, 1.1, 1.2.
+
+    The repository has a bare ``origin`` next to it that holds master.
+    """
     # Keep the user's global git config (signing, hooks) out of the repo.
     monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(tmp_path / 'no-such-config'))
     monkeypatch.setenv('GIT_CONFIG_SYSTEM', str(tmp_path / 'no-such-config'))
@@ -109,4 +113,8 @@ def scratch_repo(
         git(path, 'add', '-A')
         git(path, 'commit', '-q', '-m', f'bump {version}')
         shas.append(git(path, 'rev-parse', 'HEAD'))
-    return ScratchRepo(path=path, shas=shas)
+    origin: pathlib.Path = tmp_path / 'origin.git'
+    git(tmp_path, 'init', '-q', '--bare', '-b', 'master', str(origin))
+    git(path, 'remote', 'add', 'origin', str(origin))
+    git(path, 'push', '-q', 'origin', 'master')
+    return ScratchRepo(path=path, shas=shas, origin=origin)

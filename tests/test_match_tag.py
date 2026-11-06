@@ -9,7 +9,14 @@ import tarfile
 
 import pytest
 
-from python_project_tools import cli, common, match_tag, pypi, signing
+from python_project_tools import (
+    cli,
+    common,
+    match_tag,
+    pypi,
+    remote_tags,
+    signing,
+)
 from tests.conftest import ScratchRepo, git
 from tests.fakes import Recorder, completed
 
@@ -440,8 +447,75 @@ def test_main_refuses_an_existing_tag(
     ]
     assert match_tag.main(argv) == 1
     err: str = capsys.readouterr().err
-    assert f'tag v1.1 already exists at {scratch_repo.shas[0]}' in err
+    assert 'local tag v1.1 exists and is not on GitHub, not touching it' in err
     assert created == []
+    # On GitHub too, under the same name: the remote one is named.
+    git(scratch_repo.path, 'push', '-q', 'origin', 'v1.1')
+    assert match_tag.main(argv) == 1
+    err = capsys.readouterr().err
+    assert f'tag v1.1 already exists on GitHub at {scratch_repo.shas[0]}' in (
+        err
+    )
+    assert created == []
+
+
+def test_candidates_skip_commits_only_a_local_tag_reaches(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'checkout', '-q', '-b', 'side', scratch_repo.shas[0])
+    (path / 'spam' / '__init__.py').write_text("__version__ = '1.5'\n")
+    git(path, 'commit', '-q', '-am', 'bump 1.5 on the side')
+    side: str = git(path, 'rev-parse', 'HEAD')
+    git(path, 'tag', 'v1.5')
+    git(path, 'checkout', '-q', 'master')
+    git(path, 'branch', '-q', '-D', 'side')
+    assert match_tag.candidates(path, '1.5') == []
+    # Once GitHub has the tag it is fetched and the commit counts.
+    git(path, 'push', '-q', 'origin', 'v1.5')
+    remote_tags.fetch(path)
+    assert match_tag.candidates(path, '1.5') == [side]
+
+
+def test_create_tag_refuses_any_existing_local_tag(
+    scratch_repo: ScratchRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.1', scratch_repo.shas[0])
+    before: str = git(path, 'rev-parse', 'refs/tags/v1.1')
+    with pytest.raises(RuntimeError, match=r'local tag v1\.1 exists'):
+        match_tag.create_tag(path, 'v1.1', scratch_repo.shas[0], 'msg')
+    with pytest.raises(RuntimeError, match=r'local tag v1\.1 exists'):
+        match_tag.create_tag(path, 'v1.1', scratch_repo.shas[1], 'msg')
+    assert git(path, 'rev-parse', 'refs/tags/v1.1') == before
+
+
+def test_push_tag_records_the_pushed_tag_in_the_private_refs(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.1', scratch_repo.shas[1])
+    assert remote_tags.commit(path, 'v1.1') is None
+    match_tag.push_tag(path, 'v1.1')
+    pushed: str = git(path, 'rev-parse', 'refs/tags/v1.1')
+    assert git(path, 'rev-parse', 'refs/ppt/remote-tags/v1.1') == pushed
+    on_origin: str = git(scratch_repo.origin, 'rev-parse', 'refs/tags/v1.1')
+    assert on_origin == pushed
+
+
+def test_push_tag_never_overwrites_the_tag_on_origin(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.1', scratch_repo.shas[0])
+    git(path, 'push', '-q', 'origin', 'v1.1')
+    git(path, 'tag', '-d', 'v1.1')
+    git(path, 'tag', 'v1.1', scratch_repo.shas[1])
+    with pytest.raises(RuntimeError, match=r'push origin refs/tags/v1\.1'):
+        match_tag.push_tag(path, 'v1.1')
+    on_origin: str = git(scratch_repo.origin, 'rev-parse', 'refs/tags/v1.1')
+    assert on_origin == scratch_repo.shas[0]
+    assert remote_tags.commit(path, 'v1.1') is None
 
 
 def test_main_without_sdist_exits_one(
@@ -478,12 +552,17 @@ def test_create_tag_is_signed_and_annotated(
 
 
 def test_create_tag_passes_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    rec: Recorder = Recorder({'git tag': completed()})
+    rec: Recorder = Recorder(
+        {'git tag': completed(), 'git rev-parse': completed('', 1)}
+    )
     monkeypatch.setattr(common, 'run', rec)
     match_tag.create_tag(pathlib.Path(), 'v1', 'abc', 'msg')
     match_tag.create_tag(pathlib.Path(), 'v2', 'abc', 'msg', key='SPAM')
     default: str = signing.DEFAULT_GPG_KEY
-    assert rec.calls == [
+    tag_calls: list[list[str]] = [
+        call for call in rec.calls if call[:2] == ['git', 'tag']
+    ]
+    assert tag_calls == [
         ['git', 'tag', '-s', '-u', default, 'v1', 'abc', '-m', 'msg'],
         ['git', 'tag', '-s', '-u', 'SPAM', 'v2', 'abc', '-m', 'msg'],
     ]

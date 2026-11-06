@@ -22,6 +22,7 @@ import typing
 from python_project_tools import (
     common,
     pypi,
+    remote_tags,
     signing,
     versions,
     workflow_on,
@@ -57,6 +58,12 @@ TAG_MESSAGE: str = (
 )
 WORKFLOW_SUFFIXES: tuple[str, ...] = ('.yml', '.yaml')
 WORKFLOW_DIR: str = '.github/workflows'
+LOCAL_TAG_EXISTS: str = (
+    'local tag {name} exists and is not on GitHub, not touching it'
+)
+# Every ref but the checkout's own tags, which can point at commits GitHub
+# never saw. GitHub's tags are in remote_tags.REMOTE_TAGS, so they count.
+NOT_LOCAL_TAGS: str = f'--exclude={remote_tags.LOCAL_TAGS}/*'
 
 
 @dataclasses.dataclass
@@ -103,12 +110,23 @@ def _version_paths(checkout: pathlib.Path) -> list[str]:
 
 
 def candidates(checkout: pathlib.Path, version: str) -> list[str]:
-    """Commits whose diff adds or removes the version string, newest first."""
+    """Commits whose diff adds or removes the version string, newest first.
+
+    Commits only a local tag reaches are left out: pushing a tag at one
+    would publish a commit GitHub never had.
+    """
     paths: list[str] = _version_paths(checkout)
     if not paths:
         return []
     listing: str = _git(
-        checkout, 'log', '--all', '--format=%H', f'-S{version}', '--', *paths
+        checkout,
+        'log',
+        NOT_LOCAL_TAGS,
+        '--all',
+        '--format=%H',
+        f'-S{version}',
+        '--',
+        *paths,
     )
     return list(dict.fromkeys(listing.split()))
 
@@ -355,7 +373,13 @@ def create_tag(
     message: str,
     key: str = signing.DEFAULT_GPG_KEY,
 ) -> None:
-    """Create an annotated tag at ``sha``, signed with ``key``."""
+    """Create an annotated tag at ``sha``, signed with ``key``.
+
+    Refuses when a local tag of that name exists, whatever it points at:
+    an existing tag is never moved or replaced.
+    """
+    if remote_tags.local_object(checkout, tag) is not None:
+        raise RuntimeError(LOCAL_TAG_EXISTS.format(name=tag))
     done = common.run(
         ['git', 'tag', '-s', '-u', key, tag, sha, '-m', message],
         cwd=checkout,
@@ -365,10 +389,17 @@ def create_tag(
 
 
 def push_tag(checkout: pathlib.Path, tag: str) -> None:
-    """Push one tag to origin."""
-    done = common.run(['git', 'push', 'origin', tag], cwd=checkout)
+    """Push one local tag to origin and record it as GitHub's tag.
+
+    The push names ``refs/tags/TAG`` without a ``+``, so a tag of that
+    name on origin is never overwritten and a branch of the same name
+    never goes instead. The private ref is updated only after the push.
+    """
+    local: str = f'{remote_tags.LOCAL_TAGS}/{tag}'
+    done = common.run(['git', 'push', 'origin', local], cwd=checkout)
     if done.returncode != 0:
-        raise RuntimeError(f'git push origin {tag}: {done.stderr.strip()}')
+        raise RuntimeError(f'git push origin {local}: {done.stderr.strip()}')
+    remote_tags.record_pushed(checkout, tag)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -415,15 +446,15 @@ def _tag_and_push(
     args: argparse.Namespace, best: Candidate, sdist: pypi.PypiFile
 ) -> int:
     tag: str = versions.tag_for(args.version)
-    existing = common.run(
-        ['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'],
-        cwd=args.checkout,
-    )
-    if existing.returncode == 0:
+    existing: str | None = remote_tags.commit(args.checkout, tag)
+    if existing is not None:
         say(
-            f'tag {tag} already exists at {existing.stdout.strip()}',
+            f'tag {tag} already exists on GitHub at {existing}',
             file=sys.stderr,
         )
+        return 1
+    if remote_tags.local_object(args.checkout, tag) is not None:
+        say(LOCAL_TAG_EXISTS.format(name=tag), file=sys.stderr)
         return 1
     if args.push:
         flows: list[str] = workflow_with_tag_trigger(args.checkout, best.sha)
@@ -458,6 +489,7 @@ def main(argv: list[str]) -> int:
         if sdist is None:
             say(f'{args.package} {args.version} has no sdist on PyPI')
             return 1
+        remote_tags.fetch(args.checkout)
         with tempfile.TemporaryDirectory() as work:
             archive: pathlib.Path = pypi.download(sdist, pathlib.Path(work))
             cands: list[Candidate] = [

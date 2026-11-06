@@ -24,6 +24,11 @@ invocation for up to SIGSTORE_CHUNK files, so one browser login covers the
 run. A run goes through ``start_run``, ``execute_run``, ``sign_pending``
 and ``finish_run``, so ``backfill_batch`` can sign the bundles of several
 packages in one invocation. ``run_backfill`` is the run of one package.
+The tags on GitHub are the truth: they are fetched into the private
+``remote_tags.REMOTE_TAGS`` namespace, every tag is read from there, and
+the checkout's own ``refs/tags`` are never written or moved. A new tag
+whose name already exists locally is refused, and local tags that differ
+from GitHub's are named in the report.
 Call the other modules through their attributes (``github.create_release``,
 ``sign.sign_release``) so tests can replace them.
 """
@@ -49,6 +54,7 @@ from python_project_tools import (
     match_tag,
     pypi,
     rebuild,
+    remote_tags,
     sign,
     signing,
     versions,
@@ -57,7 +63,8 @@ from python_project_tools import (
 UNTAGGED_TAG: str = 'pypi-untagged-releases'
 UNTAGGED_TITLE: str = 'PyPI versions without a matching tag'
 UNKNOWN: str = 'unknown'
-NO_LOCAL_TAG_NOTE: str = 'tag not in checkout, stock notes used'
+NO_LOCAL_TAG_NOTE: str = 'tag not fetched from GitHub, stock notes used'
+ON_GITHUB_NOTE: str = 'tag {name} already exists on GitHub, not touching it'
 STOCK_NOTES: str = (
     'Release {version}. No changelog section was found at tag {tag}.'
 )
@@ -179,6 +186,8 @@ class BackfillReport:
     latest_target: str | None = None
     # Why the run stopped early, empty when it ran to the end.
     stopped: str = ''
+    # Lines about the package as a whole, such as differing local tags.
+    notes: list[str] = dataclasses.field(default_factory=list)
 
 
 class RunStoppedError(RuntimeError):
@@ -247,6 +256,7 @@ class PackageRun:
     attempted: set[str] = dataclasses.field(default_factory=set)
     pending: list[_Pending] = dataclasses.field(default_factory=list)
     disabled_workflows: set[str] | None = None
+    notes: list[str] = dataclasses.field(default_factory=list)
 
 
 def _say(message: str) -> None:
@@ -355,24 +365,15 @@ def plan_versions(
 
 
 def _show(checkout: pathlib.Path, tag: str, name: str) -> list[str] | None:
+    """The lines of a file at GitHub's tag, None when it cannot be read."""
+    source: str = f'{remote_tags.ref(tag)}:{name}'
     try:
-        done = common.run(['git', 'show', f'{tag}:{name}'], cwd=checkout)
+        done = common.run(['git', 'show', source], cwd=checkout)
     except UnicodeDecodeError:
         return None
     if done.returncode != 0:
         return None
     return done.stdout.splitlines()
-
-
-def _local_tag_sha(checkout: pathlib.Path, tag: str) -> str | None:
-    """The commit a local tag points at, or None when it does not exist."""
-    done = common.run(
-        ['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'],
-        cwd=checkout,
-    )
-    if done.returncode != 0:
-        return None
-    return done.stdout.strip()
 
 
 def _rst_block(lines: list[str], version: str) -> list[str] | None:
@@ -413,10 +414,11 @@ def changelog_section(
 
     Matches ``VERSION:`` headings (reStructuredText changelogs) and
     ``## VERSION`` headings (Markdown) and runs to the next heading of the
-    same kind. Returns None when the tag is not in the checkout, when no
-    changelog mentions the version or when a changelog is not UTF-8.
+    same kind. The tag is GitHub's, from ``remote_tags.REMOTE_TAGS``.
+    Returns None when that tag was not fetched, when no changelog mentions
+    the version or when a changelog is not UTF-8.
     """
-    if _local_tag_sha(checkout, tag) is None:
+    if remote_tags.commit(checkout, tag) is None:
         return None
     for name in CHANGELOG_NAMES:
         lines: list[str] | None = _show(checkout, tag, name)
@@ -472,12 +474,17 @@ def _find_match(
 def _make_tag(
     run: PackageRun, plan: Plan, sha: str, sdist: pypi.PypiFile
 ) -> str | None:
-    """Create and push the tag, reusing a local tag at the same commit.
+    """Create and push a new tag, refusing a name that is already taken.
 
-    Returns a note when a local tag of that name points somewhere else.
+    Returns a note, and creates nothing, when GitHub already has a tag of
+    that name or when a local tag of that name exists, whatever it points
+    at. An existing tag is never moved, replaced or pushed.
     """
     checkout: pathlib.Path = run.options.checkout
     name: str = versions.tag_for(plan.version)
+    refused: str | None = _taken_tag_note(run, name)
+    if refused is not None:
+        return refused
     message: str = match_tag.TAG_MESSAGE.format(
         package=run.package,
         version=plan.version,
@@ -485,18 +492,26 @@ def _make_tag(
         sha256=sdist.sha256,
         date=dt.date.today().isoformat(),
     )
-    local: str | None = _local_tag_sha(checkout, name)
-    if local is not None and local != sha:
-        return f'local tag {name} points at {local}, not at the matched commit'
-    if local is None:
-        match_tag.create_tag(
-            checkout, name, sha, message, key=run.options.gpg_key
-        )
-    if not any(tag.name == name for tag in run.tags):
-        match_tag.push_tag(checkout, name)
+    match_tag.create_tag(checkout, name, sha, message, key=run.options.gpg_key)
+    match_tag.push_tag(checkout, name)
     plan.tag = name
     plan.tag_action = 'create'
     run.tags.append(github.Tag(name, sha))
+    return None
+
+
+def _taken_tag_note(run: PackageRun, name: str) -> str | None:
+    """Why a new tag ``name`` must not be created, or None when it may.
+
+    GitHub's tags are checked in the API listing and in the fetched
+    private refs, the checkout's own tags by name alone.
+    """
+    checkout: pathlib.Path = run.options.checkout
+    on_github: bool = any(tag.name == name for tag in run.tags)
+    if on_github or remote_tags.commit(checkout, name) is not None:
+        return ON_GITHUB_NOTE.format(name=name)
+    if remote_tags.local_object(checkout, name) is not None:
+        return match_tag.LOCAL_TAG_EXISTS.format(name=name)
     return None
 
 
@@ -619,10 +634,13 @@ def _create_release(
 
 
 def _tag_commit(run: PackageRun, tag: str) -> str:
-    """The commit of a tag, from the checkout or else from GitHub."""
-    local: str | None = _local_tag_sha(run.options.checkout, tag)
-    if local is not None:
-        return local
+    """The commit of GitHub's tag, from the fetched refs or the API listing.
+
+    The checkout's own tag of that name is never read.
+    """
+    fetched: str | None = remote_tags.commit(run.options.checkout, tag)
+    if fetched is not None:
+        return fetched
     for known in run.tags:
         if known.name == tag and known.sha:
             return known.sha
@@ -663,7 +681,7 @@ def _release_workflow_note(run: PackageRun, tag: str) -> str | None:
 def _ensure_release(run: PackageRun, plan: Plan) -> tuple[github.Release, str]:
     """The release of a plan, created with changelog notes when missing.
 
-    The note is non-empty when the tag is not in the checkout, so the notes
+    The note is non-empty when GitHub's tag was not fetched, so the notes
     are the stock sentence.
     """
     assert plan.tag is not None
@@ -673,7 +691,7 @@ def _ensure_release(run: PackageRun, plan: Plan) -> tuple[github.Release, str]:
     checkout: pathlib.Path = run.options.checkout
     note: str = ''
     section: str | None = None
-    if _local_tag_sha(checkout, plan.tag) is None:
+    if remote_tags.commit(checkout, plan.tag) is None:
         note = NO_LOCAL_TAG_NOTE
     else:
         section = changelog_section(checkout, plan.tag, plan.version)
@@ -939,6 +957,9 @@ def _dry_run_plan(
     if plan.tag_action == 'untagged':
         return None, 'no files on PyPI and no tag'
     if plan.tag_action == 'create':
+        taken: str | None = _taken_tag_note(run, tag)
+        if taken is not None:
+            return None, taken
         _say(f'{plan.version}: would match tag against sdist')
         _say(f'{plan.version}: would create tag {tag}')
     if plan.release_action == 'create':
@@ -1017,29 +1038,28 @@ def _anchor_sha(run: PackageRun) -> str:
 
 
 def _ensure_anchor_tag(run: PackageRun) -> str | None:
-    """Make sure the untagged tag exists locally and on origin.
+    """Make sure the untagged tag exists on GitHub, creating it if not.
 
-    Returns a note when a workflow would fire and nothing was done.
+    Returns a note, and does nothing, when a workflow would fire or when a
+    tag of that name exists locally or was fetched from GitHub.
     """
     if any(tag.name == UNTAGGED_TAG for tag in run.tags):
         return None
     checkout: pathlib.Path = run.options.checkout
+    refused: str | None = _taken_tag_note(run, UNTAGGED_TAG)
+    if refused is not None:
+        return refused
     sha: str = _anchor_sha(run)
     flows: list[str] = match_tag.workflow_with_tag_trigger(checkout, sha)
     if flows and not run.options.allow_workflow_trigger:
         return 'tag not pushed, workflow would fire: ' + ', '.join(flows)
-    local = common.run(
-        ['git', 'rev-parse', '-q', '--verify', f'refs/tags/{UNTAGGED_TAG}'],
-        cwd=checkout,
+    match_tag.create_tag(
+        checkout,
+        UNTAGGED_TAG,
+        sha,
+        ANCHOR_MESSAGE,
+        key=run.options.gpg_key,
     )
-    if local.returncode != 0:
-        match_tag.create_tag(
-            checkout,
-            UNTAGGED_TAG,
-            sha,
-            ANCHOR_MESSAGE,
-            key=run.options.gpg_key,
-        )
     match_tag.push_tag(checkout, UNTAGGED_TAG)
     run.tags.append(github.Tag(UNTAGGED_TAG, sha))
     return None
@@ -1338,11 +1358,15 @@ def _latest_after(repo: str) -> str | None:
         return UNKNOWN
 
 
-def _fetch_tags(checkout: pathlib.Path) -> None:
-    """Fetch the remote tags, never overwriting a local one."""
-    done = common.run(['git', 'fetch', 'origin', '--tags'], cwd=checkout)
-    if done.returncode != 0:
-        raise RuntimeError(f'git fetch origin --tags: {done.stderr.strip()}')
+def _fetch_tags(checkout: pathlib.Path) -> list[str]:
+    """Fetch GitHub's tags into the private refs, return the report notes.
+
+    The checkout's own tags are left alone. Local tags that differ from
+    GitHub's tag of the same name get one note line, they are not changed.
+    """
+    remote_tags.fetch(checkout)
+    names: list[str] = remote_tags.differing(checkout)
+    return [remote_tags.differ_note(names)] if names else []
 
 
 def _sign_options(package: str, options: BackfillOptions) -> sign.SignOptions:
@@ -1469,11 +1493,14 @@ def start_run(package: str, options: BackfillOptions) -> PackageRun:
 
     The caller runs ``preflight`` first. Raises LookupError for an unknown
     package or ``only`` version, and RuntimeError or common.FetchError when
-    the tags cannot be fetched or GitHub or PyPI cannot be read. The run
-    owns a work directory from here on, ``close_run`` removes it.
+    the tags cannot be fetched or GitHub or PyPI cannot be read. A dry run
+    fetches the tags too: it only writes the private refs, and it then
+    fails where the real run would. The run owns a work directory from
+    here on, ``close_run`` removes it.
     """
-    if not options.dry_run:
-        _fetch_tags(options.checkout)
+    notes: list[str] = _fetch_tags(options.checkout)
+    for note in notes:
+        _say(note)
     project: pypi.Project = pypi.project(package)
     tags: list[github.Tag] = github.tags(options.repo)
     releases: list[github.Release] = github.releases(options.repo)
@@ -1494,6 +1521,7 @@ def start_run(package: str, options: BackfillOptions) -> PackageRun:
         sign_options=_sign_options(package, options),
         latest_before=before,
         plans=plans,
+        notes=notes,
     )
 
 
@@ -1511,6 +1539,7 @@ def finish_run(run: PackageRun) -> BackfillReport:
         latest_after=_latest_after(run.options.repo),
         latest_target=target,
         stopped=run.stopped,
+        notes=list(run.notes),
     )
 
 
@@ -1583,6 +1612,7 @@ def to_markdown(report: BackfillReport) -> str:
         cells: list[str] = [markdown_cell(cell) for cell in _row_cells(row)]
         lines.append('| ' + ' | '.join(cells) + ' |')
     lines.append('')
+    lines.extend(report.notes)
     if report.stopped:
         lines.append(f'Stopped: {report.stopped}')
     before: str = report.latest_before or 'none'

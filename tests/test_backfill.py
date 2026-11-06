@@ -19,6 +19,7 @@ from python_project_tools import (
     match_tag,
     pypi,
     rebuild,
+    remote_tags,
     sign,
     signing,
 )
@@ -101,6 +102,10 @@ class World:
         self.assets: dict[str, bytes] = {}
         self.asset_downloads: list[str] = []
         self.sleeps: list[float] = []
+        # Tag name to commit: the checkout's own tags and GitHub's fetched
+        # into the private refs.
+        self.local: dict[str, str] = {}
+        self.fetched: dict[str, str] = {}
 
 
 def _sign_release(
@@ -166,6 +171,7 @@ def install(
     world.rec = Recorder(
         {
             'git fetch': completed(),
+            'git for-each-ref': completed(),
             'git show': completed('', 128),
             'git rev-list': completed(ROOT + '\n'),
             'git rev-parse': completed('', 1),
@@ -220,11 +226,22 @@ def install(
         world.new_tags.append((tag, sha, message))
         world.tag_keys.append(key)
         # A tag that was just created exists in the checkout.
-        world.rec.replies['git rev-parse'] = completed(sha + '\n')
+        world.local[tag] = sha
+
+    def push_tag(checkout: pathlib.Path, tag: str) -> None:
+        world.pushed.append(tag)
+        # A pushed tag is recorded in the private refs.
+        world.fetched[tag] = world.local[tag]
 
     monkeypatch.setattr(match_tag, 'create_tag', create_tag)
+    monkeypatch.setattr(match_tag, 'push_tag', push_tag)
     monkeypatch.setattr(
-        match_tag, 'push_tag', lambda checkout, tag: world.pushed.append(tag)
+        remote_tags, 'commit', lambda checkout, name: world.fetched.get(name)
+    )
+    monkeypatch.setattr(
+        remote_tags,
+        'local_object',
+        lambda checkout, name: world.local.get(name),
     )
     install_github(monkeypatch, world)
     return world
@@ -431,6 +448,10 @@ def test_changelog_section_extracts_the_block(
     git(path, 'add', 'CHANGELOG.rst')
     git(path, 'commit', '-q', '-m', 'changelog')
     git(path, 'tag', 'v1.2')
+    git(path, 'push', '-q', 'origin', 'v1.2')
+    # Only a local tag, GitHub never had it.
+    git(path, 'tag', 'v1.0', scratch_repo.shas[0])
+    remote_tags.fetch(path)
     assert backfill.changelog_section(path, 'v1.2', '1.2') == (
         '1.2:\n\n- fixed spam\n- added eggs'
     )
@@ -456,7 +477,11 @@ def test_changelog_section_reads_markdown_headings(
     ) -> subprocess.CompletedProcess[str]:
         if args[:2] == ['git', 'rev-parse']:
             return completed(SHA)
-        found: bool = args == ['git', 'show', 'v1.2:CHANGES.md']
+        found: bool = args == [
+            'git',
+            'show',
+            'refs/ppt/remote-tags/v1.2:CHANGES.md',
+        ]
         return completed(text if found else '', 0 if found else 128)
 
     monkeypatch.setattr(common, 'run', run)
@@ -521,7 +546,11 @@ def test_run_backfill_dry_run_creates_nothing(
     assert not world.pushed
     assert not world.downloads
     assert not world.rebuilt
-    assert world.rec.calls == []
+    # Only the fetch into the private refs and reads of the refs.
+    assert world.rec.calls[0] == list(remote_tags.FETCH)
+    assert all(
+        call[:2] == ['git', 'for-each-ref'] for call in world.rec.calls[1:]
+    )
     assert len(report.rows) == 3
 
 
@@ -743,9 +772,13 @@ def test_changelog_text_becomes_the_release_notes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     world: World = install(monkeypatch, World())
-    world.rec.replies['git rev-parse'] = completed(SHA)
+    world.fetched['v1.0'] = SHA
+    world.rec.replies['git show refs/ppt/remote-tags/v1.0:CHANGELOG.rst'] = (
+        completed('1.0:\n\n- spam\n\n0.9:\n\n- eggs\n')
+    )
+    # The checkout's own tag of that name is never read.
     world.rec.replies['git show v1.0:CHANGELOG.rst'] = completed(
-        '1.0:\n\n- spam\n\n0.9:\n\n- eggs\n'
+        '1.0:\n\n- local only\n'
     )
     world.project = project_with({'1.0': files_of('1.0')})
     world.tags = [github.Tag('v1.0', SHA)]
@@ -854,18 +887,22 @@ def test_a_stray_key_error_is_not_swallowed(
         backfill.run_backfill('spam', options(tmp_path))
 
 
-def test_tags_are_fetched_first_unless_dry_run(
+def test_tags_are_fetched_into_the_private_refs_first_dry_run_too(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     world: World = install(monkeypatch, World())
     world.project = project_with({'1.0': files_of('1.0')})
     world.tags = [github.Tag('v1.0', SHA)]
     backfill.run_backfill('spam', options(tmp_path))
-    assert world.rec.calls[0] == ['git', 'fetch', 'origin', '--tags']
+    fetch: list[str] = [
+        *('git', 'fetch', '--no-tags', '--prune', '--no-prune-tags'),
+        *('origin', '+refs/tags/*:refs/ppt/remote-tags/*'),
+    ]
+    assert world.rec.calls[0] == fetch
     world.rec.calls.clear()
     world.latest = ['v1.0', 'v1.0']
     backfill.run_backfill('spam', options(tmp_path, dry_run=True))
-    assert not any(call[:2] == ['git', 'fetch'] for call in world.rec.calls)
+    assert world.rec.calls[0] == fetch
 
 
 def test_a_failed_fetch_exits_2_before_anything_is_created(
@@ -895,30 +932,16 @@ def test_a_tag_missing_from_the_checkout_gets_stock_notes_and_a_note(
         'spam', options(tmp_path)
     )
     assert 'No changelog section' in world.created[0][2]
-    assert report.rows[0][2] == 'tag not in checkout, stock notes used'
+    assert report.rows[0][2] == 'tag not fetched from GitHub, stock notes used'
 
 
-def test_a_local_tag_at_the_matched_commit_is_pushed_not_recreated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize('local', [SHA, 'b' * 40])
+def test_a_new_tag_whose_name_exists_locally_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, local: str
 ) -> None:
+    # Whether the local tag is at the matched commit or elsewhere.
     world: World = install(monkeypatch, World())
-    world.rec.replies['git rev-parse'] = completed(SHA + '\n')
-    world.project = project_with({'1.2': files_of('1.2')})
-    report: backfill.BackfillReport = backfill.run_backfill(
-        'spam', options(tmp_path)
-    )
-    assert not world.new_tags
-    assert world.pushed == ['v1.2']
-    assert world.created[0][0] == 'v1.2'
-    assert report.rows[0][2] == ''
-
-
-def test_a_local_tag_elsewhere_skips_the_version(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    other: str = 'b' * 40
-    world: World = install(monkeypatch, World())
-    world.rec.replies['git rev-parse'] = completed(other + '\n')
+    world.local['v1.2'] = local
     world.project = project_with({'1.2': files_of('1.2')})
     report: backfill.BackfillReport = backfill.run_backfill(
         'spam', options(tmp_path)
@@ -928,8 +951,45 @@ def test_a_local_tag_elsewhere_skips_the_version(
     assert not world.created
     _, outcome, note = report.rows[0]
     assert outcome is None
-    assert note == (
-        f'local tag v1.2 points at {other}, not at the matched commit'
+    assert (
+        note == 'local tag v1.2 exists and is not on GitHub, not touching it'
+    )
+    assert backfill.exit_status(report) == 1
+
+
+def test_a_new_tag_already_in_the_fetched_refs_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # The API listing lags behind a tag the fetch already saw.
+    world: World = install(monkeypatch, World())
+    world.fetched['v1.2'] = 'b' * 40
+    world.project = project_with({'1.2': files_of('1.2')})
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.new_tags
+    assert not world.pushed
+    assert report.rows[0][2] == (
+        'tag v1.2 already exists on GitHub, not touching it'
+    )
+
+
+def test_a_local_anchor_tag_refuses_the_untagged_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    world.project = project_with({'1.0': files_of('1.0')})
+    world.match_sha = None
+    world.local[backfill.UNTAGGED_TAG] = 'b' * 40
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.new_tags
+    assert not world.pushed
+    assert not world.created
+    assert report.rows[0][2] == (
+        f'local tag {backfill.UNTAGGED_TAG} exists and is not on GitHub, '
+        'not touching it'
     )
 
 

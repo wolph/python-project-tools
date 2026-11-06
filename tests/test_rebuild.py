@@ -9,7 +9,7 @@ import tarfile
 
 import pytest
 
-from python_project_tools import common, rebuild
+from python_project_tools import common, rebuild, remote_tags
 from tests.conftest import ScratchRepo, git
 from tests.fakes import Recorder, completed
 
@@ -85,7 +85,7 @@ def test_rebuild_runs_uv_build_in_an_archive(
     assert all(p.parent == out and p.exists() for p in built)
     archive, uv = fake.calls
     assert archive[0][:4] == ['git', 'archive', '--format=tar', '--output']
-    assert archive[0][-1] == 'v1.0'
+    assert archive[0][-1] == 'refs/ppt/remote-tags/v1.0'
     assert archive[1] == checkout
     assert uv[0][:2] == ['uv', 'build']
     assert uv[0][uv[0].index('--out-dir') + 1] == str(out)
@@ -102,13 +102,25 @@ def test_rebuild_reads_the_commit_time_of_the_tag(
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(rebuild.RebuildError, match='bad revision'):
         rebuild.rebuild(tmp_path, 'v9.9', tmp_path / 'out')
-    assert rec.calls == [['git', 'log', '-1', '--format=%ct', 'v9.9']]
+    assert rec.calls == [
+        ['git', 'log', '-1', '--format=%ct', 'refs/ppt/remote-tags/v9.9']
+    ]
 
 
-def test_rebuild_epoch_comes_from_git(scratch_repo: ScratchRepo) -> None:
-    git(scratch_repo.path, 'tag', 'v1.1', scratch_repo.shas[1])
-    expected: str = git(scratch_repo.path, 'log', '-1', '--format=%ct', 'v1.1')
-    assert rebuild._commit_time(scratch_repo.path, 'v1.1') == expected
+def test_rebuild_epoch_comes_from_github_tag(
+    scratch_repo: ScratchRepo,
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.1', scratch_repo.shas[0])
+    git(path, 'push', '-q', 'origin', 'v1.1')
+    # The local tag of the same name points elsewhere and is not read.
+    git(path, 'tag', '-d', 'v1.1')
+    git(path, 'tag', 'v1.1', scratch_repo.shas[2])
+    remote_tags.fetch(path)
+    expected: str = git(
+        path, 'log', '-1', '--format=%ct', scratch_repo.shas[0]
+    )
+    assert rebuild._commit_time(path, 'v1.1') == expected
 
 
 def test_rebuild_removes_the_extraction_directory(
@@ -153,3 +165,19 @@ def test_rebuild_raises_when_the_tag_cannot_be_archived(
     monkeypatch.setattr(common, 'run', failing)
     with pytest.raises(rebuild.RebuildError, match='not a valid object'):
         rebuild.rebuild(tmp_path, 'v9.9', tmp_path / 'out')
+
+
+def test_rebuild_exports_github_tag_not_the_local_one(
+    scratch_repo: ScratchRepo, tmp_path: pathlib.Path
+) -> None:
+    path: pathlib.Path = scratch_repo.path
+    git(path, 'tag', 'v1.0', scratch_repo.shas[0])
+    git(path, 'push', '-q', 'origin', 'v1.0')
+    git(path, 'tag', '-d', 'v1.0')
+    git(path, 'tag', 'v1.0', scratch_repo.shas[2])
+    remote_tags.fetch(path)
+    work: pathlib.Path = tmp_path / 'work'
+    work.mkdir()
+    tree: pathlib.Path = rebuild._export(path, 'v1.0', work)
+    version: str = (tree / 'spam' / '__init__.py').read_text()
+    assert version == "__version__ = '1.0'\n"

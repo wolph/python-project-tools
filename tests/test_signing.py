@@ -27,34 +27,34 @@ def gnupg_home(
     # about 104 bytes, which pytest's tmp_path on macOS already exceeds.
     # mkdtemp gives a short directory with mode 0o700.
     home: pathlib.Path = pathlib.Path(tempfile.mkdtemp(prefix='ppt-gpg-'))
-    monkeypatch.setenv('GNUPGHOME', str(home))
-    subprocess.run(
-        [
-            'gpg',
-            '--batch',
-            '--passphrase',
-            '',
-            '--quick-generate-key',
-            'ppt test <ppt@example.invalid>',
-            'ed25519',
-            'sign',
-            '1d',
-        ],
-        check=True,
-        capture_output=True,
-    )
-    listing: str = subprocess.run(
-        ['gpg', '--batch', '--list-secret-keys', '--with-colons'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    fingerprint: str = next(
-        line.split(':')[9]
-        for line in listing.splitlines()
-        if line.startswith('fpr:')
-    )
     try:
+        monkeypatch.setenv('GNUPGHOME', str(home))
+        subprocess.run(
+            [
+                'gpg',
+                '--batch',
+                '--passphrase',
+                '',
+                '--quick-generate-key',
+                'ppt test <ppt@example.invalid>',
+                'ed25519',
+                'sign',
+                '1d',
+            ],
+            check=True,
+            capture_output=True,
+        )
+        listing: str = subprocess.run(
+            ['gpg', '--batch', '--list-secret-keys', '--with-colons'],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        fingerprint: str = next(
+            line.split(':')[9]
+            for line in listing.splitlines()
+            if line.startswith('fpr:')
+        )
         yield fingerprint
     finally:
         subprocess.run(['gpgconf', '--kill', 'gpg-agent'], check=False)
@@ -200,3 +200,14 @@ def test_parse_sha256sums_ignores_blank_and_comment_lines(
     sums: pathlib.Path = tmp_path / 'SHA256SUMS'
     sums.write_text('# note\n\n' + 'ab' * 32 + '  x y.whl\n')
     assert signing.parse_sha256sums(sums) == {'x y.whl': 'ab' * 32}
+
+
+@needs_gpg
+def test_gpg_sign_keeps_double_extension(
+    gnupg_home: str, tmp_path: pathlib.Path
+) -> None:
+    target: pathlib.Path = tmp_path / 'a.tar.gz'
+    target.write_bytes(b'sdist bytes')
+    signature: pathlib.Path = signing.gpg_sign(target, gnupg_home)
+    assert signature.name == 'a.tar.gz.asc'
+    assert signature.exists()

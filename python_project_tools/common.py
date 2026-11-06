@@ -1,0 +1,122 @@
+"""Helpers shared by the ppt commands.
+
+Everything that touches the outside world (subprocesses, the network, the
+filesystem layout of a checkout) lives here, so tests can replace one
+attribute on this module instead of patching every command. Call these as
+``common.run(...)`` and never import the names directly, or a monkeypatch
+on ``common`` will not reach the caller.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import pathlib
+import subprocess
+import urllib.error
+import urllib.request
+
+from python_project_tools.toml_compat import tomllib
+
+# Tests replace this attribute to stand in for the network.
+urlopen = urllib.request.urlopen
+
+USER_AGENT: str = 'python-project-tools'
+FETCH_TIMEOUT: int = 60
+CHUNK_SIZE: int = 1 << 20
+
+
+@dataclasses.dataclass
+class Result:
+    """Outcome of one check."""
+
+    name: str
+    status: str  # PASS, FAIL or SKIP, plus WARN, EDIT and INFO in conda-forge
+    evidence: str
+
+
+class FetchError(Exception):
+    """A network or decode failure, with the url in the message."""
+
+
+def run(
+    args: list[str],
+    check: bool = False,
+    cwd: pathlib.Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command and capture its output as text."""
+    return subprocess.run(
+        args, capture_output=True, text=True, check=check, cwd=cwd
+    )
+
+
+def gh_json(args: list[str]) -> object | None:
+    """Run a gh command that prints JSON, or return None when it fails."""
+    done: subprocess.CompletedProcess[str] = run(['gh', *args])
+    if done.returncode != 0 or not done.stdout.strip():
+        return None
+    try:
+        return json.loads(done.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={'Cache-Control': 'no-cache', 'User-Agent': USER_AGENT},
+    )
+
+
+def fetch_json(url: str) -> object | None:
+    """Fetch a JSON document, or return None when the server says 404.
+
+    Any other failure raises FetchError, so an outage never reads as
+    "not found".
+    """
+    try:
+        with urlopen(_request(url), timeout=FETCH_TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code == 404:
+            return None
+        raise FetchError(f'{url}: HTTP {error.code}') from error
+    except urllib.error.URLError as error:
+        raise FetchError(f'{url}: {error.reason}') from error
+    except (TimeoutError, json.JSONDecodeError) as error:
+        raise FetchError(f'{url}: {error}') from error
+
+
+def fetch_bytes(url: str, into: pathlib.Path) -> pathlib.Path:
+    """Download a url into a file and return the file's path."""
+    try:
+        with urlopen(_request(url), timeout=FETCH_TIMEOUT) as response:
+            into.write_bytes(response.read())
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise FetchError(f'{url}: HTTP {error.code}') from error
+    except urllib.error.URLError as error:
+        raise FetchError(f'{url}: {error.reason}') from error
+    except TimeoutError as error:
+        raise FetchError(f'{url}: {error}') from error
+    return into
+
+
+def sha256_of(path: pathlib.Path) -> str:
+    """The hex SHA-256 digest of a file."""
+    digest: hashlib._Hash = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(CHUNK_SIZE), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_package_name(root: pathlib.Path = pathlib.Path('.')) -> str:
+    """Return the name from ``root/pyproject.toml``, or '' when absent."""
+    pyproject: pathlib.Path = root / 'pyproject.toml'
+    project: dict[str, object] = {}
+    if pyproject.exists():
+        project = tomllib.loads(pyproject.read_text()).get('project', {})  # type: ignore[assignment]
+    return str(project.get('name', ''))

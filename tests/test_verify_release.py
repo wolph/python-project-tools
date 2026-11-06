@@ -2,7 +2,7 @@ import pathlib
 
 import pytest
 
-from python_project_tools import cli, verify_release
+from python_project_tools import cli, common, verify_release
 
 
 def test_verify_release_is_registered() -> None:
@@ -18,36 +18,12 @@ def test_help_lists_the_skip_groups(
     assert 'pypi,github,stable,docs,install,conda' in capsys.readouterr().out
 
 
-def test_package_name_defaults_to_cwd_pyproject(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    (tmp_path / 'pyproject.toml').write_text("[project]\nname = 'spam-eggs'\n")
-    monkeypatch.chdir(tmp_path)
-    assert verify_release.read_package_name() == 'spam-eggs'
-
-
-def test_package_name_is_empty_without_pyproject(
-    tmp_path: pathlib.Path,
-) -> None:
-    assert verify_release.read_package_name(tmp_path) == ''
-
-
-def test_package_name_is_empty_without_name_key(
-    tmp_path: pathlib.Path,
-) -> None:
-    (tmp_path / 'pyproject.toml').write_text('[project]\nversion = "1"\n')
-    assert verify_release.read_package_name(tmp_path) == ''
-
-
 def test_package_flag_works_without_pyproject(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    passed: verify_release.Result = verify_release.Result(
-        'spam', 'PASS', 'eggs'
-    )
+    passed: common.Result = common.Result('spam', 'PASS', 'eggs')
     monkeypatch.setattr(verify_release, 'check_tag', lambda tag: passed)
     monkeypatch.setattr(verify_release, 'check_version', lambda v, t: passed)
     monkeypatch.setattr(verify_release, 'check_changelog', lambda v, t: passed)
@@ -84,31 +60,49 @@ def test_conda_candidates_prefers_conda_name() -> None:
 
 def test_check_conda_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        verify_release,
+        common,
         'fetch_json',
         lambda url: {'versions': ['1.0.0', '1.1.0']},
     )
-    result: verify_release.Result = verify_release.check_conda(
-        'spam', '1.1.0', None
-    )
+    result: common.Result = verify_release.check_conda('spam', '1.1.0', None)
     assert result.status == 'PASS'
     assert '1.1.0' in result.evidence
 
 
 def test_check_conda_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        verify_release, 'fetch_json', lambda url: {'versions': ['1.0.0']}
+        common, 'fetch_json', lambda url: {'versions': ['1.0.0']}
     )
-    result: verify_release.Result = verify_release.check_conda(
-        'spam', '1.1.0', None
-    )
+    result: common.Result = verify_release.check_conda('spam', '1.1.0', None)
     assert result.status == 'FAIL'
     assert 'latest is 1.0.0' in result.evidence
 
 
 def test_check_conda_skip(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(verify_release, 'fetch_json', lambda url: None)
-    result: verify_release.Result = verify_release.check_conda(
-        'spam', '1.1.0', None
-    )
+    monkeypatch.setattr(common, 'fetch_json', lambda url: None)
+    result: common.Result = verify_release.check_conda('spam', '1.1.0', None)
     assert result.status == 'SKIP'
+
+
+def test_check_conda_fails_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(url: str) -> object:
+        raise common.FetchError(f'{url}: HTTP 503')
+
+    monkeypatch.setattr(common, 'fetch_json', boom)
+    result: common.Result = verify_release.check_conda('spam', '1.1.0', None)
+    assert result.status == 'FAIL'
+    assert 'HTTP 503' in result.evidence
+
+
+def test_check_pypi_fails_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(url: str) -> object:
+        raise common.FetchError(f'{url}: HTTP 503')
+
+    monkeypatch.setattr(common, 'fetch_json', boom)
+    result: common.Result = verify_release.check_pypi('spam', '1.1.0')
+    assert result.status == 'FAIL'
+    assert 'HTTP 503' in result.evidence

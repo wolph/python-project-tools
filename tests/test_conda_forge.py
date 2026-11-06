@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from python_project_tools import conda_forge
+from python_project_tools import common, conda_forge
 
 META: str = """{% set name = "spam-utils" %}
 {% set version = "0.3.1" %}
@@ -207,7 +207,7 @@ def test_prepare_meta_edits_everything_the_bot_misses() -> None:
         'recipe/meta.yaml', META
     )
     text: str
-    results: list[conda_forge.Result]
+    results: list[common.Result]
     text, results = conda_forge.prepare_text(recipe, '0.4.0', SDIST, PYPROJECT)
     assert '{% set version = "0.4.0" %}' in text
     assert f'{{% set sha256 = "{NEW_SHA}" %}}' in text
@@ -233,7 +233,7 @@ def test_prepare_v1_edits_version_sha_and_number() -> None:
         'spam_utils-0.4.0.tar.gz', 'u', NEW_SHA
     )
     text: str
-    results: list[conda_forge.Result]
+    results: list[common.Result]
     text, results = conda_forge.prepare_text(recipe, '0.4.0', sdist, {})
     assert '  version: "0.4.0"\n' in text
     assert f'  sha256: {NEW_SHA}\n' in text
@@ -254,7 +254,7 @@ def test_prepare_is_idempotent_on_a_current_recipe() -> None:
         'spam-utils-0.3.1.tar.gz', 'u', 'a' * 64
     )
     text: str
-    results: list[conda_forge.Result]
+    results: list[common.Result]
     text, results = conda_forge.prepare_text(recipe, '0.3.1', sdist, {})
     assert text == META
     assert all(result.status == 'INFO' for result in results)
@@ -286,7 +286,7 @@ def test_add_backend_reports_an_existing_pin_instead_of_duplicating() -> None:
         'recipe/recipe.yaml', V1
     )
     text: str
-    results: list[conda_forge.Result]
+    results: list[common.Result]
     text, results = conda_forge.add_backend(
         V1, recipe, conda_forge.Requirement('uv-build', '>=0.11,<0.13')
     )
@@ -302,7 +302,7 @@ def test_compare_finds_the_drift_the_bot_cannot_see() -> None:
     mapping: dict[str, dict[str, str]] = {
         'typing-extensions': {'conda_name': 'typing_extensions'}
     }
-    results: list[conda_forge.Result] = conda_forge.compare(
+    results: list[common.Result] = conda_forge.compare(
         PYPROJECT, recipe, mapping
     )
     warnings: dict[str, list[str]] = {}
@@ -331,7 +331,7 @@ def test_compare_run_names_the_extra_a_leftover_came_from() -> None:
     recipe: conda_forge.Recipe = conda_forge.parse_recipe(
         'recipe/meta.yaml', META.replace('numpy >=1.24', 'pywin32  # [win]')
     )
-    results: list[conda_forge.Result] = conda_forge.compare_run(
+    results: list[common.Result] = conda_forge.compare_run(
         PYPROJECT, recipe, {}
     )
     assert any(
@@ -345,14 +345,16 @@ def test_compare_python_flags_a_literal_floor_that_differs() -> None:
         'recipe/meta.yaml',
         META.replace('python >={{ python_min }}', 'python >=3.8'),
     )
-    results: list[conda_forge.Result] = conda_forge.compare_python(
+    results: list[common.Result] = conda_forge.compare_python(
         PYPROJECT, recipe
     )
     assert results == [
-        conda_forge.Result(
-            'WARN',
-            'python',
-            'recipe run has python >=3.8, pyproject requires-python >=3.10',
+        common.Result(
+            status='WARN',
+            name='python',
+            evidence=(
+                'recipe run has python >=3.8, pyproject requires-python >=3.10'
+            ),
         )
     ]
 

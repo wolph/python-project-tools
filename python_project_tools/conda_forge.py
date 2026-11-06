@@ -33,10 +33,8 @@ import re
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
 
+from python_project_tools import common
 from python_project_tools.toml_compat import tomllib
 
 BOT_LOGIN: str = 'regro-cf-autotick-bot'
@@ -59,15 +57,6 @@ BACKENDS: dict[str, str] = {
     'scikit_build_core.build': 'scikit-build-core',
     'mesonpy': 'meson-python',
 }
-
-
-@dataclasses.dataclass
-class Result:
-    """One line of the report."""
-
-    status: str  # PASS, FAIL, WARN, EDIT, INFO or SKIP
-    name: str
-    evidence: str
 
 
 @dataclasses.dataclass
@@ -124,38 +113,6 @@ class TemplateError(ValueError):
 # --- helpers -----------------------------------------------------------------
 
 
-def run(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a command and capture its text output."""
-    return subprocess.run(args, capture_output=True, text=True, check=False)
-
-
-def gh_json(args: list[str]) -> object | None:
-    """Run a gh command that prints JSON, or return None when it fails."""
-    done: subprocess.CompletedProcess[str] = run(['gh', *args])
-    if done.returncode != 0 or not done.stdout.strip():
-        return None
-    try:
-        return json.loads(done.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
-def fetch_json(url: str) -> object | None:
-    """Fetch a JSON document, or return None when the request fails."""
-    request: urllib.request.Request = urllib.request.Request(
-        url,
-        headers={
-            'Cache-Control': 'no-cache',
-            'User-Agent': 'release-conda-forge',
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.load(response)
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        return None
-
-
 def normalise(name: str) -> str:
     """Compare package names the way PyPI does: lower case, one separator."""
     return re.sub(r'[-_.]+', '-', name).lower()
@@ -187,7 +144,7 @@ def parse_requirement(line: str) -> Requirement:
 
 def pypi_sdist(package: str, version: str) -> Sdist | None:
     """The sdist PyPI serves for a version, or None when it is not there."""
-    data: object | None = fetch_json(
+    data: object | None = common.fetch_json(
         f'https://pypi.org/pypi/{package}/{version}/json'
     )
     if not isinstance(data, dict):
@@ -444,10 +401,12 @@ def replace_once(
     return new_text, count > 0 and new_text != text
 
 
-def bump_version(recipe: Recipe, version: str) -> tuple[str, list[Result]]:
+def bump_version(
+    recipe: Recipe, version: str
+) -> tuple[str, list[common.Result]]:
     """Set the version, which also means the build number goes back to 0."""
     text: str = recipe.text
-    results: list[Result] = []
+    results: list[common.Result] = []
     changed: bool
     if recipe.style == 'meta':
         text, changed = replace_once(
@@ -463,23 +422,35 @@ def bump_version(recipe: Recipe, version: str) -> tuple[str, list[Result]]:
         )
     if changed:
         results.append(
-            Result('EDIT', 'version', f'{recipe.version} -> {version}')
+            common.Result(
+                status='EDIT',
+                name='version',
+                evidence=f'{recipe.version} -> {version}',
+            )
         )
         text, reset = replace_once(text, r'^(\s+number:\s*)\d+', r'\g<1>0')
         if reset and recipe.build_number != 0:
             results.append(
-                Result('EDIT', 'build-number', f'{recipe.build_number} -> 0')
+                common.Result(
+                    status='EDIT',
+                    name='build-number',
+                    evidence=f'{recipe.build_number} -> 0',
+                )
             )
     elif recipe.version == version:
         results.append(
-            Result('INFO', 'version', f'recipe already says {version}')
+            common.Result(
+                status='INFO',
+                name='version',
+                evidence=f'recipe already says {version}',
+            )
         )
     else:
         results.append(
-            Result(
-                'WARN',
-                'version',
-                f'could not find the version in {recipe.filename}',
+            common.Result(
+                status='WARN',
+                name='version',
+                evidence=f'could not find the version in {recipe.filename}',
             )
         )
     return text, results
@@ -487,10 +458,16 @@ def bump_version(recipe: Recipe, version: str) -> tuple[str, list[Result]]:
 
 def set_sha256(
     text: str, recipe: Recipe, sdist: Sdist
-) -> tuple[str, list[Result]]:
+) -> tuple[str, list[common.Result]]:
     """Point the checksum at the new sdist."""
     if recipe.sha256 == sdist.sha256:
-        return text, [Result('INFO', 'sha256', 'already matches the sdist')]
+        return text, [
+            common.Result(
+                status='INFO',
+                name='sha256',
+                evidence='already matches the sdist',
+            )
+        ]
     new_text: str
     changed: bool
     new_text, changed = replace_once(
@@ -504,56 +481,71 @@ def set_sha256(
         )
     if not changed:
         return text, [
-            Result(
-                'WARN',
-                'sha256',
-                f'could not find the checksum in {recipe.filename}',
+            common.Result(
+                status='WARN',
+                name='sha256',
+                evidence=f'could not find the checksum in {recipe.filename}',
             )
         ]
     return new_text, [
-        Result(
-            'EDIT', 'sha256', f'{recipe.sha256[:12]} -> {sdist.sha256[:12]}'
+        common.Result(
+            status='EDIT',
+            name='sha256',
+            evidence=f'{recipe.sha256[:12]} -> {sdist.sha256[:12]}',
         )
     ]
 
 
 def fix_url(
     text: str, recipe: Recipe, sdist: Sdist, version: str
-) -> tuple[str, list[Result]]:
+) -> tuple[str, list[common.Result]]:
     """Make the url template render to the filename PyPI actually serves."""
     name: str = recipe.name or sdist.filename.split('-')[0]
     try:
         rendered: str = render(recipe.url, name, version)
     except TemplateError as error:
         return text, [
-            Result(
-                'WARN',
-                'url',
-                f'cannot render {error}: check {recipe.url} by hand',
+            common.Result(
+                status='WARN',
+                name='url',
+                evidence=f'cannot render {error}: check {recipe.url} by hand',
             )
         ]
     if rendered.rsplit('/', 1)[-1] == sdist.filename:
-        return text, [Result('INFO', 'url', f'renders to {sdist.filename}')]
+        return text, [
+            common.Result(
+                status='INFO',
+                name='url',
+                evidence=f'renders to {sdist.filename}',
+            )
+        ]
     new_name: str = filename_template(
         sdist.filename, name, version, recipe.style
     )
     new_url: str = recipe.url.rsplit('/', 1)[0] + '/' + new_name
     new_text: str = text.replace(recipe.url, new_url, 1)
     return new_text, [
-        Result('EDIT', 'url', f'{recipe.url.rsplit("/", 1)[-1]} -> {new_name}')
+        common.Result(
+            status='EDIT',
+            name='url',
+            evidence=f'{recipe.url.rsplit("/", 1)[-1]} -> {new_name}',
+        )
     ]
 
 
 def add_backend(
     text: str, recipe: Recipe, backend: Requirement | None
-) -> tuple[str, list[Result]]:
+) -> tuple[str, list[common.Result]]:
     """Add the build backend to ``host`` when pip would otherwise not find it."""  # noqa: E501
     if backend is None:
         return text, [
-            Result(
-                'WARN',
-                'backend',
-                'unknown build backend in pyproject.toml, check host by hand',
+            common.Result(
+                status='WARN',
+                name='backend',
+                evidence=(
+                    'unknown build backend in pyproject.toml, '
+                    'check host by hand'
+                ),
             )
         ]
     host_names: set[str] = {normalise(item.name) for item in recipe.host}
@@ -566,13 +558,17 @@ def add_backend(
         )
         if current.spec != backend.spec:
             return text, [
-                Result(
-                    'WARN',
-                    'backend',
-                    f'host pins {current.name} {current.spec}, pyproject says {backend.spec}',  # noqa: E501
+                common.Result(
+                    status='WARN',
+                    name='backend',
+                    evidence=f'host pins {current.name} {current.spec}, pyproject says {backend.spec}',  # noqa: E501
                 )
             ]
-        return text, [Result('INFO', 'backend', f'host has {wanted}')]
+        return text, [
+            common.Result(
+                status='INFO', name='backend', evidence=f'host has {wanted}'
+            )
+        ]
     lines: list[str] = text.splitlines(keepends=True)
     requirements: int | None = find_key(
         [line.rstrip('\n') for line in lines], 'requirements'
@@ -588,10 +584,10 @@ def add_backend(
     )
     if host is None:
         return text, [
-            Result(
-                'WARN',
-                'backend',
-                f'no requirements.host section to add {wanted} to',
+            common.Result(
+                status='WARN',
+                name='backend',
+                evidence=f'no requirements.host section to add {wanted} to',
             )
         ]
     host_items: list[int] = [
@@ -601,8 +597,10 @@ def add_backend(
     ]
     if not host_items:
         return text, [
-            Result(
-                'WARN', 'backend', f'empty host section, add {wanted} by hand'
+            common.Result(
+                status='WARN',
+                name='backend',
+                evidence=f'empty host section, add {wanted} by hand',
             )
         ]
     pip_items: list[int] = [
@@ -614,7 +612,9 @@ def add_backend(
     indent: str = ' ' * indent_of(lines[anchor])
     lines.insert(anchor + 1, f'{indent}- {wanted}\n')
     return ''.join(lines), [
-        Result('EDIT', 'backend', f'added {wanted} to host')
+        common.Result(
+            status='EDIT', name='backend', evidence=f'added {wanted} to host'
+        )
     ]
 
 
@@ -631,7 +631,7 @@ def compare_run(
     pyproject: dict[str, object],
     recipe: Recipe,
     mapping: dict[str, dict[str, str]],
-) -> list[Result]:
+) -> list[common.Result]:
     """Run dependencies in pyproject.toml against the recipe's run section."""
     project: dict[str, object] = pyproject.get('project', {})  # ty: ignore[invalid-assignment]
     plain: list[Requirement]
@@ -639,7 +639,7 @@ def compare_run(
     plain, conditional = pep508_requirements(
         list(project.get('dependencies', []))  # ty: ignore[invalid-argument-type]
     )  # type: ignore[arg-type]
-    results: list[Result] = []
+    results: list[common.Result] = []
     recipe_run: dict[str, Requirement] = {
         normalise(item.name): item
         for item in recipe.run
@@ -652,26 +652,26 @@ def compare_run(
         ) or recipe_run.pop(normalise(requirement.name), None)
         if found is None:
             results.append(
-                Result(
-                    'WARN',
-                    'run',
-                    f'pyproject needs {requirement.name} {requirement.spec}, recipe run lacks {conda}',  # noqa: E501
+                common.Result(
+                    status='WARN',
+                    name='run',
+                    evidence=f'pyproject needs {requirement.name} {requirement.spec}, recipe run lacks {conda}',  # noqa: E501
                 )
             )
         elif found.spec != requirement.spec:
             results.append(
-                Result(
-                    'WARN',
-                    'run',
-                    f'{found.name}: recipe pins {found.spec or "nothing"}, pyproject {requirement.spec or "nothing"}',  # noqa: E501
+                common.Result(
+                    status='WARN',
+                    name='run',
+                    evidence=f'{found.name}: recipe pins {found.spec or "nothing"}, pyproject {requirement.spec or "nothing"}',  # noqa: E501
                 )
             )
         else:
             results.append(
-                Result(
-                    'INFO',
-                    'run',
-                    f'{found.name} {found.spec} matches'.rstrip(),
+                common.Result(
+                    status='INFO',
+                    name='run',
+                    evidence=f'{found.name} {found.spec} matches'.rstrip(),
                 )
             )
     extras: dict[str, list[str]] = project.get('optional-dependencies', {})  # ty: ignore[invalid-assignment]
@@ -691,18 +691,20 @@ def compare_run(
             else 'pyproject does not depend on it'
         )
         results.append(
-            Result(
-                'WARN',
-                'run',
-                f'recipe run has {f"{leftover.name} {leftover.spec}".strip()}, {where}',  # noqa: E501
+            common.Result(
+                status='WARN',
+                name='run',
+                evidence=f'recipe run has {f"{leftover.name} {leftover.spec}".strip()}, {where}',  # noqa: E501
             )
         )
     for spec in conditional:
         results.append(  # noqa: PERF401
-            Result(
-                'WARN',
-                'run',
-                f'conditional dependency needs a selector by hand: {spec}',
+            common.Result(
+                status='WARN',
+                name='run',
+                evidence=(
+                    f'conditional dependency needs a selector by hand: {spec}'
+                ),
             )
         )
     return results
@@ -710,7 +712,7 @@ def compare_run(
 
 def compare_python(
     pyproject: dict[str, object], recipe: Recipe
-) -> list[Result]:
+) -> list[common.Result]:
     """The Python floor in pyproject.toml against the recipe's python requirement."""  # noqa: E501
     project: dict[str, object] = pyproject.get('project', {})  # ty: ignore[invalid-assignment]
     floor: str = str(project.get('requires-python', '')).replace(' ', '')
@@ -719,34 +721,40 @@ def compare_python(
     )
     if python is None:
         return [
-            Result('WARN', 'python', 'recipe run has no python requirement')
+            common.Result(
+                status='WARN',
+                name='python',
+                evidence='recipe run has no python requirement',
+            )
         ]
     if 'python_min' in python.spec:
         return [
-            Result(
-                'INFO',
-                'python',
-                f'recipe follows conda-forge python_min, pyproject says {floor or "nothing"}',  # noqa: E501
+            common.Result(
+                status='INFO',
+                name='python',
+                evidence=f'recipe follows conda-forge python_min, pyproject says {floor or "nothing"}',  # noqa: E501
             )
         ]
     if floor and python.spec != floor:
         return [
-            Result(
-                'WARN',
-                'python',
-                f'recipe run has python {python.spec or "without a floor"}, pyproject requires-python {floor}',  # noqa: E501
+            common.Result(
+                status='WARN',
+                name='python',
+                evidence=f'recipe run has python {python.spec or "without a floor"}, pyproject requires-python {floor}',  # noqa: E501
             )
         ]
     return [
-        Result(
-            'INFO', 'python', f'python {python.spec} matches requires-python'
+        common.Result(
+            status='INFO',
+            name='python',
+            evidence=f'python {python.spec} matches requires-python',
         )
     ]
 
 
 def compare_entry_points(
     pyproject: dict[str, object], recipe: Recipe
-) -> list[Result]:
+) -> list[common.Result]:
     """Console scripts in pyproject.toml against the recipe's entry points."""
     wanted: set[str] = {
         entry.replace(' ', '') for entry in pyproject_scripts(pyproject)
@@ -754,31 +762,37 @@ def compare_entry_points(
     present: set[str] = {
         entry.replace(' ', '') for entry in recipe.entry_points
     }
-    results: list[Result] = []
+    results: list[common.Result] = []
     for entry in sorted(wanted - present):
         results.append(  # noqa: PERF401
-            Result(
-                'WARN',
-                'entry-points',
-                f'pyproject defines {entry}, recipe does not list it',
+            common.Result(
+                status='WARN',
+                name='entry-points',
+                evidence=f'pyproject defines {entry}, recipe does not list it',
             )
         )
     for entry in sorted(present - wanted):
         results.append(  # noqa: PERF401
-            Result(
-                'WARN',
-                'entry-points',
-                f'recipe lists {entry}, pyproject has no such script',
+            common.Result(
+                status='WARN',
+                name='entry-points',
+                evidence=f'recipe lists {entry}, pyproject has no such script',
             )
         )
     if wanted and not results:
         results.append(
-            Result('INFO', 'entry-points', f'{len(wanted)} entry points match')
+            common.Result(
+                status='INFO',
+                name='entry-points',
+                evidence=f'{len(wanted)} entry points match',
+            )
         )
     return results
 
 
-def compare_host(recipe: Recipe, backend: Requirement | None) -> list[Result]:
+def compare_host(
+    recipe: Recipe, backend: Requirement | None
+) -> list[common.Result]:
     """Leftovers in host that a backend switch tends to leave behind."""
     if backend is None or normalise(backend.name) == 'setuptools':
         return []
@@ -789,10 +803,12 @@ def compare_host(recipe: Recipe, backend: Requirement | None) -> list[Result]:
         in {'setuptools', 'wheel', 'setuptools-scm', 'pytest-runner'}
     ]
     return [
-        Result(
-            'WARN',
-            'host',
-            f'host still lists {name} while the backend is {backend.name}',
+        common.Result(
+            status='WARN',
+            name='host',
+            evidence=(
+                f'host still lists {name} while the backend is {backend.name}'
+            ),
         )
         for name in stale
     ]
@@ -802,7 +818,7 @@ def compare(
     pyproject: dict[str, object],
     recipe: Recipe,
     mapping: dict[str, dict[str, str]],
-) -> list[Result]:
+) -> list[common.Result]:
     """Every difference between pyproject.toml and the recipe worth a look."""
     backend: Requirement | None = backend_requirement(pyproject)
     return [
@@ -818,7 +834,7 @@ def compare(
 
 def load_mapping() -> dict[str, dict[str, str]]:
     """The regro PyPI to conda-forge name mapping, keyed by normalised PyPI name."""  # noqa: E501
-    data: object | None = fetch_json(MAPPING_URL)
+    data: object | None = common.fetch_json(MAPPING_URL)
     if not isinstance(data, dict):
         return {}
     return {normalise(key): value for key, value in data.items()}
@@ -840,14 +856,17 @@ def find_feedstock(
             continue
         seen.add(candidate)
         repo: str = f'conda-forge/{candidate}-feedstock'
-        if gh_json(['api', f'repos/{repo}', '--jq', '{name}']) is not None:
+        if (
+            common.gh_json(['api', f'repos/{repo}', '--jq', '{name}'])
+            is not None
+        ):
             return repo
     return None
 
 
 def repo_file(repo: str, path: str) -> str | None:
     """The text of a file on the feedstock's default branch."""
-    done: subprocess.CompletedProcess[str] = run(
+    done: subprocess.CompletedProcess[str] = common.run(
         [
             'gh',
             'api',
@@ -870,7 +889,7 @@ def fetch_recipe(repo: str) -> Recipe | None:
 
 def can_push(repo: str) -> bool:
     """Whether the gh user may push to (and so merge on) the feedstock."""
-    data: object | None = gh_json(
+    data: object | None = common.gh_json(
         ['api', f'repos/{repo}', '--jq', '.permissions']
     )
     return isinstance(data, dict) and bool(data.get('push'))
@@ -890,7 +909,7 @@ def automerge_enabled(repo: str) -> bool:
 
 def bot_prs(repo: str) -> tuple[list[BotPR], list[str]]:
     """Open bot version PRs, and the titles of its other open PRs (migrations)."""  # noqa: E501
-    data: object | None = gh_json(
+    data: object | None = common.gh_json(
         [
             'pr',
             'list',
@@ -928,7 +947,7 @@ def bot_prs(repo: str) -> tuple[list[BotPR], list[str]]:
 
 def pr_checks(repo: str, number: int) -> str:
     """Counts per outcome of a PR's checks, e.g. ``3 fail, 2 pass, 1 pending``."""  # noqa: E501
-    data: object | None = gh_json(
+    data: object | None = common.gh_json(
         ['pr', 'checks', str(number), '-R', repo, '--json', 'bucket,name']
     )
     if not isinstance(data, list):
@@ -949,7 +968,7 @@ def pr_checks(repo: str, number: int) -> str:
 
 def conda_versions(conda_name: str) -> list[str] | None:
     """Versions anaconda.org lists for the conda-forge package, or None when unknown."""  # noqa: E501
-    data: object | None = fetch_json(
+    data: object | None = common.fetch_json(
         f'https://api.anaconda.org/package/conda-forge/{conda_name}'
     )
     if not isinstance(data, dict):
@@ -965,14 +984,14 @@ def read_pyproject(path: pathlib.Path) -> dict[str, object]:
     return tomllib.loads(path.read_text()) if path.exists() else {}
 
 
-def report(results: list[Result]) -> None:
+def report(results: list[common.Result]) -> None:
     """Print the table, one line per result."""
     width: int = max((len(result.name) for result in results), default=4)
     for result in results:
         print(f'{result.status:4} {result.name:{width}}  {result.evidence}')  # noqa: T201
 
 
-def exit_status(results: list[Result]) -> int:
+def exit_status(results: list[common.Result]) -> int:
     """1 when something failed, 2 when the whole thing was skipped, else 0."""
     statuses: set[str] = {result.status for result in results}
     if 'FAIL' in statuses:
@@ -991,77 +1010,128 @@ def stale_prs(prs: list[BotPR], recipe_version: str) -> list[BotPR]:
     ]
 
 
+def sdist_result(package: str, version: str) -> common.Result:
+    """Does PyPI serve an sdist for the version."""
+    try:
+        sdist: Sdist | None = pypi_sdist(package, version)
+    except common.FetchError as err:
+        return common.Result(status='FAIL', name='sdist', evidence=str(err))
+    if sdist is None:
+        return common.Result(
+            status='FAIL',
+            name='sdist',
+            evidence=f'PyPI has no sdist for {package} {version} yet',
+        )
+    return common.Result(status='PASS', name='sdist', evidence=sdist.filename)
+
+
+def conda_forge_result(conda_name: str, version: str) -> common.Result:
+    """Does anaconda.org list the version of the conda-forge package."""
+    try:
+        listed: list[str] | None = conda_versions(conda_name)
+    except common.FetchError as err:
+        return common.Result(
+            status='FAIL', name='conda-forge', evidence=str(err)
+        )
+    if listed is None:
+        return common.Result(
+            status='WARN',
+            name='conda-forge',
+            evidence=(f'anaconda.org has no package conda-forge/{conda_name}'),
+        )
+    if version in listed:
+        return common.Result(
+            status='PASS',
+            name='conda-forge',
+            evidence=(
+                f'https://anaconda.org/conda-forge/{conda_name} '
+                f'lists {version}'
+            ),
+        )
+    latest: str = listed[-1] if listed else 'nothing'
+    return common.Result(
+        status='WARN',
+        name='conda-forge',
+        evidence=(
+            f'anaconda.org latest is {latest}, {version} not uploaded yet'
+        ),
+    )
+
+
 def status_feedstock(
     repo: str,
     version: str,
     package: str,
     pyproject: dict[str, object],
     mapping: dict[str, dict[str, str]],
-) -> list[Result]:
+) -> list[common.Result]:
     """Everything the skill needs to decide what to do on the feedstock."""
-    results: list[Result] = [
-        Result('PASS', 'feedstock', f'https://github.com/{repo}')
+    results: list[common.Result] = [
+        common.Result(
+            status='PASS',
+            name='feedstock',
+            evidence=f'https://github.com/{repo}',
+        )
     ]
     recipe: Recipe | None = fetch_recipe(repo)
     if recipe is None:
         return [
             *results,
-            Result(
-                'FAIL',
-                'recipe',
-                'no recipe/meta.yaml or recipe/recipe.yaml on the default branch',  # noqa: E501
+            common.Result(
+                status='FAIL',
+                name='recipe',
+                evidence='no recipe/meta.yaml or recipe/recipe.yaml on the default branch',  # noqa: E501
             ),
         ]
     results.append(
-        Result(
-            'INFO',
-            'recipe',
-            f'{recipe.filename} at {recipe.version}, build {recipe.build_number}',  # noqa: E501
+        common.Result(
+            status='INFO',
+            name='recipe',
+            evidence=f'{recipe.filename} at {recipe.version}, build {recipe.build_number}',  # noqa: E501
         )
     )
     results.append(
-        Result(
-            'INFO',
-            'maintainers',
-            ', '.join(recipe.maintainers) or 'none listed',
+        common.Result(
+            status='INFO',
+            name='maintainers',
+            evidence=', '.join(recipe.maintainers) or 'none listed',
         )
     )
     pushable: bool = can_push(repo)
     results.append(
-        Result(
-            'PASS' if pushable else 'WARN',
-            'maintainer',
-            'you can push and merge'
+        common.Result(
+            status='PASS' if pushable else 'WARN',
+            name='maintainer',
+            evidence='you can push and merge'
             if pushable
             else 'you cannot push: only a maintainer or the automerge bot can merge',  # noqa: E501
         )
     )
     automerge: bool = automerge_enabled(repo)
     results.append(
-        Result(
-            'INFO',
-            'automerge',
-            'on: a green bot PR merges itself'
+        common.Result(
+            status='INFO',
+            name='automerge',
+            evidence='on: a green bot PR merges itself'
             if automerge
             else 'off: someone has to merge',
         )
     )
-    sdist: Sdist | None = pypi_sdist(package, version)
-    results.append(
-        Result('PASS', 'sdist', sdist.filename)
-        if sdist
-        else Result(
-            'FAIL', 'sdist', f'PyPI has no sdist for {package} {version} yet'
-        )
-    )
+    results.append(sdist_result(package, version))
     if version_key(recipe.version) >= version_key(version):
         results.append(
-            Result('PASS', 'bump', f'main already carries {recipe.version}')
+            common.Result(
+                status='PASS',
+                name='bump',
+                evidence=f'main already carries {recipe.version}',
+            )
         )
     else:
         results.append(
-            Result(
-                'WARN', 'bump', f'main is at {recipe.version}, needs {version}'
+            common.Result(
+                status='WARN',
+                name='bump',
+                evidence=f'main is at {recipe.version}, needs {version}',
             )
         )
     versions: list[BotPR]
@@ -1070,86 +1140,79 @@ def status_feedstock(
     mine: list[BotPR] = [pr for pr in versions if pr.version == version]
     for pr in mine:
         results.append(  # noqa: PERF401
-            Result(
-                'INFO',
-                'bot-pr',
-                f'#{pr.number} {pr.title} ({pr.created}): {pr_checks(repo, pr.number)}, {pr.url}',  # noqa: E501
+            common.Result(
+                status='INFO',
+                name='bot-pr',
+                evidence=f'#{pr.number} {pr.title} ({pr.created}): {pr_checks(repo, pr.number)}, {pr.url}',  # noqa: E501
             )
         )
     if not mine:
         results.append(
-            Result('INFO', 'bot-pr', f'no open bot PR for {version} yet')
+            common.Result(
+                status='INFO',
+                name='bot-pr',
+                evidence=f'no open bot PR for {version} yet',
+            )
         )
     for pr in stale_prs(
         [pr for pr in versions if pr.version != version], recipe.version
     ):
         results.append(  # noqa: PERF401
-            Result(
-                'WARN',
-                'stale-pr',
-                f'#{pr.number} {pr.title} is behind main ({recipe.version}), and more than three open bot PRs stop the bot',  # noqa: E501
+            common.Result(
+                status='WARN',
+                name='stale-pr',
+                evidence=f'#{pr.number} {pr.title} is behind main ({recipe.version}), and more than three open bot PRs stop the bot',  # noqa: E501
             )
         )
     for title in others:
-        results.append(Result('INFO', 'other-pr', title))  # noqa: PERF401
+        results.append(  # noqa: PERF401
+            common.Result(status='INFO', name='other-pr', evidence=title)
+        )
     if pyproject:
         results.extend(compare(pyproject, recipe, mapping))
     else:
         results.append(
-            Result(
-                'SKIP',
-                'compare',
-                'no pyproject.toml here, dependency comparison skipped',
+            common.Result(
+                status='SKIP',
+                name='compare',
+                evidence=(
+                    'no pyproject.toml here, dependency comparison skipped'
+                ),
             )
         )
     conda_name: str = repo.split('/')[1].removesuffix('-feedstock')
-    listed: list[str] | None = conda_versions(conda_name)
-    if listed is None:
-        results.append(
-            Result(
-                'WARN',
-                'conda-forge',
-                f'anaconda.org has no package conda-forge/{conda_name}',
-            )
-        )
-    elif version in listed:
-        results.append(
-            Result(
-                'PASS',
-                'conda-forge',
-                f'https://anaconda.org/conda-forge/{conda_name} lists {version}',  # noqa: E501
-            )
-        )
-    else:
-        results.append(
-            Result(
-                'WARN',
-                'conda-forge',
-                f'anaconda.org latest is {listed[-1] if listed else "nothing"}, {version} not uploaded yet',  # noqa: E501
-            )
-        )
+    results.append(conda_forge_result(conda_name, version))
     return results
 
 
 def command_status(args: argparse.Namespace) -> int:
     """Read-only overview of the feedstock for one version."""
     pyproject: dict[str, object] = read_pyproject(pathlib.Path(args.pyproject))
-    package: str = args.package or str(
-        pyproject.get('project', {}).get('name', '')  # ty: ignore[unresolved-attribute]
-    )  # type: ignore[union-attr]
+    package: str = args.package or common.read_package_name(
+        pathlib.Path(args.pyproject).parent
+    )
     if not package:
         print(  # noqa: T201
             'no package name: pass --package or run inside a checkout',
             file=sys.stderr,
         )
         return 2
-    mapping: dict[str, dict[str, str]] = load_mapping()
+    mapping: dict[str, dict[str, str]]
+    try:
+        mapping = load_mapping()
+    except common.FetchError as err:
+        report(
+            [common.Result(status='FAIL', name='mapping', evidence=str(err))]
+        )
+        return 1
     repo: str | None = args.feedstock or find_feedstock(package, mapping)
-    results: list[Result]
+    results: list[common.Result]
     if repo is None:
         results = [
-            Result(
-                'SKIP', 'feedstock', f'no conda-forge feedstock for {package}'
+            common.Result(
+                status='SKIP',
+                name='feedstock',
+                evidence=f'no conda-forge feedstock for {package}',
             )
         ]
     else:
@@ -1168,12 +1231,12 @@ def command_status(args: argparse.Namespace) -> int:
 
 def prepare_text(
     recipe: Recipe, version: str, sdist: Sdist, pyproject: dict[str, object]
-) -> tuple[str, list[Result]]:
+) -> tuple[str, list[common.Result]]:
     """Apply every deterministic edit to the recipe text."""
     text: str
-    results: list[Result]
+    results: list[common.Result]
     text, results = bump_version(recipe, version)
-    more: list[Result]
+    more: list[common.Result]
     text, more = set_sha256(text, recipe, sdist)
     results.extend(more)
     text, more = fix_url(text, recipe, sdist, version)
@@ -1187,9 +1250,9 @@ def prepare_text(
 def command_prepare(args: argparse.Namespace) -> int:
     """Edit the recipe in a feedstock checkout for the new version."""
     pyproject: dict[str, object] = read_pyproject(pathlib.Path(args.pyproject))
-    package: str = args.package or str(
-        pyproject.get('project', {}).get('name', '')  # ty: ignore[unresolved-attribute]
-    )  # type: ignore[union-attr]
+    package: str = args.package or common.read_package_name(
+        pathlib.Path(args.pyproject).parent
+    )
     recipe_dir: pathlib.Path = pathlib.Path(args.dir) / 'recipe'
     paths: list[pathlib.Path] = [
         path
@@ -1203,42 +1266,67 @@ def command_prepare(args: argparse.Namespace) -> int:
         )
         return 2
     recipe: Recipe = parse_recipe(str(paths[0]), paths[0].read_text())
-    sdist: Sdist | None = pypi_sdist(package, args.version)
+    sdist: Sdist | None
+    try:
+        sdist = pypi_sdist(package, args.version)
+    except common.FetchError as err:
+        report([common.Result(status='FAIL', name='sdist', evidence=str(err))])
+        return 1
     if sdist is None:
         report(
             [
-                Result(
-                    'FAIL',
-                    'sdist',
-                    f'PyPI has no sdist for {package} {args.version} yet',
+                common.Result(
+                    status='FAIL',
+                    name='sdist',
+                    evidence=(
+                        f'PyPI has no sdist for {package} {args.version} yet'
+                    ),
                 )
             ]
         )
         return 1
     text: str
-    results: list[Result]
+    results: list[common.Result]
     text, results = prepare_text(recipe, args.version, sdist, pyproject)
     if pyproject:
-        results.extend(compare(pyproject, recipe, load_mapping()))
+        try:
+            mapping: dict[str, dict[str, str]] = load_mapping()
+        except common.FetchError as err:
+            results.append(
+                common.Result(status='FAIL', name='mapping', evidence=str(err))
+            )
+        else:
+            results.extend(compare(pyproject, recipe, mapping))
     if not args.dry_run and text != recipe.text:
         paths[0].write_text(text)
-        results.append(Result('PASS', 'written', str(paths[0])))
+        results.append(
+            common.Result(
+                status='PASS', name='written', evidence=str(paths[0])
+            )
+        )
     report(results)
     return exit_status(results)
 
 
 def command_verify(args: argparse.Namespace) -> int:
     """Poll anaconda.org until the version is on conda-forge."""
-    pyproject: dict[str, object] = read_pyproject(pathlib.Path(args.pyproject))
-    package: str = args.package or str(
-        pyproject.get('project', {}).get('name', '')  # ty: ignore[unresolved-attribute]
-    )  # type: ignore[union-attr]
-    conda_name: str = args.conda_name or conda_name_for(
-        package, load_mapping()
+    package: str = args.package or common.read_package_name(
+        pathlib.Path(args.pyproject).parent
     )
-    probe: Callable[[], Result] = lambda: verify_once(conda_name, args.version)  # noqa: E731
+    conda_name: str
+    try:
+        conda_name = args.conda_name or conda_name_for(package, load_mapping())
+    except common.FetchError as err:
+        report(
+            [common.Result(status='FAIL', name='mapping', evidence=str(err))]
+        )
+        return 1
+
+    def probe() -> common.Result:
+        return verify_once(conda_name, args.version)
+
     deadline: float = time.monotonic() + args.wait
-    result: Result = probe()
+    result: common.Result = probe()
     while result.status == 'FAIL' and time.monotonic() < deadline:
         time.sleep(30)
         result = probe()
@@ -1246,25 +1334,33 @@ def command_verify(args: argparse.Namespace) -> int:
     return exit_status([result])
 
 
-def verify_once(conda_name: str, version: str) -> Result:
+def verify_once(conda_name: str, version: str) -> common.Result:
     """One look at anaconda.org."""
-    listed: list[str] | None = conda_versions(conda_name)
+    try:
+        listed: list[str] | None = conda_versions(conda_name)
+    except common.FetchError as err:
+        return common.Result(
+            status='FAIL', name='conda-forge', evidence=str(err)
+        )
     if listed is None:
-        return Result(
-            'SKIP',
-            'conda-forge',
-            f'anaconda.org has no package conda-forge/{conda_name}',
+        return common.Result(
+            status='SKIP',
+            name='conda-forge',
+            evidence=(f'anaconda.org has no package conda-forge/{conda_name}'),
         )
     if version in listed:
-        return Result(
-            'PASS',
-            'conda-forge',
-            f'https://anaconda.org/conda-forge/{conda_name} lists {version}',
+        return common.Result(
+            status='PASS',
+            name='conda-forge',
+            evidence=(
+                f'https://anaconda.org/conda-forge/{conda_name} '
+                f'lists {version}'
+            ),
         )
-    return Result(
-        'FAIL',
-        'conda-forge',
-        f'conda-forge/{conda_name} latest is {listed[-1] if listed else "nothing"}, no {version}',  # noqa: E501
+    return common.Result(
+        status='FAIL',
+        name='conda-forge',
+        evidence=f'conda-forge/{conda_name} latest is {listed[-1] if listed else "nothing"}, no {version}',  # noqa: E501
     )
 
 

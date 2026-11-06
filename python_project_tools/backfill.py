@@ -4,9 +4,12 @@ The command walks the PyPI versions of a package oldest first and makes sure
 each one has a tag, a release and signed files. Missing tags come from
 ``match-tag``, missing files from ``rebuild``, signatures from ``sign``.
 Versions whose commit cannot be found share one release on a root-commit
-tag. The release marked latest on GitHub never changes. A repository with
-no latest release gets the highest stable version the run created marked
-latest at the end, and a run where GitHub marks one by itself stops. The
+tag. The release marked latest on GitHub never changes. GitHub marks the
+first stable release of an empty repository as latest whatever
+``--latest=false`` says, so a repository with no latest release releases its
+highest stable version first, and a run stops when the latest release is
+anything else after the first release it created. The target is marked
+latest at the end when GitHub does not report it already. The
 Sigstore bundles of every release are made in one sigstore invocation per
 100 files after the loop. Call the other modules through their attributes
 (``github.create_release``, ``sign.sign_release``) so tests can replace
@@ -59,6 +62,14 @@ RELEASE_WORKFLOW_NOTE: str = 'release would fire {names} at the tagged commit'
 LATEST_MARKED: str = (
     'GitHub marked {tag} as Latest despite --latest=false, stopping'
 )
+LATEST_NOT_TARGET: str = (
+    'after creating {created} GitHub reports Latest {actual}, '
+    'expected {expected}, stopping'
+)
+TARGET_NOT_RELEASED: str = (
+    'target {version} could not be released first, nothing else created'
+)
+NO_TARGET_REASON: str = 'no tag matched and no release was made'
 # Files per sigstore invocation. Each invocation is one browser login.
 SIGSTORE_CHUNK: int = 100
 SUMS_DIR: str = 'sums'
@@ -135,17 +146,25 @@ class BackfillReport:
     latest_before: str | None
     latest_after: str | None
     # The release that must be Latest afterwards: latest_before when there
-    # was one, else the highest stable version this run created, if any.
+    # was one, else the highest stable version with files, if any.
     latest_target: str | None = None
     # Why the run stopped early, empty when it ran to the end.
     stopped: str = ''
 
 
-class LatestMarkedError(RuntimeError):
-    """GitHub marked a release as Latest that this run never asked for.
+class RunStoppedError(RuntimeError):
+    """The run must not go on creating releases.
 
     Raised past the per-version error handling so the run stops.
     """
+
+
+class LatestMarkedError(RunStoppedError):
+    """GitHub's Latest is not the release this run wanted it to be."""
+
+
+class TargetNotReleasedError(RunStoppedError):
+    """The Latest target failed before its release existed."""
 
 
 Row = tuple[Plan, sign.SignOutcome | None, str]
@@ -175,8 +194,9 @@ class _Run:
     latest_before: str | None = None
     untagged: list[Plan] = dataclasses.field(default_factory=list)
     rows: list[Row] = dataclasses.field(default_factory=list)
-    # Plans with their own tag whose release this run created.
-    created: list[Plan] = dataclasses.field(default_factory=list)
+    # The plan that must become Latest, chosen before the loop when the
+    # repository has no Latest release.
+    target: Plan | None = None
     created_any: bool = False
     pending: list[_Pending] = dataclasses.field(default_factory=list)
     disabled_workflows: set[str] | None = None
@@ -454,20 +474,30 @@ def _plan_tag(run: _Run, plan: Plan) -> str | None:
     return None
 
 
-def _check_no_latest(run: _Run, tag: str) -> None:
-    """Stop when GitHub made the first created release Latest anyway.
+def _check_latest_is_target(run: _Run, tag: str) -> None:
+    """Stop unless Latest is the target after the first created release.
 
-    A Latest that cannot be read counts as moved: the run cannot show that
-    it did not.
+    The target is released first, so Latest must be its tag then. A run
+    without a target expects no Latest at all. A Latest that cannot be read
+    counts as wrong: the run cannot show that it is right.
     """
+    expected: str | None = None if run.target is None else run.target.tag
     try:
         latest: github.Release | None = github.latest_release(run.options.repo)
     except (RuntimeError, common.FetchError) as error:
         raise LatestMarkedError(
             f'could not read Latest after creating {tag}: {error}, stopping'
         ) from error
-    if latest is not None:
-        raise LatestMarkedError(LATEST_MARKED.format(tag=latest.tag))
+    actual: str | None = None if latest is None else latest.tag
+    if actual == expected:
+        return
+    if expected is None:
+        raise LatestMarkedError(LATEST_MARKED.format(tag=actual))
+    raise LatestMarkedError(
+        LATEST_NOT_TARGET.format(
+            created=tag, actual=actual or 'none', expected=expected
+        )
+    )
 
 
 def _create_release(
@@ -476,7 +506,8 @@ def _create_release(
     """Create a release, checking Latest after the first one of a run.
 
     Only a repository without a Latest release before the run is checked:
-    that is where GitHub may promote a release despite --latest=false.
+    that is where GitHub promotes the first stable release despite
+    --latest=false, so it must be the target.
     """
     created: github.Release = github.create_release(
         run.options.repo, tag, title, notes, prerelease
@@ -485,7 +516,7 @@ def _create_release(
     first: bool = not run.created_any
     run.created_any = True
     if first and run.latest_before is None:
-        _check_no_latest(run, tag)
+        _check_latest_is_target(run, tag)
     return created
 
 
@@ -551,7 +582,6 @@ def _ensure_release(run: _Run, plan: Plan) -> tuple[github.Release, str]:
     created: github.Release = _create_release(
         run, plan.tag, plan.tag, notes_for(plan, section), plan.prerelease
     )
-    run.created.append(plan)
     return created, note
 
 
@@ -657,7 +687,7 @@ def _release_and_sign(
         )
     except rebuild.RebuildError as error:
         return None, f'rebuild failed: {error}'
-    except LatestMarkedError:
+    except RunStoppedError:
         raise
     except STEP_ERRORS as error:
         return None, f'release failed: {error}'
@@ -842,7 +872,7 @@ def _handle_untagged(run: _Run, group: Plan) -> Row:
         outcome: sign.SignOutcome = sign.sign_release(
             release, files, run.workdir, options
         )
-    except LatestMarkedError:
+    except RunStoppedError:
         raise
     except STEP_ERRORS as error:
         return group, None, f'untagged release failed: {error}'
@@ -870,22 +900,46 @@ def _add_row(run: _Run, row: Row) -> None:
     _say(_progress(*row))
 
 
-def _stopping(run: _Run, plan: Plan, error: LatestMarkedError) -> None:
+def _stopping(run: _Run, plan: Plan, error: RunStoppedError) -> None:
     """Record the plan that stopped the run, before the error moves on."""
     _add_row(run, (plan, None, str(error)))
+
+
+def _target_released(run: _Run, plan: Plan) -> bool:
+    return plan.tag is not None and plan.tag in run.releases
+
+
+def _stop_unreleased_target(
+    run: _Run, plan: Plan, note: str, rest: list[Plan]
+) -> None:
+    """Record the failed target and skip every other plan, then stop.
+
+    Anything created now could become Latest in the target's place.
+    """
+    reason: str = TARGET_NOT_RELEASED.format(version=plan.version)
+    _add_row(run, (plan, None, note or NO_TARGET_REASON))
+    for other in rest:
+        _add_row(run, (other, None, reason))
+    raise TargetNotReleasedError(reason)
 
 
 def _loop(run: _Run, plans: list[Plan]) -> None:
     """Process every plan into ``run.rows``, then the untagged group.
 
-    A LatestMarkedError stops the loop with the rows so far kept.
+    A RunStoppedError stops the loop with the rows so far kept.
     """
-    for plan in plans:
+    for index, plan in enumerate(plans):
         try:
             outcome, note = _process_plan(run, plan)
-        except LatestMarkedError as error:
+        except RunStoppedError as error:
             _stopping(run, plan, error)
             raise
+        if (
+            plan is run.target
+            and not run.options.dry_run
+            and not _target_released(run, plan)
+        ):
+            _stop_unreleased_target(run, plan, note, plans[index + 1 :])
         if plan.tag_action == 'untagged' and plan.files_source == 'pypi':
             run.untagged.append(plan)
             continue
@@ -894,7 +948,7 @@ def _loop(run: _Run, plans: list[Plan]) -> None:
         group: Plan = _untagged_group(run)
         try:
             row: Row = _handle_untagged(run, group)
-        except LatestMarkedError as error:
+        except RunStoppedError as error:
             _stopping(run, group, error)
             raise
         _add_row(run, row)
@@ -1021,24 +1075,66 @@ def _is_stable(plan: Plan) -> bool:
     return not plan.prerelease and not plan.yanked
 
 
-def _set_target(run: _Run) -> str | None:
-    """Mark the highest stable version this run created as Latest.
+def _pick_target(plans: list[Plan]) -> Plan | None:
+    """The highest stable plan that has files and its own tag.
 
-    Only for a repository that had no Latest release before the run. The
-    untagged anchor never counts. Returns the tag that must be Latest now,
-    or None when the run created no stable release.
+    A plan without a tag and without files can only join the untagged
+    anchor, which never becomes the target.
     """
-    stable: list[Plan] = [plan for plan in run.created if _is_stable(plan)]
-    if not stable:
+    candidates: list[Plan] = [
+        plan
+        for plan in plans
+        if _is_stable(plan)
+        and plan.files_source != 'none'
+        and plan.tag_action != 'untagged'
+    ]
+    if not candidates:
         return None
-    best: Plan = max(stable, key=lambda plan: versions.sort_key(plan.version))
-    assert best.tag is not None
+    return max(candidates, key=lambda plan: versions.sort_key(plan.version))
+
+
+def _order_plans(run: _Run, plans: list[Plan]) -> list[Plan]:
+    """Choose the target and put it first when there is no Latest yet.
+
+    GitHub marks the first stable release of an empty repository Latest, so
+    that release must be the target. The rest keep the oldest first order.
+    A repository with a Latest release keeps its order and its Latest.
+    """
+    if run.latest_before is not None:
+        return plans
+    run.target = _pick_target(plans)
+    if run.target is None:
+        return plans
+    return [run.target, *(plan for plan in plans if plan is not run.target)]
+
+
+def _announce(run: _Run, plans: list[Plan]) -> None:
+    """Print the target and the processing order of a dry run."""
+    if run.target is not None:
+        tag: str = run.target.tag or versions.tag_for(run.target.version)
+        _say(f'target: {tag}')
+    elif run.latest_before is not None:
+        _say(f'target: {run.latest_before} (the existing Latest)')
+    else:
+        _say('target: none')
+    _say('order: ' + ', '.join(plan.version for plan in plans))
+
+
+def _mark_target(run: _Run) -> str | None:
+    """Mark the target Latest unless GitHub already reports it.
+
+    Returns the tag that must be Latest now, or None without a target.
+    """
+    if run.target is None or run.target.tag is None:
+        return None
+    tag: str = run.target.tag
     try:
-        github.mark_latest(run.options.repo, best.tag)
+        if _latest_tag(run.options.repo) != tag:
+            github.mark_latest(run.options.repo, tag)
     except (RuntimeError, common.FetchError) as error:
         # The report then shows Latest differing from the target.
-        _fail(f'could not mark {best.tag} as Latest: {error}')
-    return best.tag
+        _fail(f'could not mark {tag} as Latest: {error}')
+    return tag
 
 
 def _execute(run: _Run, plans: list[Plan]) -> tuple[str, str | None]:
@@ -1046,14 +1142,17 @@ def _execute(run: _Run, plans: list[Plan]) -> tuple[str, str | None]:
 
     Returns why the run stopped (empty when it did not) and the target.
     """
+    ordered: list[Plan] = _order_plans(run, plans)
+    if run.options.dry_run:
+        _announce(run, ordered)
     try:
-        _loop(run, plans)
+        _loop(run, ordered)
         _sign_pending(run)
-    except LatestMarkedError as error:
+    except RunStoppedError as error:
         return str(error), run.latest_before
     if run.latest_before is not None or run.options.dry_run:
         return '', run.latest_before
-    return '', _set_target(run)
+    return '', _mark_target(run)
 
 
 def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:

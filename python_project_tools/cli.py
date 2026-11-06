@@ -4,10 +4,16 @@ import argparse
 import sys
 from collections.abc import Callable
 
-from python_project_tools import __version__, check_compat, verify_release
+from python_project_tools import (
+    __version__,
+    check_compat,
+    conda_forge,
+    verify_release,
+)
 
 COMMANDS: dict[str, Callable[[list[str]], int]] = {
     'check-compat': check_compat.main,
+    'conda-forge': conda_forge.main,
     'verify-release': verify_release.main,
 }
 

@@ -28,6 +28,8 @@ urlopen = urllib.request.urlopen
 USER_AGENT: str = 'python-project-tools'
 FETCH_TIMEOUT: int = 60
 CHUNK_SIZE: int = 1 << 20
+# Seconds a timed out child gets to exit after SIGTERM before SIGKILL.
+STOP_GRACE_SECONDS: float = 10
 
 
 def parse_iso_datetime(value: str) -> dt.datetime:
@@ -64,15 +66,21 @@ def run(
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
     capture: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command and capture its output as text.
 
     ``env`` is merged over ``os.environ``. With ``capture=False`` the
     command talks to the terminal directly and stdout and stderr are None.
+    With ``timeout`` a command still running after that many seconds is
+    stopped (see ``_run_with_timeout``) and subprocess.TimeoutExpired is
+    raised.
     """
     merged: dict[str, str] | None = (
         None if env is None else {**os.environ, **env}
     )
+    if timeout is not None:
+        return _run_with_timeout(args, check, cwd, merged, capture, timeout)
     return subprocess.run(
         args,
         capture_output=capture,
@@ -81,6 +89,52 @@ def run(
         cwd=cwd,
         env=merged,
     )
+
+
+def _stop(process: subprocess.Popen[str]) -> None:
+    """Terminate a child, then kill it when it outlives the grace period.
+
+    SIGTERM comes first because a wrapper such as uvx forwards it to the
+    program it started, while SIGKILL stops only the wrapper and leaves
+    that program running.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _run_with_timeout(
+    args: list[str],
+    check: bool,
+    cwd: pathlib.Path | None,
+    env: dict[str, str] | None,
+    capture: bool,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    """``run`` with a deadline: the child is stopped before the raise."""
+    pipe: int | None = subprocess.PIPE if capture else None
+    stdout: str | None
+    stderr: str | None
+    with subprocess.Popen(
+        args, stdout=pipe, stderr=pipe, text=True, cwd=cwd, env=env
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _stop(process)
+            raise
+        except BaseException:
+            process.kill()
+            raise
+    done: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(
+        args, process.returncode, stdout, stderr
+    )
+    if check:
+        done.check_returncode()
+    return done
 
 
 def run_bytes(args: list[str], cwd: pathlib.Path | None = None) -> bytes:

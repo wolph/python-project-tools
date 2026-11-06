@@ -29,6 +29,7 @@ class Recorder:
         self.replies: dict[str, subprocess.CompletedProcess[str]] = replies
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
+        self.timeouts: list[float | None] = []
 
     @staticmethod
     def _joined(args: list[str]) -> str:
@@ -46,9 +47,11 @@ class Recorder:
         cwd: pathlib.Path | None = None,
         env: dict[str, str] | None = None,
         capture: bool = True,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(args))
         self.envs.append(env)
+        self.timeouts.append(timeout)
         joined: str = self._joined(args)
         matches: list[str] = [
             key for key in self.replies if joined.startswith(key)

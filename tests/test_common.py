@@ -6,9 +6,11 @@ import datetime as dt
 import email.message
 import hashlib
 import io
+import os
 import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
 from collections.abc import Callable
 
@@ -65,6 +67,100 @@ def test_run_without_capture_leaves_output_alone() -> None:
     assert done.returncode == 0
     assert done.stdout is None
     assert done.stderr is None
+
+
+def test_run_with_a_timeout_returns_like_without_one() -> None:
+    done: subprocess.CompletedProcess[str] = common.run(
+        [sys.executable, '-c', 'print("spam"); raise SystemExit(3)'],
+        timeout=30,
+    )
+    assert done.stdout == 'spam\n'
+    assert done.returncode == 3
+    with pytest.raises(subprocess.CalledProcessError):
+        common.run(
+            [sys.executable, '-c', 'raise SystemExit(1)'],
+            check=True,
+            timeout=30,
+        )
+
+
+def test_run_passes_the_timeout_to_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[float | None] = []
+    real: Callable[..., object] = subprocess.Popen.communicate
+
+    def communicate(
+        self: subprocess.Popen[str],
+        input: str | None = None,
+        timeout: float | None = None,
+    ) -> object:
+        seen.append(timeout)
+        return real(self, input, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, 'communicate', communicate)
+    common.run([sys.executable, '-c', 'pass'], timeout=12.5)
+    assert seen == [12.5]
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+# A wrapper like uvx: it starts a child and forwards SIGTERM to it.
+WRAPPER: str = """
+import os, pathlib, signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+def forward(signum, frame):
+    child.terminate()
+    child.wait()
+    sys.exit(1)
+signal.signal(signal.SIGTERM, forward)
+pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}')
+time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='POSIX signals')
+def test_a_timeout_stops_the_child_and_what_it_started(
+    tmp_path: pathlib.Path,
+) -> None:
+    pids: pathlib.Path = tmp_path / 'pids'
+    with pytest.raises(subprocess.TimeoutExpired):
+        common.run(
+            [sys.executable, '-c', WRAPPER, str(pids)],
+            capture=False,
+            timeout=2,
+        )
+    wrapper, child = (int(pid) for pid in pids.read_text().split())
+    assert _gone(wrapper)
+    deadline: float = time.monotonic() + 5
+    while not _gone(child) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _gone(child)
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='POSIX signals')
+def test_a_child_ignoring_sigterm_is_killed_after_the_grace(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(common, 'STOP_GRACE_SECONDS', 0.5)
+    pid_file: pathlib.Path = tmp_path / 'pid'
+    script: str = (
+        'import os, pathlib, signal, sys, time\n'
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n'
+        'time.sleep(60)\n'
+    )
+    started: float = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        common.run([sys.executable, '-c', script, str(pid_file)], timeout=1)
+    assert time.monotonic() - started < 30
+    assert _gone(int(pid_file.read_text()))
 
 
 def test_run_bytes_returns_undecoded_output() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
 import pathlib
 import subprocess
 
@@ -97,6 +98,7 @@ class World:
         self.disabled: set[str] = set()
         self.tag_keys: list[str] = []
         self.assets: dict[str, bytes] = {}
+        self.asset_downloads: list[str] = []
 
 
 def _sign_release(
@@ -235,6 +237,7 @@ def install_github(monkeypatch: pytest.MonkeyPatch, world: World) -> None:
     def download_asset(
         asset: github.Asset, into: pathlib.Path
     ) -> pathlib.Path:
+        world.asset_downloads.append(asset.name)
         into.mkdir(parents=True, exist_ok=True)
         target: pathlib.Path = into / asset.name
         target.write_bytes(world.assets[asset.name])
@@ -1202,7 +1205,10 @@ def test_an_already_signed_release_is_not_rebuilt(
         'SHA256SUMS.asc',
     ]
     world.releases = [
-        dataclasses.replace(release('v1.0'), assets=signed_assets(*names))
+        dataclasses.replace(
+            release('v1.0', body=f'notes\n\n{sign.FOOTER_MARKER}\n'),
+            assets=signed_assets(*names),
+        )
     ]
     world.assets['SHA256SUMS'] = (
         f'# rebuilt from tag v1.0\n{"0" * 64}  {WHEEL}\n'
@@ -1220,10 +1226,8 @@ def test_an_already_signed_release_is_not_rebuilt(
     assert backfill._exit_status(report) == 0
 
 
-@pytest.mark.parametrize(
-    'missing', [f'{WHEEL}.sigstore.json', f'{WHEEL}.asc', 'SHA256SUMS', WHEEL]
-)
-def test_a_partly_signed_release_is_still_rebuilt(
+@pytest.mark.parametrize('missing', ['SHA256SUMS', 'SHA256SUMS.asc'])
+def test_a_release_without_a_signed_sums_list_is_still_rebuilt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, missing: str
 ) -> None:
     world: World = install(monkeypatch, World())
@@ -1254,6 +1258,7 @@ class Signer:
         self.sigstore_calls: list[list[pathlib.Path]] = []
         self.uploads: list[tuple[str, list[str]]] = []
         self.edits: list[str] = []
+        self.bodies: list[str] = []
         self.sigstore_error: str = ''
         monkeypatch.setattr(pypi, 'download', self.download)
         monkeypatch.setattr(signing, 'gpg_sign', self.gpg_sign)
@@ -1294,6 +1299,7 @@ class Signer:
 
     def edit_notes(self, repo: str, tag: str, body: str) -> None:
         self.edits.append(tag)
+        self.bodies.append(body)
 
     def bundle_uploads(self) -> list[tuple[str, list[str]]]:
         return [
@@ -1360,6 +1366,282 @@ def test_a_failed_sigstore_run_fails_every_waiting_release(
         assert outcome.status == 'failed'
         assert outcome.reason == 'sigstore failed: login cancelled'
     assert backfill._exit_status(report) == 1
+
+
+def test_a_sigstore_timeout_fails_the_waiting_releases_not_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    Signer(monkeypatch)
+    message: str = signing.SIGSTORE_TIMEOUT_MESSAGE.format(seconds=900)
+
+    def timed_out(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(signing, 'sigstore_sign', timed_out)
+    world.project = project_with({'1.0': files_of('1.0')})
+    tagged(world, '1.0')
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    _, outcome, _ = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'failed'
+    assert outcome.reason == f'sigstore failed: {message}'
+    assert backfill._exit_status(report) == 1
+
+
+SDIST: str = 'spam-1.0.tar.gz'
+REBUILT_COMMENT: str = (
+    '# rebuilt from tag v1.0 on 2026-11-05, not the PyPI bytes'
+)
+
+
+class Verifier:
+    """Stand-in for signing.gpg_verify_key with a fixed verdict."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, good: bool) -> None:
+        self.good: bool = good
+        self.calls: list[tuple[str, str, str]] = []
+        monkeypatch.setattr(signing, 'gpg_verify_key', self)
+
+    def __call__(
+        self, path: pathlib.Path, signature: pathlib.Path, key: str
+    ) -> bool:
+        self.calls.append((path.name, signature.name, key))
+        return self.good
+
+
+def interrupted(world: World, body: str = 'notes') -> list[str]:
+    """A rebuilt v1.0 that a run left without bundles, returning its assets.
+
+    The release has both dists with their ``.asc``, SHA256SUMS and its
+    signature, and no footer unless ``body`` carries one.
+    """
+    world.project = project_with({'1.0': []})
+    tagged(world, '1.0')
+    world.assets = {SDIST: b'sdist bytes', WHEEL: b'wheel bytes'}
+    lines: list[str] = []
+    for name in (SDIST, WHEEL):
+        digest: str = hashlib.sha256(world.assets[name]).hexdigest()
+        lines.extend([REBUILT_COMMENT, f'{digest}  {name}'])
+    world.assets['SHA256SUMS'] = ('\n'.join(lines) + '\n').encode()
+    world.assets['SHA256SUMS.asc'] = b'signature of the list'
+    world.assets[f'{SDIST}.asc'] = b'signature'
+    world.assets[f'{WHEEL}.asc'] = b'signature'
+    names: list[str] = sorted(world.assets)
+    world.releases = [
+        dataclasses.replace(
+            release('v1.0', body=body), assets=signed_assets(*names)
+        )
+    ]
+    return names
+
+
+def test_an_interrupted_rebuild_resumes_from_the_release_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    verifier: Verifier = Verifier(monkeypatch, good=True)
+    interrupted(world)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.rebuilt == []
+    assert {'SHA256SUMS', 'SHA256SUMS.asc', SDIST, WHEEL} <= set(
+        world.asset_downloads
+    )
+    assert verifier.calls == [
+        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
+    ]
+    assert [[p.name for p in call] for call in signer.sigstore_calls] == [
+        [SDIST, WHEEL]
+    ]
+    # The dists, their .asc and the signed list stay as they are.
+    assert signer.uploads == [
+        ('v1.0', [f'{SDIST}.sigstore.json', f'{WHEEL}.sigstore.json'])
+    ]
+    assert signer.edits == ['v1.0']
+    assert sign.FOOTER_MARKER in signer.bodies[0]
+    assert f'Rebuilt files:\n\n- {SDIST}\n- {WHEEL}\n' in signer.bodies[0]
+    plan, outcome, note = report.rows[0]
+    assert plan.files_source == 'rebuild'
+    assert outcome is not None
+    assert outcome.status == 'signed'
+    assert note == backfill.RESUMED_NOTE
+    assert backfill._exit_status(report) == 0
+
+
+def test_a_resumed_release_with_bundles_only_gets_its_footer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=True)
+    interrupted(world)
+    for name in (SDIST, WHEEL):
+        world.assets[f'{name}.sigstore.json'] = b'bundle'
+    world.releases[0].assets = signed_assets(*sorted(world.assets))
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert world.rebuilt == []
+    assert signer.sigstore_calls == []
+    assert signer.uploads == []
+    assert signer.edits == ['v1.0']
+    _, outcome, _ = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'already signed'
+
+
+def _assert_failed_untouched(
+    world: World,
+    signer: Signer,
+    report: backfill.BackfillReport,
+    reason: str,
+) -> None:
+    assert world.rebuilt == []
+    assert signer.uploads == []
+    assert signer.edits == []
+    assert signer.sigstore_calls == []
+    _, outcome, _ = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'failed'
+    assert outcome.reason == reason
+    assert backfill._exit_status(report) == 1
+
+
+def test_a_release_file_that_differs_from_the_list_fails_the_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=True)
+    interrupted(world)
+    world.assets[WHEEL] = b'tampered'
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    actual: str = hashlib.sha256(b'tampered').hexdigest()
+    listed: str = hashlib.sha256(b'wheel bytes').hexdigest()
+    _assert_failed_untouched(
+        world,
+        signer,
+        report,
+        f'{WHEEL} on the release has sha256 {actual}, SHA256SUMS says '
+        f'{listed}',
+    )
+
+
+def test_a_bad_sums_signature_fails_the_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=False)
+    interrupted(world)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    _assert_failed_untouched(
+        world,
+        signer,
+        report,
+        f'SHA256SUMS signature not valid for {signing.DEFAULT_GPG_KEY}',
+    )
+    # No dist is fetched from a list nobody vouches for.
+    assert SDIST not in world.asset_downloads
+    assert WHEEL not in world.asset_downloads
+
+
+@pytest.mark.parametrize(
+    ('listing', 'reason'),
+    [
+        (
+            f'{"0" * 64}  {WHEEL}\n',
+            f'SHA256SUMS does not mark as rebuilt: {WHEEL}',
+        ),
+        (
+            f'{REBUILT_COMMENT}\n{"0" * 64}  spam-1.0-cp39.whl\n',
+            'spam-1.0-cp39.whl is in SHA256SUMS but not on the release',
+        ),
+        (
+            f'{REBUILT_COMMENT}\n{"0" * 64}  ../{WHEEL}\n',
+            f"SHA256SUMS lists a bad file name '../{WHEEL}'",
+        ),
+        (
+            f'{REBUILT_COMMENT}\n{"0" * 64}  {WHEEL}.asc\n',
+            f"SHA256SUMS lists a bad file name '{WHEEL}.asc'",
+        ),
+        ('# only a comment\n', 'SHA256SUMS lists no files'),
+    ],
+)
+def test_a_sums_list_that_cannot_be_resumed_fails_the_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    listing: str,
+    reason: str,
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=True)
+    interrupted(world)
+    world.assets['SHA256SUMS'] = listing.encode()
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    _assert_failed_untouched(world, signer, report, reason)
+
+
+def test_already_signed_needs_the_footer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World())
+    interrupted(world)
+    for name in (SDIST, WHEEL):
+        world.assets[f'{name}.sigstore.json'] = b'bundle'
+    names: list[str] = sorted(world.assets)
+    plan: backfill.Plan = backfill.plan_versions(
+        world.project, world.tags, world.releases
+    )[0]
+    opts: backfill.BackfillOptions = options(tmp_path)
+
+    def run_with(body: str) -> backfill._Run:
+        signed: github.Release = dataclasses.replace(
+            release('v1.0', body=body), assets=signed_assets(*names)
+        )
+        return backfill._Run(
+            package='spam',
+            options=opts,
+            project=world.project,
+            tags=world.tags,
+            releases={'v1.0': signed},
+            workdir=tmp_path / 'work',
+            sign_options=backfill._sign_options('spam', opts),
+        )
+
+    assert backfill._already_signed(run_with('notes'), plan) is None
+    footed: sign.SignOutcome | None = backfill._already_signed(
+        run_with(f'notes\n\n{sign.FOOTER_MARKER}\n'), plan
+    )
+    assert footed is not None
+    assert footed.status == 'already signed'
+
+
+def test_dry_run_says_a_resumable_release_is_checked_not_rebuilt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world: World = install(monkeypatch, World())
+    interrupted(world)
+    backfill.run_backfill('spam', options(tmp_path, dry_run=True))
+    out: str = capsys.readouterr().out
+    assert 'would check the files on release v1.0 against its SHA256SUMS' in (
+        out
+    )
+    assert 'would rebuild' not in out
 
 
 def test_chunks_cap_the_size_and_keep_names_apart() -> None:

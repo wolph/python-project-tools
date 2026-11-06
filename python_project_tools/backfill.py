@@ -3,6 +3,9 @@
 The command walks the PyPI versions of a package oldest first and makes sure
 each one has a tag, a release and signed files. Missing tags come from
 ``match-tag``, missing files from ``rebuild``, signatures from ``sign``.
+A rebuilt release that an interrupted run left with a signed SHA256SUMS is
+completed from its own files, checked against that list, because a rebuild
+need not give the same bytes.
 Versions whose commit cannot be found share one release on a root-commit
 tag. The release marked latest on GitHub never changes. GitHub marks the
 first stable release of an empty repository as latest whatever
@@ -62,6 +65,11 @@ UNTAGGED_INTRO: str = (
 )
 REBUILT_NOTE: str = '# rebuilt from tag {tag} on {date}, not the PyPI bytes'
 REBUILD_SKIPPED_NOTE: str = 'rebuild skipped, the release is already signed'
+RESUMED_NOTE: str = (
+    'rebuild skipped, files taken from the release and checked against its '
+    'signed SHA256SUMS'
+)
+SUMS_SIGNATURE: str = f'{signing.SHA256SUMS_NAME}.asc'
 RELEASE_WORKFLOW_NOTE: str = 'release would fire {names} at the tagged commit'
 LATEST_MARKED: str = (
     'GitHub marked {tag} as Latest despite --latest=false, stopping'
@@ -172,6 +180,14 @@ class LatestMarkedError(RunStoppedError):
 
 class TargetFailedError(RunStoppedError):
     """The Latest target failed after its release may have been created."""
+
+
+class ResumeError(RuntimeError):
+    """The signed files on a release cannot be trusted to resume from.
+
+    The version fails: rebuilding instead would give bytes that differ
+    from the ones already signed.
+    """
 
 
 Row = tuple[Plan, sign.SignOutcome | None, str]
@@ -622,18 +638,117 @@ def _rebuilt_dir(run: _Run, tag: str) -> pathlib.Path:
     return run.workdir / f'{tag}-rebuilt'
 
 
-def _files_for_plan(run: _Run, plan: Plan) -> tuple[Files, dict[str, str]]:
-    """The files to sign and the disclosure line of each rebuilt one."""
+def _resumable(release: github.Release | None) -> bool:
+    """Whether a release carries a SHA256SUMS list and its signature."""
+    if release is None:
+        return False
+    names: set[str] = {asset.name for asset in release.assets}
+    return {sign.SUMS_NAME, SUMS_SIGNATURE} <= names
+
+
+def _listed_name_ok(name: str) -> bool:
+    """A plain dist file name, not a path and not a signature or sums file."""
+    if name in ('', '.', '..') or '/' in name or '\\' in name:
+        return False
+    if name in (sign.SUMS_NAME, SUMS_SIGNATURE):
+        return False
+    return not name.endswith(('.asc', signing.BUNDLE_SUFFIX))
+
+
+def _fetch_listed(
+    assets: dict[str, github.Asset],
+    name: str,
+    digest: str,
+    into: pathlib.Path,
+) -> pathlib.Path:
+    """Download one dist SHA256SUMS lists and check it against the list."""
+    if not _listed_name_ok(name):
+        raise ResumeError(f'SHA256SUMS lists a bad file name {name!r}')
+    asset: github.Asset | None = assets.get(name)
+    if asset is None:
+        raise ResumeError(f'{name} is in SHA256SUMS but not on the release')
+    path: pathlib.Path = github.download_asset(asset, into)
+    actual: str = common.sha256_of(path)
+    if actual != digest.lower():
+        raise ResumeError(
+            f'{name} on the release has sha256 {actual}, SHA256SUMS says '
+            f'{digest}'
+        )
+    return path
+
+
+def _verified_sums(
+    run: _Run, tag: str, assets: dict[str, github.Asset]
+) -> pathlib.Path:
+    """Download SHA256SUMS and raise unless the configured key signed it."""
+    into: pathlib.Path = run.workdir / SUMS_DIR / tag
+    sums: pathlib.Path = github.download_asset(assets[sign.SUMS_NAME], into)
+    signature: pathlib.Path = github.download_asset(
+        assets[SUMS_SIGNATURE], into
+    )
+    key: str = run.options.gpg_key
+    if not signing.gpg_verify_key(sums, signature, key):
+        raise ResumeError(f'SHA256SUMS signature not valid for {key}')
+    return sums
+
+
+def _resume_files(
+    run: _Run, tag: str
+) -> tuple[list[pathlib.Path], dict[str, str]] | None:
+    """The dists of an earlier, interrupted run, taken from the release.
+
+    None when the release has no SHA256SUMS with a signature, so the files
+    must be rebuilt. Otherwise the list must carry a good signature by
+    the configured key, and every dist it names is downloaded from the
+    release and checked against it. Their rebuilt comments come back as
+    well, so the files keep their marking. Any failure raises ResumeError:
+    a rebuild would not give the bytes that are already signed.
+    """
+    release: github.Release | None = run.releases.get(tag)
+    if release is None or not _resumable(release):
+        return None
+    assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
+    sums: pathlib.Path = _verified_sums(run, tag, assets)
+    listed: dict[str, str] = signing.parse_sha256sums(sums)
+    if not listed:
+        raise ResumeError('SHA256SUMS lists no files')
+    comments: dict[str, str] = signing.sha256sums_comments(sums)
+    unmarked: list[str] = [name for name in listed if name not in comments]
+    if unmarked:
+        raise ResumeError(
+            'SHA256SUMS does not mark as rebuilt: ' + ', '.join(unmarked)
+        )
+    into: pathlib.Path = _rebuilt_dir(run, tag)
+    dists: list[pathlib.Path] = [
+        _fetch_listed(assets, name, digest, into)
+        for name, digest in listed.items()
+    ]
+    return dists, comments
+
+
+def _files_for_plan(
+    run: _Run, plan: Plan
+) -> tuple[Files, dict[str, str], str]:
+    """The files to sign, the disclosure line of each rebuilt one, a note.
+
+    A rebuild plan whose release already has a signed SHA256SUMS resumes
+    from the files on that release instead of rebuilding them.
+    """
     if plan.files_source == 'pypi':
-        return pypi.files_for(run.project, plan.version), {}
+        return pypi.files_for(run.project, plan.version), {}, ''
     assert plan.tag is not None
+    resumed: tuple[list[pathlib.Path], dict[str, str]] | None = _resume_files(
+        run, plan.tag
+    )
+    if resumed is not None:
+        return resumed[0], resumed[1], RESUMED_NOTE
     built: list[pathlib.Path] = rebuild.rebuild(
         run.options.checkout, plan.tag, _rebuilt_dir(run, plan.tag)
     )
     note: str = REBUILT_NOTE.format(
         tag=plan.tag, date=dt.date.today().isoformat()
     )
-    return built, {path.name: note for path in built}
+    return built, {path.name: note for path in built}, ''
 
 
 def _signed_names(entries: list[str], options: sign.SignOptions) -> set[str]:
@@ -650,12 +765,16 @@ def _signed_names(entries: list[str], options: sign.SignOptions) -> set[str]:
 def _already_signed(run: _Run, plan: Plan) -> sign.SignOutcome | None:
     """An outcome when an existing release needs no rebuild at all.
 
-    That is when its SHA256SUMS lists entries and the release has each of
-    them with the signatures this run would make. Rebuilding then only
-    produces bytes that differ from the files already signed.
+    That is when its body carries the footer, its SHA256SUMS lists entries
+    and the release has each of them with the signatures this run would
+    make. Rebuilding then only produces bytes that differ from the files
+    already signed. A release without the footer was interrupted before
+    its end, so it goes on to be completed.
     """
     assert plan.tag is not None
     release: github.Release = run.releases[plan.tag]
+    if sign.FOOTER_MARKER not in release.body:
+        return None
     assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
     sums: github.Asset | None = assets.get(sign.SUMS_NAME)
     if sums is None:
@@ -709,7 +828,7 @@ def _release_and_sign(
         )
         if early is not None:
             return early
-        files, rebuilt = _files_for_plan(run, plan)
+        files, rebuilt, files_note = _files_for_plan(run, plan)
         release, note = _ensure_release(run, plan)
         options: sign.SignOptions = dataclasses.replace(
             run.sign_options, rebuilt=rebuilt
@@ -721,13 +840,29 @@ def _release_and_sign(
         return None, f'rebuild failed: {error}'
     except RunStoppedError:
         raise
+    except ResumeError as error:
+        return _failed(plan, str(error)), ''
     except STEP_ERRORS as error:
         return None, f'release failed: {error}'
     finally:
         shutil.rmtree(_rebuilt_dir(run, plan.tag), ignore_errors=True)
     outcome.version = plan.version
     _remember_pending(run, release, outcome, files, options)
-    return outcome, note
+    return outcome, note or files_note
+
+
+def _failed(plan: Plan, reason: str) -> sign.SignOutcome:
+    """The outcome of a version that failed before anything was uploaded."""
+    assert plan.tag is not None
+    return sign.SignOutcome(
+        tag=plan.tag,
+        version=plan.version,
+        uploaded=[],
+        kept=[],
+        conflicts=[],
+        status='failed',
+        reason=reason,
+    )
 
 
 def _remember_pending(
@@ -759,7 +894,7 @@ def _dry_run_plan(
     if plan.release_action == 'create':
         _say(f'{plan.version}: would create release {tag}')
     if plan.files_source == 'rebuild':
-        _say(f'{plan.version}: would rebuild from tag {tag}')
+        _say(f'{plan.version}: would {_dry_source(run, tag)}')
         _say(f'{plan.version}: would sign the rebuilt files')
         return _dry_outcome(tag, plan.version), 'dry run'
     files: list[pypi.PypiFile] = pypi.files_for(run.project, plan.version)
@@ -778,6 +913,13 @@ def _dry_run_plan(
     )
     outcome.version = plan.version
     return outcome, 'dry run'
+
+
+def _dry_source(run: _Run, tag: str) -> str:
+    """Where a dry run says the files of a rebuild plan would come from."""
+    if _resumable(run.releases.get(tag)):
+        return f'check the files on release {tag} against its SHA256SUMS'
+    return f'rebuild from tag {tag}'
 
 
 def _dry_outcome(tag: str, version: str) -> sign.SignOutcome:
@@ -1086,7 +1228,7 @@ def _sign_chunk(chunk: list[pathlib.Path]) -> str:
     """One sigstore invocation, returning its error or an empty string."""
     try:
         signing.sigstore_sign(chunk)
-    except (signing.SigningError, OSError) as error:
+    except (signing.SigningError, RuntimeError, OSError) as error:
         return str(error) or type(error).__name__
     return ''
 

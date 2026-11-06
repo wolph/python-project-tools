@@ -145,43 +145,66 @@ def _compare_dists(
     return new, clobber
 
 
+def _needed(name: str, present: set[str], options: SignOptions) -> bool:
+    """Whether an output file is missing from the release or replaceable."""
+    return options.replace_assets or name not in present
+
+
 def _make_signatures(
     dists: list[pathlib.Path],
     workdir: pathlib.Path,
     options: SignOptions,
+    present: set[str],
 ) -> list[pathlib.Path]:
-    """Sign every dist, write the sums and sign those."""
+    """Produce only the signature and sums files the release still lacks."""
     produced: list[pathlib.Path] = []
     if options.gpg:
-        produced.extend(signing.gpg_sign(p, options.gpg_key) for p in dists)
+        produced.extend(
+            signing.gpg_sign(p, options.gpg_key)
+            for p in dists
+            if _needed(f'{p.name}.asc', present, options)
+        )
     if options.sigstore:
-        produced.extend(signing.sigstore_sign(dists))
-    sums: pathlib.Path = signing.write_sha256sums(
-        workdir, dists, options.rebuilt
+        todo: list[pathlib.Path] = [
+            p
+            for p in dists
+            if _needed(f'{p.name}.sigstore.json', present, options)
+        ]
+        if todo:
+            produced.extend(signing.sigstore_sign(todo))
+    sums_needed: bool = _needed(SUMS_NAME, present, options)
+    sums_asc_needed: bool = options.gpg and _needed(
+        f'{SUMS_NAME}.asc', present, options
     )
-    produced.append(sums)
-    if options.gpg:
-        produced.append(signing.gpg_sign(sums, options.gpg_key))
+    if sums_needed or sums_asc_needed:
+        sums: pathlib.Path = signing.write_sha256sums(
+            workdir, dists, options.rebuilt
+        )
+        if sums_needed:
+            produced.append(sums)
+        if sums_asc_needed:
+            produced.append(signing.gpg_sign(sums, options.gpg_key))
     return produced
 
 
 def _split_signatures(
     produced: list[pathlib.Path],
-    release: github.Release,
+    present: set[str],
+    dist_names: list[str],
     options: SignOptions,
     outcome: SignOutcome,
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
-    """Signature files to upload plainly and to upload with clobber."""
-    present: set[str] = {a.name for a in release.assets}
-    new: list[pathlib.Path] = []
-    clobber: list[pathlib.Path] = []
-    for path in produced:
-        if path.name not in present:
-            new.append(path)
-        elif options.replace_assets:
-            clobber.append(path)
-        else:
-            outcome.kept.append(path.name)
+    """Produced files to upload plainly and with clobber, plus kept names."""
+    new: list[pathlib.Path] = [p for p in produced if p.name not in present]
+    clobber: list[pathlib.Path] = [
+        p for p in produced if p.name in present and options.replace_assets
+    ]
+    replaced: set[str] = {p.name for p in clobber}
+    outcome.kept.extend(
+        name
+        for name in _signature_names(dist_names, options)
+        if name in present and name not in replaced
+    )
     return new, clobber
 
 
@@ -208,18 +231,15 @@ def _append_footer(
     if FOOTER_MARKER in release.body:
         return
     text: str = footer(options, rebuilt_names)
-    body: str = f'{release.body.rstrip()}\n\n{text}' if release.body else text
+    body: str = (
+        f'{release.body.rstrip()}\n\n{text}' if release.body.strip() else text
+    )
     github.edit_notes(options.repo, release.tag, body)
 
 
 def _finish(outcome: SignOutcome) -> SignOutcome:
     if outcome.uploaded:
         outcome.status = 'signed'
-    elif outcome.conflicts:
-        outcome.status = 'failed'
-        outcome.reason = 'conflicting assets left alone: ' + ', '.join(
-            outcome.conflicts
-        )
     else:
         outcome.status = 'already signed'
     return outcome
@@ -289,11 +309,18 @@ def sign_release(
         new, clobber = _compare_dists(
             release, dists, workdir, options, outcome
         )
+        if outcome.conflicts and not options.replace_assets:
+            outcome.status = 'failed'
+            outcome.reason = 'conflicting assets left alone: ' + ', '.join(
+                outcome.conflicts
+            )
+            return outcome
+        present: set[str] = {a.name for a in release.assets}
         produced: list[pathlib.Path] = _make_signatures(
-            dists, workdir, options
+            dists, workdir, options, present
         )
         sig_new, sig_clobber = _split_signatures(
-            produced, release, options, outcome
+            produced, present, [d.name for d in dists], options, outcome
         )
         _upload(
             release, new + sig_new, clobber + sig_clobber, options, outcome
@@ -398,12 +425,16 @@ def _sign_one(
             status='failed',
             reason=f'{release.tag} matches no PyPI version',
         )
-    outcome: SignOutcome = sign_release(
-        release,
-        pypi.files_for(project, version),
-        workdir / release.tag,
-        options,
-    )
+    release_dir: pathlib.Path = workdir / release.tag
+    try:
+        outcome: SignOutcome = sign_release(
+            release,
+            pypi.files_for(project, version),
+            release_dir,
+            options,
+        )
+    finally:
+        shutil.rmtree(release_dir, ignore_errors=True)
     outcome.version = version
     return outcome
 

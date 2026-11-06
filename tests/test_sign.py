@@ -188,6 +188,8 @@ def test_sign_release_is_idempotent(
     assert not any('release edit' in ' '.join(c) for c in rec.calls)
     # Dist files are compared by content, signatures are not downloaded.
     assert sorted(world.downloaded) == sorted(DISTS)
+    assert world.sigstore_calls == 0
+    assert world.signed == []
 
 
 def test_conflicting_asset_is_left_alone_and_reported(
@@ -201,9 +203,13 @@ def test_conflicting_asset_is_left_alone_and_reported(
         release(['s.whl']), files[:1], tmp_path, options
     )
     assert out.conflicts == ['s.whl']
-    assert 's.whl' not in out.uploaded
-    assert 's.whl' not in world.uploaded
-    assert out.status == 'signed'
+    assert out.status == 'failed'
+    assert out.uploaded == []
+    assert out.reason == 'conflicting assets left alone: s.whl'
+    assert world.uploads == []
+    assert world.edits == []
+    assert world.signed == []
+    assert world.sigstore_calls == 0
 
 
 def test_replace_assets_clobbers_conflicts(
@@ -419,3 +425,108 @@ def test_gpg_only_and_sigstore_only_are_exclusive() -> None:
 
 def test_sign_is_registered() -> None:
     assert cli.COMMANDS['sign'] is sign.main
+
+
+def test_only_missing_signatures_are_produced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(
+        monkeypatch, {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES}
+    )
+    have: list[str] = [
+        n for n in ALL_NAMES if n not in ('s.whl.asc', 'SHA256SUMS.asc')
+    ]
+    out: sign.SignOutcome = sign.sign_release(
+        release(have, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert sorted(out.uploaded) == ['SHA256SUMS.asc', 's.whl.asc']
+    assert world.sigstore_calls == 0
+    assert world.signed == ['s.whl', 'SHA256SUMS']
+
+
+def test_sha256sums_lists_dists_and_rebuilt_comment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    import hashlib
+
+    install(monkeypatch)
+    captured: list[str] = []
+    real: typing.Callable[..., pathlib.Path] = signing.write_sha256sums
+
+    def spy(
+        directory: pathlib.Path,
+        paths: list[pathlib.Path],
+        rebuilt: dict[str, str],
+    ) -> pathlib.Path:
+        target: pathlib.Path = real(directory, paths, rebuilt)
+        captured.append(target.read_text())
+        return target
+
+    monkeypatch.setattr(signing, 'write_sha256sums', spy)
+    options.rebuilt = {'s.whl': '# s.whl rebuilt'}
+    sign.sign_release(release([]), files, tmp_path, options)
+    whl: str = hashlib.sha256(WHL_BYTES).hexdigest()
+    sdist: str = hashlib.sha256(SDIST_BYTES).hexdigest()
+    assert captured == [f'# s.whl rebuilt\n{whl}  s.whl\n{sdist}  s.tar.gz\n']
+
+
+def test_release_workdir_is_removed_after_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    install(monkeypatch)
+    project: pypi.Project = project_with({'1.0': files})
+    sign._sign_one(release([]), project, tmp_path, options)
+    assert not (tmp_path / 'v1.0').exists()
+
+    def broken(file: pypi.PypiFile, into: pathlib.Path) -> pathlib.Path:
+        into.mkdir(parents=True, exist_ok=True)
+        (into / file.filename).write_bytes(b'partial')
+        raise pypi.IntegrityError('bad hash')
+
+    monkeypatch.setattr(pypi, 'download', broken)
+    out: sign.SignOutcome = sign._sign_one(
+        release([]), project, tmp_path, options
+    )
+    assert out.status == 'failed'
+    assert not (tmp_path / 'v1.0').exists()
+
+
+def test_all_continues_after_a_signing_error(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    real: typing.Callable[..., pathlib.Path] = signing.gpg_sign
+
+    def flaky(path: pathlib.Path, key: str) -> pathlib.Path:
+        if 'v1.0' in str(path):
+            raise signing.SigningError('gpg exploded')
+        return real(path, key)
+
+    monkeypatch.setattr(signing, 'gpg_sign', flaky)
+    monkeypatch.setattr(
+        pypi,
+        'project',
+        lambda package: project_with({'1.0': files, '2.0': files}),
+    )
+    monkeypatch.setattr(
+        github,
+        'releases',
+        lambda repo: [release([], tag='v1.0'), release([], tag='v2.0')],
+    )
+    assert sign.main(['--all', '--package', 's']) == 1
+    printed: str = capsys.readouterr().out
+    assert 'v1.0: failed' in printed
+    assert 'gpg exploded' in printed
+    assert 'v2.0: signed' in printed
+    assert world.uploaded

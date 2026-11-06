@@ -12,6 +12,7 @@ import pytest
 
 from python_project_tools import (
     backfill,
+    backfill_batch,
     cli,
     common,
     github,
@@ -327,7 +328,7 @@ def test_main_exits_2_for_an_archived_repository(
     world: World = install(monkeypatch, World())
     world.project = project_with({'1.0': files_of('1.0')})
     world.repo_meta = {'archived': True}
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 2
     assert 'gh repo unarchive WoLpH/spam' in capsys.readouterr().err
     assert not world.created
     assert not world.rec.calls
@@ -343,7 +344,7 @@ def test_main_exits_2_before_creating_anything_when_preflight_fails(
     monkeypatch.setattr(
         github, 'release_triggered_workflows', lambda repo: ['release.yml']
     )
-    status: int = backfill.main(['spam', '--checkout', str(tmp_path)])
+    status: int = backfill_batch.main(['spam', '--checkout', str(tmp_path)])
     assert status == 2
     assert 'release.yml is enabled' in capsys.readouterr().err
     assert not world.created
@@ -602,7 +603,7 @@ def test_run_backfill_asserts_latest_unchanged(
     assert 'Latest before: v1.0, after: v1.1' in backfill.to_markdown(report)
     assert backfill.to_markdown(report).rstrip().endswith('CHANGED')
     world.latest = ['v1.0', 'v1.1']
-    status: int = backfill.main(['spam', '--checkout', str(tmp_path)])
+    status: int = backfill_batch.main(['spam', '--checkout', str(tmp_path)])
     assert status == 1
     assert 'CHANGED' in capsys.readouterr().out
 
@@ -615,7 +616,7 @@ def test_main_exits_0_when_everything_is_signed(
     world: World = install(monkeypatch, World())
     world.project = project_with({'1.0': files_of('1.0')})
     world.tags = [github.Tag('v1.0', SHA)]
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 0
     printed: str = capsys.readouterr().out
     assert '| version |' in printed
     assert printed.rstrip().endswith('OK')
@@ -628,10 +629,10 @@ def test_main_exits_1_when_a_version_fails_or_is_skipped(
     world.project = project_with({'1.0': files_of('1.0')})
     world.tags = [github.Tag('v1.0', SHA)]
     world.sign_status = 'failed'
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 1
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 1
     world = install(monkeypatch, World())
     world.project = project_with({'0.5': []})
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 1
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 1
 
 
 def test_untagged_versions_land_on_the_untagged_release(
@@ -799,7 +800,7 @@ def test_to_markdown_lists_every_column() -> None:
 
 
 def test_backfill_is_registered() -> None:
-    assert cli.COMMANDS['backfill'] is backfill.main
+    assert cli.COMMANDS['backfill'] is backfill_batch.main
 
 
 def test_changelog_section_tolerates_a_non_utf8_changelog(
@@ -878,7 +879,7 @@ def test_a_failed_fetch_exits_2_before_anything_is_created(
     )
     world.project = project_with({'1.0': files_of('1.0')})
     world.tags = [github.Tag('v1.0', SHA)]
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 2
     assert 'no remote' in capsys.readouterr().err
     assert not world.created
     assert not world.signed
@@ -978,7 +979,7 @@ def test_no_latest_before_releases_the_highest_stable_first(
     tagged(world, '1.0', '1.1', '1.2rc1', '1.3')
     # Before the run, after the first release, before marking, after the run.
     world.latest = [None, 'v1.1', 'v1.1', 'v1.1']
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 0
     assert [created[0] for created in world.created] == [
         'v1.1',
         'v1.0',
@@ -1009,7 +1010,7 @@ def test_no_latest_before_and_latest_elsewhere_after_is_changed(
     assert world.marked == ['v1.1', 'v1.1']
     assert report.latest_target == 'v1.1'
     assert backfill.to_markdown(report).rstrip().endswith('CHANGED')
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
 
 
 def test_no_latest_before_and_only_prereleases_marks_nothing(
@@ -1042,7 +1043,7 @@ def test_latest_appearing_mid_run_stops_with_exit_2(
     )
     tagged(world, '1.0', '1.1')
     world.latest = [None, 'v1.0', 'v1.0']
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 2
     message: str = (
         'after creating v1.1 GitHub reports Latest v1.0, expected v1.1, '
         'stopping'
@@ -1079,7 +1080,7 @@ def test_an_unreadable_latest_mid_run_stops_too(
         'spam', options(tmp_path)
     )
     assert 'could not read Latest after creating v1.0' in report.stopped
-    assert backfill._exit_status(report) == 2
+    assert backfill.exit_status(report) == 2
     assert not world.signed
 
 
@@ -1120,7 +1121,7 @@ def test_a_release_workflow_at_the_tag_commit_refuses_the_version(
     _, outcome, note = report.rows[0]
     assert outcome is None
     assert note == 'release would fire publish.yml at the tagged commit'
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
     # Disabled on GitHub, the same workflow no longer blocks the release.
     world.disabled = {'.github/workflows/publish.yml'}
     world.latest = ['v1.0', 'v1.0']
@@ -1227,7 +1228,7 @@ def test_an_already_signed_release_is_not_rebuilt(
     assert outcome.status == 'already signed'
     assert sorted(outcome.kept) == sorted(names)
     assert note == backfill.REBUILD_SKIPPED_NOTE
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 @pytest.mark.parametrize('missing', ['SHA256SUMS', 'SHA256SUMS.asc'])
@@ -1349,7 +1350,7 @@ def test_one_sigstore_invocation_for_the_whole_run(
         outcome.status for _, outcome, _ in report.rows if outcome
     ]
     assert statuses == ['signed', 'signed', 'signed']
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 def test_a_failed_sigstore_run_fails_every_waiting_release(
@@ -1369,7 +1370,7 @@ def test_a_failed_sigstore_run_fails_every_waiting_release(
         assert outcome is not None
         assert outcome.status == 'failed'
         assert outcome.reason == 'sigstore failed: login cancelled'
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
 
 
 def test_a_sigstore_timeout_fails_the_waiting_releases_not_the_run(
@@ -1392,7 +1393,7 @@ def test_a_sigstore_timeout_fails_the_waiting_releases_not_the_run(
     assert outcome is not None
     assert outcome.status == 'failed'
     assert outcome.reason == f'sigstore failed: {message}'
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
 
 
 SDIST: str = 'spam-1.0.tar.gz'
@@ -1474,7 +1475,7 @@ def test_an_interrupted_rebuild_resumes_from_the_release_files(
     assert outcome is not None
     assert outcome.status == 'signed'
     assert note == backfill.RESUMED_NOTE
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 def test_a_resumed_release_with_bundles_only_gets_its_footer(
@@ -1513,7 +1514,7 @@ def _assert_failed_untouched(
     assert outcome is not None
     assert outcome.status == 'failed'
     assert outcome.reason == reason
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
 
 
 def test_a_release_file_that_differs_from_the_list_fails_the_version(
@@ -1611,11 +1612,11 @@ def test_already_signed_needs_the_footer(
     )[0]
     opts: backfill.BackfillOptions = options(tmp_path)
 
-    def run_with(body: str) -> backfill._Run:
+    def run_with(body: str) -> backfill.PackageRun:
         signed: github.Release = dataclasses.replace(
             release('v1.0', body=body), assets=signed_assets(*names)
         )
-        return backfill._Run(
+        return backfill.PackageRun(
             package='spam',
             options=opts,
             project=world.project,
@@ -1688,7 +1689,7 @@ def test_an_empty_repository_releases_the_target_first(
 ) -> None:
     # Before the run, after the first release, before marking, after the run.
     world: World = run_empty_repo(monkeypatch, [None, 'v1.0', 'v1.0', 'v1.0'])
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 0
     assert [created[0] for created in world.created] == [
         'v1.0',
         'v0.1',
@@ -1731,7 +1732,7 @@ def test_latest_on_an_older_release_after_the_first_stops_the_run(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     world: World = run_empty_repo(monkeypatch, [None, 'v0.1', 'v0.1'])
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 2
     message: str = (
         'after creating v1.0 GitHub reports Latest v0.1, expected v1.0, '
         'stopping'
@@ -1754,7 +1755,7 @@ def test_no_latest_after_the_first_release_stops_the_run(
         'after creating v1.0 GitHub reports Latest none, expected v1.0, '
         'stopping'
     )
-    assert backfill._exit_status(report) == 2
+    assert backfill.exit_status(report) == 2
     assert [created[0] for created in world.created] == ['v1.0']
     # Five reads after the first release, four sleeps between them.
     assert world.sleeps == [2.0] * 4
@@ -1782,7 +1783,7 @@ def test_a_latest_that_lags_behind_the_first_release_is_waited_for(
     ]
     assert world.marked == ['v1.0']
     assert world.latest == []
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 def test_a_wrong_latest_after_the_first_release_is_not_waited_for(
@@ -1798,7 +1799,7 @@ def test_a_wrong_latest_after_the_first_release_is_not_waited_for(
     )
     assert world.sleeps == []
     assert [created[0] for created in world.created] == ['v1.0']
-    assert backfill._exit_status(report) == 2
+    assert backfill.exit_status(report) == 2
 
 
 def test_an_unreadable_latest_while_waiting_stops_the_run(
@@ -1861,7 +1862,7 @@ def test_a_rerun_fills_the_empty_target_release_a_stopped_run_left(
     _, outcome, _ = report.rows[0]
     assert outcome is not None
     assert outcome.status == 'signed'
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 def test_a_rerun_without_latest_yet_fills_the_empty_target_release(
@@ -1884,7 +1885,7 @@ def test_a_rerun_without_latest_yet_fills_the_empty_target_release(
     assert len(signer.sigstore_calls) == 1
     assert signer.edits == ['v1.0.1']
     assert report.latest_target == 'v1.0.1'
-    assert backfill._exit_status(report) == 0
+    assert backfill.exit_status(report) == 0
 
 
 def test_a_target_that_fails_before_a_release_falls_through(
@@ -1904,7 +1905,7 @@ def test_a_target_that_fails_before_a_release_falls_through(
         return into / file.filename
 
     monkeypatch.setattr(pypi, 'download', download)
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 1
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 1
     captured = capsys.readouterr()
     assert '| 1.0 |' in captured.out
     assert 'tag creation failed: sha256 mismatch' in captured.out
@@ -1932,7 +1933,7 @@ def test_a_target_failing_after_its_release_stops_the_run(
         raise RuntimeError('upload failed')
 
     monkeypatch.setattr(sign, 'sign_release', upload_raises)
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 2
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 2
     reason: str = 'target 1.0 failed after its release was created, stopping'
     captured = capsys.readouterr()
     assert reason in captured.err
@@ -1967,7 +1968,7 @@ def test_a_target_whose_release_call_raises_stops_the_run(
         'spam', options(tmp_path)
     )
     assert report.stopped.startswith('target 1.0 failed after its release')
-    assert backfill._exit_status(report) == 2
+    assert backfill.exit_status(report) == 2
     assert [created[0] for created in world.created] == ['v1.0']
 
 
@@ -1983,7 +1984,7 @@ def test_untagged_candidates_fall_through_and_join_the_anchor(
     world.match_sha = None
     # Before the run, after 0.2.1, before marking, after the run.
     world.latest = [None, 'v0.2.1', 'v0.2.1', 'v0.2.1']
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 0
     expected: list[str] = [
         'v0.2.1',
         'v0.1',
@@ -2043,7 +2044,7 @@ def test_no_candidate_with_a_commit_makes_the_anchor_the_target(
         monkeypatch, [None, anchor, anchor, anchor], release_tags=False
     )
     world.match_sha = None
-    assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
+    assert backfill_batch.main(['spam', '--checkout', str(tmp_path)]) == 0
     assert [created[0] for created in world.created] == [anchor]
     assert world.pushed == [anchor]
     assert world.marked == [anchor]
@@ -2063,7 +2064,7 @@ def test_every_candidate_refused_by_a_workflow_creates_nothing(
     assert not report.stopped
     assert not world.created
     assert report.latest_target is None
-    assert backfill._exit_status(report) == 1
+    assert backfill.exit_status(report) == 1
     assert [plan.version for plan, _, _ in report.rows] == [
         '1.0',
         '0.2',

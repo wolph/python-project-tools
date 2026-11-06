@@ -19,15 +19,17 @@ commit cannot be matched joins the untagged anchor and the next one down is
 tried, and only a failure after a release was created stops the run. The
 anchor is the target when no version gets its own release. The target is
 marked latest at the end when GitHub does not report it already. The
-Sigstore bundles of every release are made in one sigstore invocation per
-100 files after the loop. Call the other modules through their attributes
-(``github.create_release``, ``sign.sign_release``) so tests can replace
-them.
+Sigstore bundles of every release are made after the loop, in one sigstore
+invocation for up to SIGSTORE_CHUNK files, so one browser login covers the
+run. A run goes through ``start_run``, ``execute_run``, ``sign_pending``
+and ``finish_run``, so ``backfill_batch`` can sign the bundles of several
+packages in one invocation. ``run_backfill`` is the run of one package.
+Call the other modules through their attributes (``github.create_release``,
+``sign.sign_release``) so tests can replace them.
 """
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import datetime as dt
 import pathlib
@@ -89,8 +91,9 @@ TARGET_FAILED: str = (
 RELEASED: str = 'released'
 FELL_THROUGH: str = 'fell through'
 FAILED_AFTER_CREATING: str = 'failed after creating'
-# Files per sigstore invocation. Each invocation is one browser login.
-SIGSTORE_CHUNK: int = 100
+# Files per sigstore invocation. Each invocation is one browser login, so
+# the cap only keeps the argv of one invocation a sane length.
+SIGSTORE_CHUNK: int = 2000
 # GitHub can answer releases/latest with 404 for a moment after the first
 # release of a repository, then with that release. The guard reads Latest
 # this many times at most while it is missing, sleeping in between.
@@ -215,8 +218,12 @@ class _Pending:
 
 
 @dataclasses.dataclass
-class _Run:
-    """Everything the steps of one run share."""
+class PackageRun:
+    """Everything the steps of one run share.
+
+    ``workdir`` holds the staged copies the deferred Sigstore bundles are
+    made for, so it lives until ``close_run``.
+    """
 
     package: str
     options: BackfillOptions
@@ -226,6 +233,9 @@ class _Run:
     workdir: pathlib.Path
     sign_options: sign.SignOptions
     latest_before: str | None = None
+    plans: list[Plan] = dataclasses.field(default_factory=list)
+    # Why the run stopped early, empty while it has not.
+    stopped: str = ''
     untagged: list[Plan] = dataclasses.field(default_factory=list)
     rows: list[Row] = dataclasses.field(default_factory=list)
     # The plan that must become Latest. With no Latest release it is the
@@ -437,7 +447,9 @@ def _sdist_of(files: list[pypi.PypiFile]) -> pypi.PypiFile | None:
     return None
 
 
-def _find_match(run: _Run, plan: Plan) -> tuple[str, pypi.PypiFile] | None:
+def _find_match(
+    run: PackageRun, plan: Plan
+) -> tuple[str, pypi.PypiFile] | None:
     """The commit whose files equal the sdist, with the sdist, or None."""
     sdist: pypi.PypiFile | None = _sdist_of(
         pypi.files_for(run.project, plan.version)
@@ -458,7 +470,7 @@ def _find_match(run: _Run, plan: Plan) -> tuple[str, pypi.PypiFile] | None:
 
 
 def _make_tag(
-    run: _Run, plan: Plan, sha: str, sdist: pypi.PypiFile
+    run: PackageRun, plan: Plan, sha: str, sdist: pypi.PypiFile
 ) -> str | None:
     """Create and push the tag, reusing a local tag at the same commit.
 
@@ -488,7 +500,7 @@ def _make_tag(
     return None
 
 
-def _plan_tag(run: _Run, plan: Plan) -> str | None:
+def _plan_tag(run: PackageRun, plan: Plan) -> str | None:
     """Create the tag of a version, returning a note when it is skipped.
 
     A version whose commit cannot be matched becomes 'untagged' and returns
@@ -511,7 +523,7 @@ def _plan_tag(run: _Run, plan: Plan) -> str | None:
     return None
 
 
-def _read_latest_after(run: _Run, tag: str) -> str | None:
+def _read_latest_after(run: PackageRun, tag: str) -> str | None:
     """The tag of Latest right after creating ``tag``, or None.
 
     A Latest that cannot be read raises LatestMarkedError: the run cannot
@@ -526,7 +538,7 @@ def _read_latest_after(run: _Run, tag: str) -> str | None:
     return None if latest is None else latest.tag
 
 
-def _settled_latest(run: _Run, tag: str) -> str | None:
+def _settled_latest(run: PackageRun, tag: str) -> str | None:
     """Latest after creating ``tag``, read again while GitHub reports none.
 
     GitHub can lag a second behind the release it just created, so a
@@ -543,7 +555,7 @@ def _settled_latest(run: _Run, tag: str) -> str | None:
     return actual
 
 
-def _check_latest_is_target(run: _Run, tag: str) -> None:
+def _check_latest_is_target(run: PackageRun, tag: str) -> None:
     """Stop unless Latest is the target after the first created release.
 
     The target is released first, so Latest must be its tag then. A run
@@ -564,7 +576,7 @@ def _check_latest_is_target(run: _Run, tag: str) -> None:
     )
 
 
-def _pin_latest_target(run: _Run) -> None:
+def _pin_latest_target(run: PackageRun) -> None:
     """Mark the target Latest explicitly once the guard accepted it.
 
     The automatic first Latest is recomputed by GitHub from release dates
@@ -585,7 +597,7 @@ def _pin_latest_target(run: _Run) -> None:
 
 
 def _create_release(
-    run: _Run, tag: str, title: str, notes: str, prerelease: bool
+    run: PackageRun, tag: str, title: str, notes: str, prerelease: bool
 ) -> github.Release:
     """Create a release, checking Latest after the first one of a run.
 
@@ -606,7 +618,7 @@ def _create_release(
     return created
 
 
-def _tag_commit(run: _Run, tag: str) -> str:
+def _tag_commit(run: PackageRun, tag: str) -> str:
     """The commit of a tag, from the checkout or else from GitHub."""
     local: str | None = _local_tag_sha(run.options.checkout, tag)
     if local is not None:
@@ -617,7 +629,7 @@ def _tag_commit(run: _Run, tag: str) -> str:
     raise RuntimeError(f'the commit of {tag} is unknown')
 
 
-def _disabled_workflows(run: _Run) -> set[str]:
+def _disabled_workflows(run: PackageRun) -> set[str]:
     if run.disabled_workflows is None:
         run.disabled_workflows = github.disabled_workflow_paths(
             run.options.repo
@@ -625,7 +637,7 @@ def _disabled_workflows(run: _Run) -> set[str]:
     return run.disabled_workflows
 
 
-def _release_workflow_note(run: _Run, tag: str) -> str | None:
+def _release_workflow_note(run: PackageRun, tag: str) -> str | None:
     """A refusal when a new release at ``tag`` would run a workflow.
 
     GitHub runs release workflows from the tagged commit, so the files at
@@ -648,7 +660,7 @@ def _release_workflow_note(run: _Run, tag: str) -> str | None:
     return RELEASE_WORKFLOW_NOTE.format(names=', '.join(firing))
 
 
-def _ensure_release(run: _Run, plan: Plan) -> tuple[github.Release, str]:
+def _ensure_release(run: PackageRun, plan: Plan) -> tuple[github.Release, str]:
     """The release of a plan, created with changelog notes when missing.
 
     The note is non-empty when the tag is not in the checkout, so the notes
@@ -671,7 +683,7 @@ def _ensure_release(run: _Run, plan: Plan) -> tuple[github.Release, str]:
     return created, note
 
 
-def _rebuilt_dir(run: _Run, tag: str) -> pathlib.Path:
+def _rebuilt_dir(run: PackageRun, tag: str) -> pathlib.Path:
     """A sibling of the directory ``sign_release`` works in and removes."""
     return run.workdir / f'{tag}-rebuilt'
 
@@ -716,7 +728,7 @@ def _fetch_listed(
 
 
 def _verified_sums(
-    run: _Run, tag: str, assets: dict[str, github.Asset]
+    run: PackageRun, tag: str, assets: dict[str, github.Asset]
 ) -> pathlib.Path:
     """Download SHA256SUMS and raise unless the configured key signed it."""
     into: pathlib.Path = run.workdir / SUMS_DIR / tag
@@ -731,7 +743,7 @@ def _verified_sums(
 
 
 def _resume_files(
-    run: _Run, tag: str
+    run: PackageRun, tag: str
 ) -> tuple[list[pathlib.Path], dict[str, str]] | None:
     """The dists of an earlier, interrupted run, taken from the release.
 
@@ -765,7 +777,7 @@ def _resume_files(
 
 
 def _files_for_plan(
-    run: _Run, plan: Plan
+    run: PackageRun, plan: Plan
 ) -> tuple[Files, dict[str, str], str]:
     """The files to sign, the disclosure line of each rebuilt one, a note.
 
@@ -800,7 +812,7 @@ def _signed_names(entries: list[str], options: sign.SignOptions) -> set[str]:
     return names
 
 
-def _already_signed(run: _Run, plan: Plan) -> sign.SignOutcome | None:
+def _already_signed(run: PackageRun, plan: Plan) -> sign.SignOutcome | None:
     """An outcome when an existing release needs no rebuild at all.
 
     That is when its body carries the footer, its SHA256SUMS lists entries
@@ -836,7 +848,7 @@ def _already_signed(run: _Run, plan: Plan) -> sign.SignOutcome | None:
 
 
 def _precheck(
-    run: _Run, plan: Plan
+    run: PackageRun, plan: Plan
 ) -> tuple[sign.SignOutcome | None, str] | None:
     """A finished row for a plan that needs no rebuild or must not go on.
 
@@ -856,7 +868,7 @@ def _precheck(
 
 
 def _release_and_sign(
-    run: _Run, plan: Plan
+    run: PackageRun, plan: Plan
 ) -> tuple[sign.SignOutcome | None, str]:
     """Rebuild or collect files, ensure the release, sign it."""
     assert plan.tag is not None
@@ -904,7 +916,7 @@ def _failed(plan: Plan, reason: str) -> sign.SignOutcome:
 
 
 def _remember_pending(
-    run: _Run,
+    run: PackageRun,
     release: github.Release,
     outcome: sign.SignOutcome,
     files: Files,
@@ -920,7 +932,7 @@ def _remember_pending(
 
 
 def _dry_run_plan(
-    run: _Run, plan: Plan
+    run: PackageRun, plan: Plan
 ) -> tuple[sign.SignOutcome | None, str]:
     """Print what a plan would do and do none of it."""
     tag: str = plan.tag or versions.tag_for(plan.version)
@@ -953,7 +965,7 @@ def _dry_run_plan(
     return outcome, 'dry run'
 
 
-def _dry_source(run: _Run, tag: str) -> str:
+def _dry_source(run: PackageRun, tag: str) -> str:
     """Where a dry run says the files of a rebuild plan would come from."""
     if _resumable(run.releases.get(tag)):
         return f'check the files on release {tag} against its SHA256SUMS'
@@ -973,7 +985,7 @@ def _dry_outcome(tag: str, version: str) -> sign.SignOutcome:
 
 
 def _process_plan(
-    run: _Run, plan: Plan
+    run: PackageRun, plan: Plan
 ) -> tuple[sign.SignOutcome | None, str]:
     """Do everything one version needs, returning its outcome and a note.
 
@@ -993,7 +1005,7 @@ def _process_plan(
     return _release_and_sign(run, plan)
 
 
-def _anchor_sha(run: _Run) -> str:
+def _anchor_sha(run: PackageRun) -> str:
     done = common.run(
         ['git', 'rev-list', '--max-parents=0', 'HEAD'],
         cwd=run.options.checkout,
@@ -1004,7 +1016,7 @@ def _anchor_sha(run: _Run) -> str:
     return roots[-1]
 
 
-def _ensure_anchor_tag(run: _Run) -> str | None:
+def _ensure_anchor_tag(run: PackageRun) -> str | None:
     """Make sure the untagged tag exists locally and on origin.
 
     Returns a note when a workflow would fire and nothing was done.
@@ -1033,7 +1045,7 @@ def _ensure_anchor_tag(run: _Run) -> str | None:
     return None
 
 
-def _untagged_release(run: _Run, plans: list[Plan]) -> github.Release:
+def _untagged_release(run: PackageRun, plans: list[Plan]) -> github.Release:
     existing: github.Release | None = run.releases.get(UNTAGGED_TAG)
     if existing is not None:
         return existing
@@ -1047,7 +1059,7 @@ def _untagged_release(run: _Run, plans: list[Plan]) -> github.Release:
     )
 
 
-def _untagged_group(run: _Run) -> Plan:
+def _untagged_group(run: PackageRun) -> Plan:
     """The one row that stands for every untagged version."""
     return Plan(
         version=', '.join(plan.version for plan in run.untagged),
@@ -1064,7 +1076,7 @@ def _untagged_group(run: _Run) -> Plan:
     )
 
 
-def _handle_untagged(run: _Run, group: Plan) -> Row:
+def _handle_untagged(run: PackageRun, group: Plan) -> Row:
     """Put every untagged version on the one untagged release."""
     files: list[pypi.PypiFile] = [
         file
@@ -1107,17 +1119,19 @@ def _selected(plans: list[Plan], only: str | None) -> list[Plan]:
     return chosen
 
 
-def _add_row(run: _Run, row: Row) -> None:
+def _add_row(run: PackageRun, row: Row) -> None:
     run.rows.append(row)
     _say(_progress(*row))
 
 
-def _stopping(run: _Run, plan: Plan, error: RunStoppedError) -> None:
+def _stopping(run: PackageRun, plan: Plan, error: RunStoppedError) -> None:
     """Record the plan that stopped the run, before the error moves on."""
     _add_row(run, (plan, None, str(error)))
 
 
-def _verdict(run: _Run, plan: Plan, outcome: sign.SignOutcome | None) -> str:
+def _verdict(
+    run: PackageRun, plan: Plan, outcome: sign.SignOutcome | None
+) -> str:
     """What became of a candidate that was processed.
 
     A release this run requested that is missing or whose signing failed
@@ -1136,7 +1150,7 @@ def _verdict(run: _Run, plan: Plan, outcome: sign.SignOutcome | None) -> str:
 
 
 def _stop_failed_target(
-    run: _Run,
+    run: PackageRun,
     plan: Plan,
     outcome: sign.SignOutcome | None,
     note: str,
@@ -1154,7 +1168,7 @@ def _stop_failed_target(
     raise TargetFailedError(reason)
 
 
-def _step(run: _Run, plan: Plan) -> tuple[sign.SignOutcome | None, str]:
+def _step(run: PackageRun, plan: Plan) -> tuple[sign.SignOutcome | None, str]:
     """Process one plan, recording the plan that stopped the run."""
     try:
         return _process_plan(run, plan)
@@ -1164,7 +1178,7 @@ def _step(run: _Run, plan: Plan) -> tuple[sign.SignOutcome | None, str]:
 
 
 def _record(
-    run: _Run, plan: Plan, outcome: sign.SignOutcome | None, note: str
+    run: PackageRun, plan: Plan, outcome: sign.SignOutcome | None, note: str
 ) -> None:
     """Queue an untagged version for the anchor, else add its row."""
     if plan.tag_action == 'untagged' and plan.files_source == 'pypi':
@@ -1174,7 +1188,7 @@ def _record(
 
 
 def _release_target(
-    run: _Run, plans: list[Plan], candidates: list[Plan]
+    run: PackageRun, plans: list[Plan], candidates: list[Plan]
 ) -> list[Plan]:
     """Try the candidates from the highest down until one has its release.
 
@@ -1199,7 +1213,7 @@ def _release_target(
     return [p for p in plans if all(p is not t for t in tried)]
 
 
-def _finish_untagged(run: _Run) -> None:
+def _finish_untagged(run: PackageRun) -> None:
     """Release the untagged anchor last, as the target when nothing else is."""
     if not run.untagged:
         return
@@ -1214,7 +1228,7 @@ def _finish_untagged(run: _Run) -> None:
     _add_row(run, row)
 
 
-def _loop(run: _Run, plans: list[Plan], candidates: list[Plan]) -> None:
+def _loop(run: PackageRun, plans: list[Plan], candidates: list[Plan]) -> None:
     """Process every plan into ``run.rows``, then the untagged group.
 
     A RunStoppedError stops the loop with the rows so far kept. A dry run
@@ -1271,18 +1285,20 @@ def _sign_chunk(chunk: list[pathlib.Path]) -> str:
     return ''
 
 
-def _sign_pending(run: _Run) -> None:
-    """Make the deferred Sigstore bundles of the whole run and upload them."""
-    if not run.pending:
+def sign_pending(runs: list[PackageRun]) -> None:
+    """Make the deferred Sigstore bundles of every run and upload them.
+
+    All files of all runs go to one sigstore invocation per SIGSTORE_CHUNK
+    files, so one browser login covers them. A stopped run is included:
+    its releases exist and only their bundles are missing.
+    """
+    pending: list[_Pending] = [entry for run in runs for entry in run.pending]
+    if not pending:
         return
     failed: dict[pathlib.Path, str] = _sign_bundles(
-        [
-            path
-            for entry in run.pending
-            for path in entry.outcome.pending_bundles
-        ]
+        [path for entry in pending for path in entry.outcome.pending_bundles]
     )
-    for entry in run.pending:
+    for entry in pending:
         errors: list[str] = [
             failed[path]
             for path in entry.outcome.pending_bundles
@@ -1299,7 +1315,8 @@ def _sign_pending(run: _Run) -> None:
                 entry.options,
             )
         _say(f'{entry.release.tag}: {entry.outcome.status}')
-    run.pending.clear()
+    for run in runs:
+        run.pending.clear()
 
 
 def _progress(plan: Plan, outcome: sign.SignOutcome | None, note: str) -> str:
@@ -1351,7 +1368,7 @@ def _is_stable(plan: Plan) -> bool:
     return not plan.prerelease and not plan.yanked
 
 
-def _candidates(run: _Run, plans: list[Plan]) -> list[Plan]:
+def _candidates(run: PackageRun, plans: list[Plan]) -> list[Plan]:
     """The Latest candidates, highest first, when there is no Latest yet.
 
     GitHub marks the first stable release of an empty repository Latest, so
@@ -1383,7 +1400,9 @@ def _first_candidate_first(
     return [candidates[0], *(p for p in plans if p is not candidates[0])]
 
 
-def _announce(run: _Run, plans: list[Plan], candidates: list[Plan]) -> None:
+def _announce(
+    run: PackageRun, plans: list[Plan], candidates: list[Plan]
+) -> None:
     """Print the target candidates and the order of a dry run."""
     if candidates:
         _say(
@@ -1402,7 +1421,7 @@ def _announce(run: _Run, plans: list[Plan], candidates: list[Plan]) -> None:
     )
 
 
-def _mark_target(run: _Run) -> str | None:
+def _mark_target(run: PackageRun) -> str | None:
     """Mark the target Latest unless GitHub already reports it.
 
     Returns the tag that must be Latest now, or None without a target.
@@ -1419,32 +1438,39 @@ def _mark_target(run: _Run) -> str | None:
     return tag
 
 
-def _execute(run: _Run, plans: list[Plan]) -> tuple[str, str | None]:
-    """Run the plans, then the deferred bundles and the Latest target.
+def execute_run(run: PackageRun) -> None:
+    """Run the plans, leaving the Sigstore bundles to ``sign_pending``.
 
-    Returns why the run stopped (empty when it did not) and the target.
+    A RunStoppedError ends the loop with the rows so far kept and its
+    message in ``run.stopped``.
     """
-    candidates: list[Plan] = _candidates(run, plans)
+    candidates: list[Plan] = _candidates(run, run.plans)
     if run.options.dry_run:
-        _announce(run, plans, candidates)
+        _announce(run, run.plans, candidates)
     try:
-        _loop(run, plans, candidates)
-        _sign_pending(run)
+        _loop(run, run.plans, candidates)
     except RunStoppedError as error:
-        return str(error), run.latest_before
-    if run.latest_before is not None or run.options.dry_run:
-        return '', run.latest_before
-    return '', _mark_target(run)
+        run.stopped = str(error)
 
 
-def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
-    """Backfill every version of a package and report what happened.
+def _final_target(run: PackageRun) -> str | None:
+    """The tag that must be Latest, marking it when the run may.
+
+    A stopped run, a dry run and a repository that had a Latest release
+    mark nothing.
+    """
+    if run.stopped or run.latest_before is not None or run.options.dry_run:
+        return run.latest_before
+    return _mark_target(run)
+
+
+def start_run(package: str, options: BackfillOptions) -> PackageRun:
+    """Read everything a run needs and plan it, creating nothing.
 
     The caller runs ``preflight`` first. Raises LookupError for an unknown
     package or ``only`` version, and RuntimeError or common.FetchError when
-    the tags cannot be fetched or GitHub or PyPI cannot be read, all before
-    anything is created. A run that GitHub's Latest marking stops returns
-    the rows so far with ``stopped`` set.
+    the tags cannot be fetched or GitHub or PyPI cannot be read. The run
+    owns a work directory from here on, ``close_run`` removes it.
     """
     if not options.dry_run:
         _fetch_tags(options.checkout)
@@ -1458,7 +1484,7 @@ def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
     workdir: pathlib.Path = pathlib.Path(
         tempfile.mkdtemp(prefix='ppt-backfill-')
     )
-    run: _Run = _Run(
+    return PackageRun(
         package=package,
         options=options,
         project=project,
@@ -1467,23 +1493,50 @@ def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
         workdir=workdir,
         sign_options=_sign_options(package, options),
         latest_before=before,
+        plans=plans,
     )
-    try:
-        stopped, target = _execute(run, plans)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def finish_run(run: PackageRun) -> BackfillReport:
+    """Mark the Latest target when the run may, then report the run.
+
+    Runs after ``sign_pending``, so the target already has its bundles.
+    """
+    target: str | None = _final_target(run)
     return BackfillReport(
-        package=package,
-        repo=options.repo,
+        package=run.package,
+        repo=run.options.repo,
         rows=run.rows,
-        latest_before=before,
-        latest_after=_latest_after(options.repo),
+        latest_before=run.latest_before,
+        latest_after=_latest_after(run.options.repo),
         latest_target=target,
-        stopped=stopped,
+        stopped=run.stopped,
     )
 
 
-def _cell(value: str) -> str:
+def close_run(run: PackageRun) -> None:
+    """Remove the work directory of a run."""
+    shutil.rmtree(run.workdir, ignore_errors=True)
+
+
+def run_backfill(package: str, options: BackfillOptions) -> BackfillReport:
+    """Backfill every version of one package and report what happened.
+
+    Raises what ``start_run`` raises, before anything is created. A run
+    that GitHub's Latest marking stops returns the rows so far with
+    ``stopped`` set, its created releases still get their bundles.
+    """
+    run: PackageRun = start_run(package, options)
+    try:
+        execute_run(run)
+        sign_pending([run])
+        return finish_run(run)
+    finally:
+        close_run(run)
+
+
+def markdown_cell(value: str) -> str:
+    """A value made safe for one cell of a Markdown table row."""
     return value.replace('|', '\\|').replace('\n', ' ')
 
 
@@ -1512,7 +1565,7 @@ def _row_cells(row: Row) -> list[str]:
     ]
 
 
-def _latest_changed(report: BackfillReport) -> bool:
+def latest_changed(report: BackfillReport) -> bool:
     """Whether Latest is anything but the target, or cannot be read."""
     return (
         report.latest_after == UNKNOWN
@@ -1527,7 +1580,7 @@ def to_markdown(report: BackfillReport) -> str:
         '|' + '|'.join(' --- ' for _ in COLUMNS) + '|',
     ]
     for row in report.rows:
-        cells: list[str] = [_cell(cell) for cell in _row_cells(row)]
+        cells: list[str] = [markdown_cell(cell) for cell in _row_cells(row)]
         lines.append('| ' + ' | '.join(cells) + ' |')
     lines.append('')
     if report.stopped:
@@ -1535,89 +1588,24 @@ def to_markdown(report: BackfillReport) -> str:
     before: str = report.latest_before or 'none'
     after: str = report.latest_after or 'none'
     target: str = report.latest_target or 'none'
-    verdict: str = 'CHANGED' if _latest_changed(report) else 'OK'
+    verdict: str = 'CHANGED' if latest_changed(report) else 'OK'
     lines.extend(
         [f'Latest before: {before}, after: {after}, target: {target}', verdict]
     )
     return '\n'.join(lines) + '\n'
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        prog='ppt backfill',
-        description='Put every PyPI version on a signed GitHub release.',
-        allow_abbrev=False,
-    )
-    parser.add_argument('package')
-    parser.add_argument('--repo', help='OWNER/NAME, default from PyPI')
-    parser.add_argument(
-        '--checkout', type=pathlib.Path, default=pathlib.Path()
-    )
-    parser.add_argument('--only', metavar='VERSION')
-    parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--replace-assets', action='store_true')
-    only = parser.add_mutually_exclusive_group()
-    only.add_argument('--gpg-only', action='store_true')
-    only.add_argument('--sigstore-only', action='store_true')
-    parser.add_argument('--gpg-key', default=signing.DEFAULT_GPG_KEY)
-    parser.add_argument('--allow-workflow-trigger', action='store_true')
-    return parser
+def row_failed(outcome: sign.SignOutcome | None) -> bool:
+    """Whether a row is skipped, failed or still waits for its bundles."""
+    return outcome is None or outcome.status in ('failed', sign.PENDING)
 
 
-def _resolve_repo(args: argparse.Namespace) -> str | None:
-    if args.repo:
-        return str(args.repo)
-    return pypi.project(args.package).repo
-
-
-def _exit_status(report: BackfillReport) -> int:
+def exit_status(report: BackfillReport) -> int:
     """2 when the run stopped, 1 when a version failed or was skipped,
     still waits for bundles or Latest is off target, else 0.
     """
     if report.stopped:
         return 2
-    for _, outcome, _ in report.rows:
-        if outcome is None or outcome.status in ('failed', sign.PENDING):
-            return 1
-    return 1 if _latest_changed(report) else 0
-
-
-def main(argv: list[str]) -> int:
-    """Run ``ppt backfill`` and return its exit status."""
-    args: argparse.Namespace = _build_parser().parse_args(argv)
-    if not args.checkout.is_dir():
-        _fail(f'--checkout {args.checkout} is not a directory')
-        return 2
-    try:
-        repo: str | None = _resolve_repo(args)
-        if not repo:
-            _fail(f'no --repo and PyPI has none for {args.package}')
-            return 2
-        reasons: list[str] = preflight(repo)
-        if reasons:
-            for reason in reasons:
-                _fail(reason)
-            return 2
-        options: BackfillOptions = BackfillOptions(
-            repo=repo,
-            checkout=args.checkout,
-            only=args.only,
-            dry_run=args.dry_run,
-            replace_assets=args.replace_assets,
-            gpg=not args.sigstore_only,
-            sigstore=not args.gpg_only,
-            gpg_key=args.gpg_key,
-            allow_workflow_trigger=args.allow_workflow_trigger,
-        )
-        report: BackfillReport = run_backfill(args.package, options)
-    except (LookupError, RuntimeError, common.FetchError) as error:
-        _fail(str(error))
-        return 2
-    _say(to_markdown(report))
-    if report.stopped:
-        _fail(report.stopped)
-    return _exit_status(report)
-
-
-if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    if any(row_failed(outcome) for _, outcome, _ in report.rows):
+        return 1
+    return 1 if latest_changed(report) else 0

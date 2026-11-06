@@ -26,3 +26,13 @@ shows how to check them.
 - `match-tag`: find the commit whose tracked files match a PyPI sdist byte for byte and create a signed tag for it.
 - `sign`: sign the PyPI files of a GitHub release with GPG and Sigstore and attach the signatures.
 - `backfill`: give every PyPI version a tag, a release and signed files, rebuilding from the tag when PyPI has none.
+
+`ppt backfill --batch FILE` backfills several packages in one run and needs a
+single Sigstore browser login for all of them. The file lists one
+`PACKAGE CHECKOUT_PATH` pair per line, with an absolute path (`~` is
+expanded), and skips blank lines and lines starting with `#`. Each package
+runs its checks and releases in turn, then every Sigstore bundle is made in
+one go, then each package prints its report and a summary table closes the
+run. A package that is refused or stops does not stop the others. The exit
+status is the worst of all packages. `--only`, `--repo` and `--checkout`
+name one package, so they are refused together with `--batch`.

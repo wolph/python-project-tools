@@ -1,4 +1,4 @@
-# SDD ledger — plan: docs/superpowers/plans/2026-11-06-revival-and-script-migration.md
+# SDD ledger, plan: docs/superpowers/plans/2026-11-06-revival-and-script-migration.md
 
 Spec: docs/superpowers/specs/2026-11-06-signed-releases-design.md (read).
 Worktree: .claude/worktrees/signed-releases-plan1, branch worktree-signed-releases-plan1.

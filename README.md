@@ -17,3 +17,4 @@ uv tool install --editable ~/workspace/python-project-tools
 - `verify-release`: check that a release is complete everywhere it should be.
 - `inventory`: list the PyPI versions of a package against GitHub tags, releases and signatures.
 - `conda-forge`: inspect and update the conda-forge feedstock of a package.
+- `sign`: sign the PyPI files of a GitHub release with GPG and Sigstore and attach the signatures.

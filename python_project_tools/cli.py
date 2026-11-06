@@ -8,12 +8,14 @@ from python_project_tools import (
     __version__,
     check_compat,
     conda_forge,
+    inventory,
     verify_release,
 )
 
 COMMANDS: dict[str, Callable[[list[str]], int]] = {
     'check-compat': check_compat.main,
     'conda-forge': conda_forge.main,
+    'inventory': inventory.main,
     'verify-release': verify_release.main,
 }
 

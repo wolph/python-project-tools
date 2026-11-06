@@ -7,6 +7,7 @@ Pure mechanics with no policy. Every subprocess goes through
 from __future__ import annotations
 
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -155,6 +156,19 @@ def bundle_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(path.name + BUNDLE_SUFFIX)
 
 
+def relay_browser() -> str:
+    """The BROWSER value that routes sigstore's login through the relay.
+
+    Python's ``webbrowser`` runs an entry containing ``%s`` as a command
+    with the URL in its place, so the relay prints the URL and then opens
+    the real browser. See ``browser_relay``.
+    """
+    return (
+        f'{shlex.quote(sys.executable)} -m python_project_tools.browser_relay'
+        ' %s'
+    )
+
+
 def _sigstore_run(directory: pathlib.Path, paths: list[pathlib.Path]) -> None:
     """One sigstore invocation for files that all live in ``directory``.
 
@@ -183,6 +197,7 @@ def _sigstore_run(directory: pathlib.Path, paths: list[pathlib.Path]) -> None:
             ],
             capture=False,
             timeout=SIGSTORE_TIMEOUT_SECONDS,
+            env={'BROWSER': relay_browser()},
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(

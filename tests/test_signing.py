@@ -68,6 +68,8 @@ def _sigstore_fake(
         # The OIDC prompt must reach the terminal.
         assert capture is False
         assert timeout == signing.SIGSTORE_TIMEOUT_SECONDS
+        # The login URL is routed through the relay so it reaches the log.
+        assert env == {'BROWSER': signing.relay_browser()}
         reply: object = rec(args, check=check, cwd=cwd, timeout=timeout)
         out: pathlib.Path = pathlib.Path(
             args[args.index('--output-directory') + 1]

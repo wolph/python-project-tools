@@ -63,13 +63,13 @@ On macOS there is no `sha256sum` by default. Use `shasum -a 256 -c --ignore-miss
 
 ## Checking a Sigstore bundle signed by Rick
 
-Files signed by hand carry a certificate issued to Rick's GitHub login. Verify with the identity in that certificate and the GitHub OIDC issuer:
+Files signed by hand carry a certificate issued to Rick's GitHub login, which puts the email address wolph@wol.ph in the certificate. Verify with that identity and the GitHub OIDC issuer:
 
 ```bash
-uvx sigstore verify identity --bundle FILE.sigstore.json --cert-identity <identity> --cert-oidc-issuer https://github.com/login/oauth FILE
+uvx sigstore verify identity --bundle FILE.sigstore.json --cert-identity wolph@wol.ph --cert-oidc-issuer https://github.com/login/oauth FILE
 ```
 
-The `<identity>` placeholder gets filled in from the first real bundle, once one exists.
+The identity was read from the first real bundle, tissue 0.9.2, signed on 2026-11-06.
 
 ## Checking a bundle signed by CI
 

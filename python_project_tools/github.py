@@ -11,22 +11,12 @@ import binascii
 import dataclasses
 import json
 import pathlib
-import re
 import subprocess
 import tempfile
 import typing
 
-from python_project_tools import common
+from python_project_tools import common, workflow_on
 
-# Ways a workflow file can say it runs on a release event.
-_ON_KEY: str = r'^[ \t]*(?:on|"on"|\'on\'):[ \t]*'
-_RELEASE_TRIGGERS: tuple[re.Pattern[str], ...] = (
-    re.compile(r'^[ \t]*release:[ \t]*(?:\{|#|$)', re.MULTILINE),
-    re.compile(_ON_KEY + r'release[ \t]*(?:#|$)', re.MULTILINE),
-    # Flow styles: on: [push, release] and on: {release: {...}}.
-    re.compile(_ON_KEY + r'\[[^\]]*\brelease\b', re.MULTILINE),
-    re.compile(_ON_KEY + r'\{.*\brelease\b', re.MULTILINE),
-)
 _DISABLED_PREFIX: str = 'disabled'
 
 
@@ -236,11 +226,6 @@ def download_asset(asset: Asset, into: pathlib.Path) -> pathlib.Path:
     return common.fetch_bytes(asset.url, into / asset.name)
 
 
-def _triggers_on_release(text: str) -> bool:
-    """Whether workflow YAML text lists a release event."""
-    return any(pattern.search(text) for pattern in _RELEASE_TRIGGERS)
-
-
 def _workflow_text(repo: str, path: str) -> str | None:
     raw: object | None = common.gh_json(
         ['api', f'repos/{repo}/contents/{path}']
@@ -293,7 +278,7 @@ def release_triggered_workflows(repo: str) -> list[str]:
     names: list[str] = []
     for path in sorted(active_workflow_paths(repo)):
         text: str | None = _workflow_text(repo, path)
-        if text is not None and _triggers_on_release(text):
+        if text is not None and workflow_on.fires_on_release(text):
             names.append(pathlib.PurePosixPath(path).name)
     return names
 

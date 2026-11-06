@@ -111,46 +111,6 @@ def test_workflow_with_tag_trigger_detects_publish(
     assert without == []
 
 
-TAG_PUSH_CASES: list[tuple[str, bool]] = [
-    # The 2020 pattern: a bare push trigger, the tag check inside the job.
-    (
-        'on: push\njobs:\n  publish:\n'
-        "    if: startsWith(github.ref, 'refs/tags')\n",
-        True,
-    ),
-    ('on: [push, pull_request]\n', True),
-    ('on: [pull_request]\n', False),
-    ('on: [pull_request,\n  create]\n', True),
-    ('on: pull_request  # not push\n', False),
-    ('on:\n  push:\n', True),
-    ('on:\n  push:\n    paths: [spam]\n', True),
-    ('on:\n  push:\n    branches: [master]\n', False),
-    ('on:\n  push:\n    branches-ignore: [eggs]\n  pull_request:\n', False),
-    ('on:\n  push:\n    branches: [master]\n    tags: ["v*"]\n', True),
-    ('on:\n  push:\n    tags-ignore: [spam]\n', True),
-    ('on:\n  push:\n    branches:\n    - master\n  release:\n', False),
-    ('on:\n  create:\n', True),
-    ('on:\n  - push\n  - pull_request\n', True),
-    ('on:\n- pull_request\n- create\n', True),
-    ('on:\n  pull_request:\n    branches: [master]\n', False),
-    ('"on":\n  push:\n    branches:\n      - master\njobs: {}\n', False),
-    ('on:\n  push: {branches: [master]}\n', False),
-    ('on:\n  push: {tags: [v1]}\n', True),
-    # A top-level flow map is read loosely: push in it always counts.
-    ('on: {push: {branches: [master]}}\n', True),
-    ('on: {pull_request: {branches: [master]}}\n', False),
-    ('on: {pull_request: {}, create: {}}\n', True),
-    ('on:\n  push:  # all\n    branches: [master]\n    # tags: [v1]\n', False),
-    # No readable on key at all: over-report.
-    ('jobs: {}\n', True),
-]
-
-
-@pytest.mark.parametrize(('text', 'expected'), TAG_PUSH_CASES)
-def test_fires_on_tag_push(text: str, expected: bool) -> None:
-    assert match_tag.fires_on_tag_push(text) is expected
-
-
 def test_workflow_with_tag_trigger_reads_bare_push(
     scratch_repo: ScratchRepo,
 ) -> None:

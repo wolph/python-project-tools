@@ -234,28 +234,6 @@ def test_release_triggered_workflows_reads_active_files(
     assert not any('off.yml' in ' '.join(call) for call in rec.calls)
 
 
-@pytest.mark.parametrize(
-    ('text', 'expected'),
-    [
-        ('on:\n  release:\n    types: [created]\n', True),
-        ('on:\n  release:\n', True),
-        ('on:\n  release: {types: [created]}\n', True),
-        ('on: [push, release]\n', True),
-        ('on: [release]\n', True),
-        ('on: {release: {types: [published]}}\n', True),
-        ('on: {push: {branches: [master]}, release: {}}\n', True),
-        ('"on": {release: null}\n', True),
-        ('on: {push: {branches: [master]}}\n', False),
-        ('on: release\n', True),
-        ('on: release  # publish\n', True),
-        ('on:\n  push:\n', False),
-        ('on:\n  workflow_dispatch:\n# release: later\n', False),
-    ],
-)
-def test_triggers_on_release(text: str, expected: bool) -> None:
-    assert github._triggers_on_release(text) is expected
-
-
 def test_upload_assets_clobber_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     rec: Recorder = Recorder({'gh release upload': completed()})
     monkeypatch.setattr(common, 'run', rec)

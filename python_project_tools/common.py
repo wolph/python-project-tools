@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import http.client
 import json
 import pathlib
 import subprocess
@@ -69,38 +70,56 @@ def _request(url: str) -> urllib.request.Request:
     )
 
 
+def _failure(url: str, error: Exception) -> FetchError:
+    """Wrap a network, protocol or decode error with the url."""
+    if isinstance(error, urllib.error.HTTPError):
+        error.close()
+        return FetchError(f'{url}: HTTP {error.code}')
+    if isinstance(error, urllib.error.URLError):
+        return FetchError(f'{url}: {error.reason}')
+    return FetchError(f'{url}: {error}')
+
+
+_READ_ERRORS: tuple[type[Exception], ...] = (
+    OSError,  # URLError, HTTPError, TimeoutError, ConnectionResetError
+    http.client.HTTPException,  # IncompleteRead and friends
+)
+
+
 def fetch_json(url: str) -> object | None:
     """Fetch a JSON document, or return None when the server says 404.
 
-    Any other failure raises FetchError, so an outage never reads as
-    "not found".
+    Any other failure, including one while reading the body, raises
+    FetchError, so an outage never reads as "not found".
     """
     try:
         with urlopen(_request(url), timeout=FETCH_TIMEOUT) as response:
-            return json.load(response)
+            body: bytes = response.read()
+        return json.loads(body.decode())
     except urllib.error.HTTPError as error:
-        error.close()
         if error.code == 404:
+            error.close()
             return None
-        raise FetchError(f'{url}: HTTP {error.code}') from error
-    except urllib.error.URLError as error:
-        raise FetchError(f'{url}: {error.reason}') from error
-    except (TimeoutError, json.JSONDecodeError) as error:
-        raise FetchError(f'{url}: {error}') from error
+        raise _failure(url, error) from error
+    except (*_READ_ERRORS, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _failure(url, error) from error
 
 
 def fetch_bytes(url: str, into: pathlib.Path) -> pathlib.Path:
-    """Download a url into a file and return the file's path."""
+    """Download a url into a file and return the file's path.
+
+    A failed download removes the partially written file.
+    """
     try:
-        with urlopen(_request(url), timeout=FETCH_TIMEOUT) as response:
-            into.write_bytes(response.read())
-    except urllib.error.HTTPError as error:
-        error.close()
-        raise FetchError(f'{url}: HTTP {error.code}') from error
-    except urllib.error.URLError as error:
-        raise FetchError(f'{url}: {error.reason}') from error
-    except TimeoutError as error:
-        raise FetchError(f'{url}: {error}') from error
+        with (
+            urlopen(_request(url), timeout=FETCH_TIMEOUT) as response,
+            into.open('wb') as handle,
+        ):
+            for chunk in iter(lambda: response.read(CHUNK_SIZE), b''):
+                handle.write(chunk)
+    except _READ_ERRORS as error:
+        into.unlink(missing_ok=True)
+        raise _failure(url, error) from error
     return into
 
 

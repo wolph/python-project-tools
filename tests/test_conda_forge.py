@@ -11,6 +11,9 @@ shapes conda-forge actually uses: a jinja ``meta.yaml`` and a v1
 
 from __future__ import annotations
 
+import argparse
+import pathlib
+
 import pytest
 
 from python_project_tools import common, conda_forge
@@ -389,3 +392,79 @@ def test_conda_forge_is_registered() -> None:
     from python_project_tools import cli
 
     assert cli.COMMANDS['conda-forge'] is conda_forge.main
+
+
+def _down(url: str) -> object:
+    raise common.FetchError('down')
+
+
+def test_sdist_result_fails_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, 'fetch_json', _down)
+    result: common.Result = conda_forge.sdist_result('spam-utils', '0.4.0')
+    assert result.status == 'FAIL'
+    assert result.name == 'sdist'
+    assert 'down' in result.evidence
+
+
+def test_conda_forge_result_fails_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, 'fetch_json', _down)
+    result: common.Result = conda_forge.conda_forge_result(
+        'spam-utils', '0.4.0'
+    )
+    assert result.status == 'FAIL'
+    assert 'down' in result.evidence
+
+
+def test_verify_once_fails_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, 'fetch_json', _down)
+    result: common.Result = conda_forge.verify_once('spam-utils', '0.4.0')
+    assert result.status == 'FAIL'
+    assert 'down' in result.evidence
+
+
+def test_command_status_keeps_going_when_the_mapping_is_down(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pyproject: pathlib.Path = tmp_path / 'other.toml'
+    pyproject.write_text('[project]\nname = "spam-utils"\n')
+    seen: list[str] = []
+
+    def fake_status(
+        repo: str,
+        version: str,
+        package: str,
+        pyproject: dict[str, object],
+        mapping: dict[str, dict[str, str]],
+    ) -> list[common.Result]:
+        seen.append(package)
+        assert mapping == {}
+        return [common.Result(status='PASS', name='feedstock', evidence=repo)]
+
+    monkeypatch.setattr(common, 'fetch_json', _down)
+    monkeypatch.setattr(conda_forge, 'status_feedstock', fake_status)
+    args: argparse.Namespace = argparse.Namespace(
+        package=None,
+        pyproject=str(pyproject),
+        feedstock='conda-forge/spam-utils-feedstock',
+        version='0.4.0',
+        json=None,
+    )
+    assert conda_forge.command_status(args) == 1
+    out: str = capsys.readouterr().out
+    assert seen == ['spam-utils']
+    assert 'mapping' in out
+    assert 'down' in out
+    assert 'feedstock' in out
+
+
+def test_project_name_reads_the_given_pyproject() -> None:
+    assert conda_forge.project_name(PYPROJECT) == 'spam-utils'
+    assert conda_forge.project_name({}) == ''

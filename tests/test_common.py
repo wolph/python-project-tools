@@ -142,3 +142,38 @@ def test_package_name_is_empty_without_name_key(
 ) -> None:
     (tmp_path / 'pyproject.toml').write_text('[project]\nversion = "1"\n')
     assert common.read_package_name(tmp_path) == ''
+
+
+class _FailingResponse(io.BytesIO):
+    """A response that yields one chunk and then fails mid-body."""
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.tell():
+            raise ConnectionResetError('reset')
+        return super().read(size)
+
+
+def test_fetch_json_wraps_read_phase_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake(*args: object, **kwargs: object) -> _FailingResponse:
+        response: _FailingResponse = _FailingResponse(b'x')
+        response.read()
+        return response
+
+    monkeypatch.setattr(common, 'urlopen', fake)
+    with pytest.raises(common.FetchError, match='reset'):
+        common.fetch_json('https://example.invalid/x')
+
+
+def test_fetch_bytes_leaves_no_partial_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake(*args: object, **kwargs: object) -> _FailingResponse:
+        return _FailingResponse(b'partial')
+
+    monkeypatch.setattr(common, 'urlopen', fake)
+    target: pathlib.Path = tmp_path / 'w.whl'
+    with pytest.raises(common.FetchError, match='reset'):
+        common.fetch_bytes('https://example.invalid/w.whl', target)
+    assert not target.exists()

@@ -4,9 +4,11 @@ import argparse
 import sys
 from collections.abc import Callable
 
-from python_project_tools import __version__
+from python_project_tools import __version__, check_compat
 
-COMMANDS: dict[str, Callable[[list[str]], int]] = {}
+COMMANDS: dict[str, Callable[[list[str]], int]] = {
+    'check-compat': check_compat.main,
+}
 
 
 def main(argv: list[str] | None = None) -> int:

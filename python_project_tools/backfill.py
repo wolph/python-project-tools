@@ -11,7 +11,9 @@ tag. The release marked latest on GitHub never changes. GitHub marks the
 first stable release of an empty repository as latest whatever
 ``--latest=false`` says, so a repository with no latest release releases its
 highest stable version first, and a run stops when the latest release is
-anything else after the first release it created. The target is the
+anything else after the first release it created. GitHub can report no
+Latest for a moment after that release, so a missing Latest is read again a
+few times before the run decides. The target is the
 highest stable version that gets a release of its own: a version whose
 commit cannot be matched joins the untagged anchor and the next one down is
 tried, and only a failure after a release was created stops the run. The
@@ -34,6 +36,8 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
+from collections.abc import Callable
 
 from packaging.version import InvalidVersion, Version
 
@@ -87,6 +91,13 @@ FELL_THROUGH: str = 'fell through'
 FAILED_AFTER_CREATING: str = 'failed after creating'
 # Files per sigstore invocation. Each invocation is one browser login.
 SIGSTORE_CHUNK: int = 100
+# GitHub can answer releases/latest with 404 for a moment after the first
+# release of a repository, then with that release. The guard reads Latest
+# this many times at most while it is missing, sleeping in between.
+LATEST_READS: int = 5
+LATEST_READ_INTERVAL: float = 2.0
+# Called through the module attribute so tests can replace it.
+sleep: Callable[[float], None] = time.sleep
 SUMS_DIR: str = 'sums'
 CHANGELOG_NAMES: tuple[str, ...] = (
     'CHANGELOG.rst',
@@ -500,21 +511,48 @@ def _plan_tag(run: _Run, plan: Plan) -> str | None:
     return None
 
 
-def _check_latest_is_target(run: _Run, tag: str) -> None:
-    """Stop unless Latest is the target after the first created release.
+def _read_latest_after(run: _Run, tag: str) -> str | None:
+    """The tag of Latest right after creating ``tag``, or None.
 
-    The target is released first, so Latest must be its tag then. A run
-    without a target expects no Latest at all. A Latest that cannot be read
-    counts as wrong: the run cannot show that it is right.
+    A Latest that cannot be read raises LatestMarkedError: the run cannot
+    show that it is right.
     """
-    expected: str | None = None if run.target is None else run.target.tag
     try:
         latest: github.Release | None = github.latest_release(run.options.repo)
     except (RuntimeError, common.FetchError) as error:
         raise LatestMarkedError(
             f'could not read Latest after creating {tag}: {error}, stopping'
         ) from error
-    actual: str | None = None if latest is None else latest.tag
+    return None if latest is None else latest.tag
+
+
+def _settled_latest(run: _Run, tag: str) -> str | None:
+    """Latest after creating ``tag``, read again while GitHub reports none.
+
+    GitHub can lag a second behind the release it just created, so a
+    missing Latest is read up to LATEST_READS times, LATEST_READ_INTERVAL
+    seconds apart. A Latest that is there is returned at once, right or
+    wrong, so a wrong one is never waited on.
+    """
+    actual: str | None = _read_latest_after(run, tag)
+    for _ in range(LATEST_READS - 1):
+        if actual is not None:
+            break
+        sleep(LATEST_READ_INTERVAL)
+        actual = _read_latest_after(run, tag)
+    return actual
+
+
+def _check_latest_is_target(run: _Run, tag: str) -> None:
+    """Stop unless Latest is the target after the first created release.
+
+    The target is released first, so Latest must be its tag then. A run
+    without a target expects no Latest at all. A Latest that cannot be read
+    counts as wrong: the run cannot show that it is right. The decision is
+    made on the last of the reads ``_settled_latest`` makes.
+    """
+    expected: str | None = None if run.target is None else run.target.tag
+    actual: str | None = _settled_latest(run, tag)
     if actual == expected:
         return
     if expected is None:

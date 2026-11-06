@@ -99,6 +99,7 @@ class World:
         self.tag_keys: list[str] = []
         self.assets: dict[str, bytes] = {}
         self.asset_downloads: list[str] = []
+        self.sleeps: list[float] = []
 
 
 def _sign_release(
@@ -171,6 +172,7 @@ def install(
     )
     monkeypatch.setattr(common, 'run', world.rec)
     monkeypatch.setattr(pypi, 'project', lambda package: world.project)
+    monkeypatch.setattr(backfill, 'sleep', world.sleeps.append)
 
     def download(file: pypi.PypiFile, into: pathlib.Path) -> pathlib.Path:
         world.downloads.append(file.filename)
@@ -1016,10 +1018,12 @@ def test_no_latest_before_and_only_prereleases_marks_nothing(
     world: World = install(monkeypatch, World())
     world.project = project_with({'2.0rc1': files_of('2.0rc1')})
     tagged(world, '2.0rc1')
-    world.latest = [None, None, None]
+    # Before the run, five reads after the first release, after the run.
+    world.latest = [None] * 7
     report: backfill.BackfillReport = backfill.run_backfill(
         'spam', options(tmp_path)
     )
+    assert world.sleeps == [2.0] * 4
     assert world.marked == []
     assert report.latest_target is None
     text: str = backfill.to_markdown(report)
@@ -1742,7 +1746,7 @@ def test_latest_on_an_older_release_after_the_first_stops_the_run(
 def test_no_latest_after_the_first_release_stops_the_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    world: World = run_empty_repo(monkeypatch, [None, None, None])
+    world: World = run_empty_repo(monkeypatch, [None] * 7)
     report: backfill.BackfillReport = backfill.run_backfill(
         'spam', options(tmp_path)
     )
@@ -1752,6 +1756,135 @@ def test_no_latest_after_the_first_release_stops_the_run(
     )
     assert backfill._exit_status(report) == 2
     assert [created[0] for created in world.created] == ['v1.0']
+    # Five reads after the first release, four sleeps between them.
+    assert world.sleeps == [2.0] * 4
+    assert world.latest == []
+
+
+def test_a_latest_that_lags_behind_the_first_release_is_waited_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # Before the run, three reads after the first release, before marking
+    # and after the run.
+    world: World = run_empty_repo(
+        monkeypatch, [None, None, None, 'v1.0', 'v1.0', 'v1.0']
+    )
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not report.stopped
+    assert world.sleeps == [2.0, 2.0]
+    assert [created[0] for created in world.created] == [
+        'v1.0',
+        'v0.1',
+        'v0.2',
+        'v0.9rc1',
+    ]
+    assert world.marked == ['v1.0']
+    assert world.latest == []
+    assert backfill._exit_status(report) == 0
+
+
+def test_a_wrong_latest_after_the_first_release_is_not_waited_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = run_empty_repo(monkeypatch, [None, 'v0.1', 'v0.1'])
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert report.stopped == (
+        'after creating v1.0 GitHub reports Latest v0.1, expected v1.0, '
+        'stopping'
+    )
+    assert world.sleeps == []
+    assert [created[0] for created in world.created] == ['v1.0']
+    assert backfill._exit_status(report) == 2
+
+
+def test_an_unreadable_latest_while_waiting_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = run_empty_repo(monkeypatch, [])
+    answers: list[str | None] = [None, None]
+
+    def latest(repo: str) -> github.Release | None:
+        if not answers:
+            raise RuntimeError('gh is down')
+        tag: str | None = answers.pop(0)
+        return None if tag is None else release(tag)
+
+    monkeypatch.setattr(github, 'latest_release', latest)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert report.stopped.startswith('could not read Latest after creating')
+    assert world.sleeps == [2.0]
+    assert [created[0] for created in world.created] == ['v1.0']
+
+
+def test_a_rerun_fills_the_empty_target_release_a_stopped_run_left(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # The stopped run created v1.0.1 and nothing else, GitHub then marked
+    # it Latest.
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    world.project = project_with({'1.0.1': files_of('1.0.1')})
+    tagged(world, '1.0.1')
+    world.releases = [release('v1.0.1', body='Release 1.0.1.')]
+    world.latest = ['v1.0.1', 'v1.0.1']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.created
+    assert not world.marked
+    sdist: str = 'spam-1.0.1.tar.gz'
+    wheel: str = 'spam-1.0.1-py3-none-any.whl'
+    uploaded: set[str] = {
+        name for _, names in signer.uploads for name in names
+    }
+    assert {tag for tag, _ in signer.uploads} == {'v1.0.1'}
+    assert uploaded == {
+        sdist,
+        wheel,
+        f'{sdist}.asc',
+        f'{wheel}.asc',
+        f'{sdist}.sigstore.json',
+        f'{wheel}.sigstore.json',
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+    }
+    assert len(signer.sigstore_calls) == 1
+    assert signer.edits == ['v1.0.1']
+    assert sign.FOOTER_MARKER in signer.bodies[0]
+    assert signer.bodies[0].startswith('Release 1.0.1.')
+    _, outcome, _ = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'signed'
+    assert backfill._exit_status(report) == 0
+
+
+def test_a_rerun_without_latest_yet_fills_the_empty_target_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # GitHub still reports no Latest: the existing release is the target
+    # and is marked at the end, nothing new is created.
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    world.project = project_with({'1.0.1': files_of('1.0.1')})
+    tagged(world, '1.0.1')
+    world.releases = [release('v1.0.1')]
+    # Before the run, before marking, after the run.
+    world.latest = [None, None, 'v1.0.1']
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert not world.created
+    assert world.marked == ['v1.0.1']
+    assert len(signer.sigstore_calls) == 1
+    assert signer.edits == ['v1.0.1']
+    assert report.latest_target == 'v1.0.1'
+    assert backfill._exit_status(report) == 0
 
 
 def test_a_target_that_fails_before_a_release_falls_through(

@@ -10,4 +10,4 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib  # ty: ignore[import-not-found]
 
-__all__ = ['tomllib']
+__all__: list[str] = ['tomllib']

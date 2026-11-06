@@ -122,6 +122,7 @@ def manifest_of(root: pathlib.Path) -> dict[str, object]:
         [
             sys.executable,
             '-I',
+            '-S',
             api_manifest.__file__,
             '--path',
             str(root),
@@ -382,6 +383,29 @@ def test_unpack_sdist_refuses_without_data_filter(
     with tarfile.open(archive, 'w') as tar:
         tar.add(payload, arcname='spam.txt')
     monkeypatch.delattr(tarfile, 'data_filter', raising=False)
-    with pytest.raises(RuntimeError, match='data_filter'):
+    with pytest.raises(check_compat.SetupError, match='data_filter'):
         check_compat.unpack_sdist(archive, tmp_path / 'out')
     assert not (tmp_path / 'out').exists()
+
+
+def test_manifest_runs_isolated_without_site_packages(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    def fake_must(
+        cmd: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout='{}', stderr='')
+
+    monkeypatch.setattr(check_compat, 'must', fake_must)
+    result: dict[str, object] = check_compat.manifest(
+        pathlib.Path(sys.executable), tmp_path, ['spamlib']
+    )
+    assert result == {}
+    argv: list[str] = captured[0]
+    assert '-I' in argv
+    assert '-S' in argv
+    assert api_manifest.__file__ in argv

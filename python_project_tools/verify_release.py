@@ -30,6 +30,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from python_project_tools.toml_compat import tomllib
 
@@ -439,12 +440,7 @@ def main(argv: list[str]) -> int:
     if 'install' not in skip and 'pypi' not in skip:
         results.append(check_install(package, args.version, import_name))
     if 'conda' not in skip:
-        results.append(
-            poll(
-                args.wait,
-                lambda: check_conda(package, args.version, args.conda_name),
-            )
-        )
+        results.append(check_conda(package, args.version, args.conda_name))
 
     width: int = max(len(result.name) for result in results)
     for result in results:
@@ -455,6 +451,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == '__main__':
-    from collections.abc import Callable  # noqa: F401  (used in annotations)
-
     sys.exit(main(sys.argv[1:]))

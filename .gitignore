@@ -21,7 +21,7 @@ dist/
 .coverage.*
 htmlcov/
 
-# uv (deps intentionally unlocked — always test newest)
+# uv (deps intentionally unlocked, always test newest)
 uv.lock
 
 # Editors / local
@@ -35,3 +35,6 @@ uv.lock
 .superpowers/
 .worktrees/
 docs/_build/
+
+# Global gitignores may hide plan documents
+!docs/superpowers/

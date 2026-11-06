@@ -107,7 +107,7 @@ def fetch(url: str, dest: pathlib.Path | None = None) -> bytes | None:
 def unpack_sdist(archive: pathlib.Path, destination: pathlib.Path) -> None:
     """Extract an sdist, refusing to do so without the safe ``data`` filter."""
     if not hasattr(tarfile, 'data_filter'):
-        raise RuntimeError(
+        raise SetupError(
             'check-compat needs tarfile.data_filter (Python 3.10.12, '
             '3.11.4 or later) to unpack sdists safely',
         )
@@ -319,6 +319,7 @@ def manifest(
         [
             str(python),
             '-I',
+            '-S',
             str(pathlib.Path(api_manifest.__file__)),
             '--path',
             str(target),

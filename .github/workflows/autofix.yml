@@ -7,7 +7,7 @@
 # Pull requests only. The gate in ci.yml already checks every push to
 # develop and master, so a push run here would buy nothing except an
 # automated write to a release branch by the output of a tool resolved
-# at run time (security audit run-2, finding 1). The ruff the fixer runs
+# at run time, which nobody reviewed beforehand. The ruff the fixer runs
 # is pinned in tox.toml for the same reason.
 #
 # The filename and the workflow name are both fixed by autofix.ci, which

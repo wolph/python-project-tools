@@ -1073,7 +1073,7 @@ def status_feedstock(
             Result(
                 'INFO',
                 'bot-pr',
-                f'#{pr.number} {pr.title} ({pr.created}): {pr_checks(repo, pr.number)}; {pr.url}',  # noqa: E501
+                f'#{pr.number} {pr.title} ({pr.created}): {pr_checks(repo, pr.number)}, {pr.url}',  # noqa: E501
             )
         )
     if not mine:
@@ -1087,7 +1087,7 @@ def status_feedstock(
             Result(
                 'WARN',
                 'stale-pr',
-                f'#{pr.number} {pr.title} is behind main ({recipe.version}); more than three open bot PRs stop the bot',  # noqa: E501
+                f'#{pr.number} {pr.title} is behind main ({recipe.version}), and more than three open bot PRs stop the bot',  # noqa: E501
             )
         )
     for title in others:

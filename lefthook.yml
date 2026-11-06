@@ -2,7 +2,7 @@
 #  parallel: true
 
 templates:
-  ruff: 'uvx ruff'
+  ruff: 'uvx ruff@0.15.18'
 
 pre-commit:
   parallel: true

@@ -60,3 +60,55 @@ def test_package_flag_works_without_pyproject(
         'pypi,github,stable,docs,install,conda',
     ]
     assert verify_release.main(argv) == 0
+
+
+def test_poll_annotation_resolves() -> None:
+    import typing
+
+    hints: dict[str, object] = typing.get_type_hints(verify_release.poll)
+    assert 'probe' in hints
+
+
+def test_conda_candidates_from_package_name() -> None:
+    names: list[str] = verify_release.conda_candidates('Spam_Eggs.Ham', None)
+    assert names == ['spam_eggs.ham', 'spam-eggs.ham', 'spameggsham']
+
+
+def test_conda_candidates_deduplicates() -> None:
+    assert verify_release.conda_candidates('spam', None) == ['spam']
+
+
+def test_conda_candidates_prefers_conda_name() -> None:
+    assert verify_release.conda_candidates('spam_eggs', 'eggs') == ['eggs']
+
+
+def test_check_conda_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        verify_release,
+        'fetch_json',
+        lambda url: {'versions': ['1.0.0', '1.1.0']},
+    )
+    result: verify_release.Result = verify_release.check_conda(
+        'spam', '1.1.0', None
+    )
+    assert result.status == 'PASS'
+    assert '1.1.0' in result.evidence
+
+
+def test_check_conda_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        verify_release, 'fetch_json', lambda url: {'versions': ['1.0.0']}
+    )
+    result: verify_release.Result = verify_release.check_conda(
+        'spam', '1.1.0', None
+    )
+    assert result.status == 'FAIL'
+    assert 'latest is 1.0.0' in result.evidence
+
+
+def test_check_conda_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verify_release, 'fetch_json', lambda url: None)
+    result: verify_release.Result = verify_release.check_conda(
+        'spam', '1.1.0', None
+    )
+    assert result.status == 'SKIP'

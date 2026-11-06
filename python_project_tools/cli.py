@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from python_project_tools import (
     __version__,
+    backfill,
     check_compat,
     conda_forge,
     inventory,
@@ -15,6 +16,7 @@ from python_project_tools import (
 )
 
 COMMANDS: dict[str, Callable[[list[str]], int]] = {
+    'backfill': backfill.main,
     'check-compat': check_compat.main,
     'conda-forge': conda_forge.main,
     'inventory': inventory.main,

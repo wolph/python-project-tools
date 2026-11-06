@@ -90,6 +90,8 @@ class World:
         self.rec: Recorder = Recorder({})
         self.repo_meta: object | None = {'archived': False}
         self.marked: list[str] = []
+        # Create and mark calls in the order they happened.
+        self.events: list[str] = []
         self.release_workflows: list[str] = []
         self.release_shas: list[str] = []
         self.disabled: set[str] = set()
@@ -125,6 +127,7 @@ def _create_release(
     prerelease: bool,
 ) -> github.Release:
     world.created.append((tag, title, notes, prerelease))
+    world.events.append(f'create {tag}')
     return release(tag)
 
 
@@ -238,9 +241,12 @@ def install_github(monkeypatch: pytest.MonkeyPatch, world: World) -> None:
         return target
 
     monkeypatch.setattr(common, 'gh_json', gh_json)
-    monkeypatch.setattr(
-        github, 'mark_latest', lambda repo, tag: world.marked.append(tag)
-    )
+
+    def mark_latest(repo: str, tag: str) -> None:
+        world.marked.append(tag)
+        world.events.append(f'mark {tag}')
+
+    monkeypatch.setattr(github, 'mark_latest', mark_latest)
     monkeypatch.setattr(
         github, 'disabled_workflow_paths', lambda repo: set(world.disabled)
     )
@@ -974,7 +980,9 @@ def test_no_latest_before_releases_the_highest_stable_first(
         'v1.2rc1',
         'v1.3',
     ]
-    assert world.marked == []
+    # Pinned once right after the first release, before the second.
+    assert world.marked == ['v1.1']
+    assert world.events[:3] == ['create v1.1', 'mark v1.1', 'create v1.0']
     printed: str = capsys.readouterr().out
     assert 'Latest before: none, after: v1.1, target: v1.1' in printed
     assert printed.rstrip().endswith('OK')
@@ -988,12 +996,12 @@ def test_no_latest_before_and_latest_elsewhere_after_is_changed(
         {'1.0': files_of('1.0'), '1.1': files_of('1.1')}
     )
     tagged(world, '1.0', '1.1')
-    # Latest moved off the target after the guard, so it is marked again.
+    # Latest moved off the target after the pin, so it is marked again.
     world.latest = [None, 'v1.1', 'v1.0', 'v1.0']
     report: backfill.BackfillReport = backfill.run_backfill(
         'spam', options(tmp_path)
     )
-    assert world.marked == ['v1.1']
+    assert world.marked == ['v1.1', 'v1.1']
     assert report.latest_target == 'v1.1'
     assert backfill.to_markdown(report).rstrip().endswith('CHANGED')
     assert backfill._exit_status(report) == 1
@@ -1407,7 +1415,8 @@ def test_an_empty_repository_releases_the_target_first(
         'v0.2',
         'v0.9rc1',
     ]
-    assert world.marked == []
+    assert world.marked == ['v1.0']
+    assert world.events[:3] == ['create v1.0', 'mark v1.0', 'create v0.1']
     assert world.latest == []
     printed: str = capsys.readouterr().out
     assert 'Latest before: none, after: v1.0, target: v1.0' in printed
@@ -1427,7 +1436,7 @@ def test_a_target_without_a_tag_is_tagged_and_accepted_as_latest(
     assert world.created[0][0] == 'v1.0'
     assert not report.stopped
     assert report.latest_target == 'v1.0'
-    assert world.marked == []
+    assert world.marked == ['v1.0']
 
 
 def test_latest_on_an_older_release_after_the_first_stops_the_run(
@@ -1515,7 +1524,8 @@ def test_a_target_failing_after_its_release_stops_the_run(
     assert f'Stopped: {reason}' in captured.out
     assert [created[0] for created in world.created] == ['v1.0']
     assert not world.new_tags
-    assert not world.marked
+    # The pin ran before the target failed.
+    assert world.marked == ['v1.0']
     lines: list[str] = [
         line for line in captured.out.splitlines() if line.startswith('| ')
     ]
@@ -1570,7 +1580,12 @@ def test_untagged_candidates_fall_through_and_join_the_anchor(
     assert [signed[0].tag for signed in world.signed] == expected
     assert world.rebuilt == ['v0.2.1', 'v0.1', 'v0.1.1', 'v0.2']
     assert world.downloads == ['spam-0.2.2.tar.gz']
-    assert world.marked == []
+    assert world.marked == ['v0.2.1']
+    assert world.events[:3] == [
+        'create v0.2.1',
+        'mark v0.2.1',
+        'create v0.1',
+    ]
     assert world.latest == []
     printed: str = capsys.readouterr().out
     rows: list[str] = [
@@ -1616,7 +1631,7 @@ def test_no_candidate_with_a_commit_makes_the_anchor_the_target(
     assert backfill.main(['spam', '--checkout', str(tmp_path)]) == 0
     assert [created[0] for created in world.created] == [anchor]
     assert world.pushed == [anchor]
-    assert world.marked == []
+    assert world.marked == [anchor]
     printed: str = capsys.readouterr().out
     assert f'Latest before: none, after: {anchor}, target: {anchor}' in printed
     assert printed.rstrip().endswith('OK')

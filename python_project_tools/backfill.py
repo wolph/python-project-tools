@@ -510,6 +510,26 @@ def _check_latest_is_target(run: _Run, tag: str) -> None:
     )
 
 
+def _pin_latest_target(run: _Run) -> None:
+    """Mark the target Latest explicitly once the guard accepted it.
+
+    The automatic first Latest is recomputed by GitHub from release dates
+    and versions, so a later release made with --latest=false can still
+    take it over, for example when old tags meet a new anchor tag. An
+    explicit mark pins it. A run without a target has nothing to pin.
+    """
+    if run.target is None or run.target.tag is None:
+        return
+    tag: str = run.target.tag
+    try:
+        github.mark_latest(run.options.repo, tag)
+    except (RuntimeError, common.FetchError) as error:
+        raise LatestMarkedError(
+            f'could not pin {tag} as Latest after creating it: {error}, '
+            'stopping'
+        ) from error
+
+
 def _create_release(
     run: _Run, tag: str, title: str, notes: str, prerelease: bool
 ) -> github.Release:
@@ -528,6 +548,7 @@ def _create_release(
     run.created_any = True
     if first and run.latest_before is None:
         _check_latest_is_target(run, tag)
+        _pin_latest_target(run)
     return created
 
 

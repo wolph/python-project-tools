@@ -189,6 +189,32 @@ def test_main_match_without_create_exits_zero(
     assert git(scratch_repo.path, 'tag', '--list') == ''
 
 
+def test_main_refuses_an_existing_tag(
+    scratch_repo: ScratchRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(scratch_repo.path, 'tag', 'v1.1', scratch_repo.shas[0])
+    fake_pypi(monkeypatch, scratch_repo, scratch_repo.shas[1])
+    created: list[str] = []
+    monkeypatch.setattr(
+        match_tag,
+        'create_tag',
+        lambda checkout, tag, sha, msg: created.append(tag),
+    )
+    argv: list[str] = [
+        'spam',
+        '1.1',
+        '--checkout',
+        str(scratch_repo.path),
+        '--create',
+    ]
+    assert match_tag.main(argv) == 1
+    err: str = capsys.readouterr().err
+    assert f'tag v1.1 already exists at {scratch_repo.shas[0]}' in err
+    assert created == []
+
+
 def test_main_without_sdist_exits_one(
     scratch_repo: ScratchRepo,
     monkeypatch: pytest.MonkeyPatch,

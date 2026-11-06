@@ -59,7 +59,8 @@ class Candidate:
 
 def _git(checkout: pathlib.Path, *args: str) -> str:
     """Run git in the checkout and return stdout, raising on failure."""
-    done = common.run(['git', *args], cwd=checkout)
+    # quotepath=off keeps non-ASCII paths unquoted so they match sdist names.
+    done = common.run(['git', '-c', 'core.quotepath=off', *args], cwd=checkout)
     if done.returncode != 0:
         raise RuntimeError(f'git {" ".join(args)}: {done.stderr.strip()}')
     return done.stdout
@@ -260,6 +261,16 @@ def _tag_and_push(
     args: argparse.Namespace, best: Candidate, sdist: pypi.PypiFile
 ) -> int:
     tag: str = versions.tag_for(args.version)
+    existing = common.run(
+        ['git', 'rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'],
+        cwd=args.checkout,
+    )
+    if existing.returncode == 0:
+        say(
+            f'tag {tag} already exists at {existing.stdout.strip()}',
+            file=sys.stderr,
+        )
+        return 1
     if args.push:
         flows: list[str] = workflow_with_tag_trigger(args.checkout, best.sha)
         if flows and not args.allow_workflow_trigger:

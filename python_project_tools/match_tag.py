@@ -180,7 +180,7 @@ def compare(
     stamp: str = _git(checkout, 'show', '-s', '--format=%cI', sha).strip()
     return Candidate(
         sha=sha,
-        committed=dt.datetime.fromisoformat(stamp),
+        committed=common.parse_iso_datetime(stamp),
         matched=matched,
         differing=differing,
     )

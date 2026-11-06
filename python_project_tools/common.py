@@ -10,6 +10,7 @@ on ``common`` will not reach the caller.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import http.client
 import json
@@ -27,6 +28,21 @@ urlopen = urllib.request.urlopen
 USER_AGENT: str = 'python-project-tools'
 FETCH_TIMEOUT: int = 60
 CHUNK_SIZE: int = 1 << 20
+
+
+def parse_iso_datetime(value: str) -> dt.datetime:
+    """Parse an ISO 8601 timestamp into an aware UTC datetime.
+
+    Python 3.10's fromisoformat rejects the trailing Z that git and PyPI
+    print for UTC, so it is rewritten to +00:00 first. A naive value is
+    taken as UTC and an offset value is converted to UTC.
+    """
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    parsed: dt.datetime = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 @dataclasses.dataclass

@@ -56,13 +56,8 @@ class Project:
 
 
 def _parse_time(value: str) -> dt.datetime:
-    """Parse an ISO 8601 timestamp, accepting a trailing Z on Python 3.10."""
-    if value.endswith('Z'):
-        value = value[:-1] + '+00:00'
-    parsed: dt.datetime = dt.datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc)
+    """Parse an ISO 8601 timestamp, see common.parse_iso_datetime."""
+    return common.parse_iso_datetime(value)
 
 
 def _parse_file(raw: dict[str, object]) -> PypiFile:

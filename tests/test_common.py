@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import email.message
 import hashlib
 import io
@@ -212,3 +213,24 @@ def test_fetch_bytes_leaves_no_partial_file(
     with pytest.raises(common.FetchError, match='reset'):
         common.fetch_bytes('https://example.invalid/w.whl', target)
     assert not target.exists()
+
+
+def test_parse_iso_datetime_accepts_z_suffix() -> None:
+    parsed: dt.datetime = common.parse_iso_datetime('2026-11-06T12:36:06Z')
+    assert parsed == dt.datetime(
+        2026, 11, 6, 12, 36, 6, tzinfo=dt.timezone.utc
+    )
+
+
+def test_parse_iso_datetime_converts_offset_to_utc() -> None:
+    parsed: dt.datetime = common.parse_iso_datetime(
+        '2026-11-06T12:00:00+02:00'
+    )
+    assert parsed.hour == 10
+    assert parsed.utcoffset() == dt.timedelta(0)
+
+
+def test_parse_iso_datetime_naive_gets_utc() -> None:
+    parsed: dt.datetime = common.parse_iso_datetime('2026-11-06T12:00:00')
+    assert parsed.tzinfo == dt.timezone.utc
+    assert parsed.hour == 12

@@ -7,6 +7,7 @@ import dataclasses
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -17,13 +18,19 @@ def gnupg_home(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> collections.abc.Iterator[str]:
     """A throwaway GNUPGHOME with one ed25519 key, yielding its fingerprint."""
+    if sys.platform == 'win32':
+        pytest.skip(
+            'gpg-agent sockets are not reliable on the Windows runners'
+        )
+    if shutil.which('gpg') is None:
+        pytest.skip('gpg unusable here: gpg is not installed')
     # gpg-agent sockets live under GNUPGHOME and unix socket paths cap at
     # about 104 bytes, which pytest's tmp_path on macOS already exceeds.
     # mkdtemp gives a short directory with mode 0o700.
     home: pathlib.Path = pathlib.Path(tempfile.mkdtemp(prefix='ppt-gpg-'))
     try:
         monkeypatch.setenv('GNUPGHOME', str(home))
-        subprocess.run(
+        generated: subprocess.CompletedProcess[str] = subprocess.run(
             [
                 'gpg',
                 '--batch',
@@ -35,18 +42,23 @@ def gnupg_home(
                 'sign',
                 '1d',
             ],
-            check=True,
-            capture_output=True,
-        )
-        listing: str = subprocess.run(
-            ['gpg', '--batch', '--list-secret-keys', '--with-colons'],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
-        ).stdout
+        )
+        if generated.returncode != 0:
+            pytest.skip(f'gpg unusable here: {generated.stderr.strip()}')
+        listed: subprocess.CompletedProcess[str] = subprocess.run(
+            ['gpg', '--batch', '--list-secret-keys', '--with-colons'],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if listed.returncode != 0:
+            pytest.skip(f'gpg unusable here: {listed.stderr.strip()}')
         fingerprint: str = next(
             line.split(':')[9]
-            for line in listing.splitlines()
+            for line in listed.stdout.splitlines()
             if line.startswith('fpr:')
         )
         yield fingerprint

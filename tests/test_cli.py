@@ -47,3 +47,24 @@ def test_registered_command_receives_remaining_argv() -> None:
     finally:
         del cli.COMMANDS['fake']
     assert seen == [['--x', '1']]
+
+
+@pytest.mark.parametrize(
+    'rest',
+    [['--help'], ['--version', '-x'], ['-h'], ['--ver']],
+)
+def test_flags_after_command_are_forwarded_untouched(
+    rest: list[str],
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake(argv: list[str]) -> int:
+        seen.append(argv)
+        return 3
+
+    cli.COMMANDS['fake'] = fake
+    try:
+        assert cli.main(['fake', *rest]) == 3
+    finally:
+        del cli.COMMANDS['fake']
+    assert seen == [rest]

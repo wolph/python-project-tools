@@ -131,3 +131,30 @@ def test_download_rejects_sha256_mismatch(
     with pytest.raises(pypi.IntegrityError):
         pypi.download(_file(sha256='0' * 64), tmp_path)
     assert list(tmp_path.iterdir()) == []  # the bad file is removed
+
+
+def test_repo_overrides_table_is_exact() -> None:
+    assert pypi.REPO_OVERRIDES == {
+        'numpy-stl': 'WoLpH/numpy-stl',
+        'portalocker': 'WoLpH/portalocker',
+        'progressbar2': 'WoLpH/python-progressbar',
+    }
+
+
+def test_parse_time_converts_to_utc() -> None:
+    aware: dt.datetime = pypi._parse_time('2024-01-02T05:00:00+02:00')
+    assert aware.hour == 3
+    assert aware.utcoffset() == dt.timedelta(0)
+    naive: dt.datetime = pypi._parse_time('2024-01-02T05:00:00')
+    assert naive.tzinfo == dt.timezone.utc
+    assert naive.hour == 5
+
+
+def test_download_creates_missing_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body: bytes = b'sdist bytes'
+    monkeypatch.setattr(common, 'fetch_bytes', _writing(body))
+    good: pypi.PypiFile = _file(sha256=hashlib.sha256(body).hexdigest())
+    result: pathlib.Path = pypi.download(good, tmp_path / 'a' / 'b')
+    assert result.read_bytes() == body

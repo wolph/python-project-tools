@@ -19,7 +19,9 @@ GITHUB_REPO: re.Pattern[str] = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)')
 
 # Projects whose PyPI metadata does not point at the right repository.
 REPO_OVERRIDES: dict[str, str] = {
+    'numpy-stl': 'WoLpH/numpy-stl',
     'portalocker': 'WoLpH/portalocker',
+    'progressbar2': 'WoLpH/python-progressbar',
 }
 
 # Metadata fields scanned for a repository url, in order of preference.
@@ -57,7 +59,10 @@ def _parse_time(value: str) -> dt.datetime:
     """Parse an ISO 8601 timestamp, accepting a trailing Z on Python 3.10."""
     if value.endswith('Z'):
         value = value[:-1] + '+00:00'
-    return dt.datetime.fromisoformat(value)
+    parsed: dt.datetime = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def _parse_file(raw: dict[str, object]) -> PypiFile:
@@ -133,6 +138,7 @@ def download(file: PypiFile, into: pathlib.Path) -> pathlib.Path:
 
     A mismatching file is deleted and IntegrityError is raised.
     """
+    into.mkdir(parents=True, exist_ok=True)
     target: pathlib.Path = common.fetch_bytes(file.url, into / file.filename)
     got: str = common.sha256_of(target)
     expected: str = file.sha256

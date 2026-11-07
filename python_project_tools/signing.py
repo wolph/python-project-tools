@@ -7,6 +7,7 @@ Pure mechanics with no policy. Every subprocess goes through
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import shlex
 import subprocess
@@ -23,9 +24,9 @@ SIGSTORE_ARGV: list[str] = ['uvx', '--from', 'sigstore==4.5.1', 'python', '-I']
 SIGNER_SCRIPT: pathlib.Path = pathlib.Path(sigstore_signer.__file__)
 SHA256SUMS_NAME: str = 'SHA256SUMS'
 BUNDLE_SUFFIX: str = '.sigstore.json'
-# The OIDC login waits for a browser callback that may never come.
-SIGSTORE_TIMEOUT_SECONDS: int = 900
-# On top of the login: the signer paces and backs off per file.
+# On top of the logins: the signer paces and backs off per file. Each
+# login waits sigstore_signer.LOGIN_WAIT_SECONDS for the browser, and a run
+# has sigstore_signer.MAX_LOGINS of them at most.
 SIGSTORE_SECONDS_PER_FILE: int = 6
 SIGSTORE_TIMEOUT_MESSAGE: str = (
     'sigstore did not finish within {seconds} s, the browser login never '
@@ -33,7 +34,11 @@ SIGSTORE_TIMEOUT_MESSAGE: str = (
 )
 # Exit statuses of the signer that leave the bundles so far in place.
 SIGSTORE_PARTIAL_EXITS: frozenset[int] = frozenset(
-    {sigstore_signer.EXIT_TOKEN_EXPIRED, sigstore_signer.EXIT_RATE_LIMITED}
+    {
+        sigstore_signer.EXIT_TOKEN_EXPIRED,
+        sigstore_signer.EXIT_RATE_LIMITED,
+        sigstore_signer.EXIT_NO_LOGIN,
+    }
 )
 SIGSTORE_LOGIN_NOTICE: str = (
     'ppt: Sigstore login needed, a browser tab opens for {count} files'
@@ -189,8 +194,15 @@ def bundle_covers(path: pathlib.Path) -> bool:
 
 
 def sigstore_timeout(count: int) -> int:
-    """Seconds a signer run of ``count`` files gets: the login plus pacing."""
-    return SIGSTORE_TIMEOUT_SECONDS + count * SIGSTORE_SECONDS_PER_FILE
+    """Seconds a signer run of ``count`` files gets: every login, pacing.
+
+    The signer stops a login that waits too long itself, so this is the
+    backstop for a signer that hangs anywhere else.
+    """
+    logins: float = (
+        sigstore_signer.MAX_LOGINS * sigstore_signer.LOGIN_WAIT_SECONDS
+    )
+    return math.ceil(logins) + count * SIGSTORE_SECONDS_PER_FILE
 
 
 def _write_manifest(target: pathlib.Path, paths: list[pathlib.Path]) -> None:
@@ -225,16 +237,16 @@ def _signer_argv(manifest: pathlib.Path, status: pathlib.Path) -> list[str]:
 
 
 def _sigstore_run(paths: list[pathlib.Path]) -> None:
-    """One signer run for all ``paths``, so one browser login.
+    """One signer run for all ``paths``, one browser login per token.
 
     Output is not captured, so the browser prompt and the fallback URL of
     the OIDC flow reach the terminal. A notice on stderr comes first, so
-    whoever watches a log knows a person is needed. A run still going
-    after ``sigstore_timeout`` is stopped and raises RuntimeError: a login
-    callback that never arrives would otherwise keep it listening forever.
-    An expired token or a rate limit raises RuntimeError with the signer's
-    message, any other failure SigningError. Bundles written before a
-    failure stay next to their files.
+    whoever watches a log knows a person is needed, and the signer prints
+    one of its own before each later login. A run still going after
+    ``sigstore_timeout`` is stopped and raises RuntimeError. A run out of
+    logins, a rate limit or a login that never arrived raises RuntimeError
+    with the signer's message, any other failure SigningError. Bundles
+    written before a failure stay next to their files.
     """
     print(  # noqa: T201
         SIGSTORE_LOGIN_NOTICE.format(count=len(paths)),

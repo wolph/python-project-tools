@@ -11,7 +11,7 @@ import typing
 
 import pytest
 
-from python_project_tools import common, signing
+from python_project_tools import common, signing, sigstore_signer
 from tests.fakes import completed, covering_bundle
 
 needs_gpg = pytest.mark.skipif(
@@ -144,8 +144,15 @@ def test_sigstore_sign_runs_the_signer_once_with_a_manifest(
             for path in paths
         ]
     ]
-    # Login time plus three seconds per file.
-    assert fake.timeouts == [900 + 3 * 6]
+    # Every login the signer may wait for, plus six seconds per file.
+    assert (
+        sigstore_signer.MAX_LOGINS,
+        sigstore_signer.LOGIN_WAIT_SECONDS,
+    ) == (
+        6,
+        900,
+    )
+    assert fake.timeouts == [6 * 900 + 3 * 6]
     assert out == [signing.bundle_path(path) for path in paths]
     assert all(signing.bundle_covers(path) for path in paths)
     # The manifest lived in a temporary directory that is gone.
@@ -160,7 +167,7 @@ def test_sigstore_sign_lists_a_repeated_file_once(
     (wheel,) = wheels('a.whl', root=tmp_path)
     out: list[pathlib.Path] = signing.sigstore_sign([wheel, wheel])
     assert [entry['input'] for entry in fake.manifests[0]] == [str(wheel)]
-    assert fake.timeouts == [906]
+    assert fake.timeouts == [5406]
     assert out == [signing.bundle_path(wheel)] * 2
 
 
@@ -191,9 +198,14 @@ def test_sigstore_sign_raises_when_bundle_missing(
             'the rest',
         ),
         (4, 'rate limited by sigstore after 1 of 2 files, run again later'),
+        (
+            5,
+            'no login within 900 s after 1 of 2 files, run again to sign '
+            'the rest',
+        ),
     ],
 )
-def test_an_expired_token_or_a_rate_limit_is_a_runtime_error(
+def test_an_expired_token_a_rate_limit_or_no_login_is_a_runtime_error(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     returncode: int,
@@ -386,10 +398,10 @@ def test_sigstore_sign_times_out_with_a_clear_error(
     with pytest.raises(RuntimeError) as raised:
         signing.sigstore_sign(wheels('a.whl', 'b.whl', root=tmp_path))
     assert str(raised.value) == (
-        'sigstore did not finish within 912 s, the browser login never '
+        'sigstore did not finish within 5412 s, the browser login never '
         'completed or signing ran out of time'
     )
-    assert seen == [912]
+    assert seen == [5412]
     assert capsys.readouterr().err == (
         'ppt: Sigstore login needed, a browser tab opens for 2 files\n'
     )

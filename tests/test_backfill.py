@@ -1505,6 +1505,8 @@ def test_a_stopped_signer_still_finishes_the_releases_it_covered(
     )
     assert len(calls) == 1
     assert len(calls[0]) == 6
+    # v1.2 gets the bundle of its sdist, not the foreign one of its wheel,
+    # and neither v1.1 nor v1.2 gets the footer.
     assert signer.bundle_uploads() == [
         (
             'v1.0',
@@ -1512,7 +1514,8 @@ def test_a_stopped_signer_still_finishes_the_releases_it_covered(
                 'spam-1.0.tar.gz.sigstore.json',
                 'spam-1.0-py3-none-any.whl.sigstore.json',
             ],
-        )
+        ),
+        ('v1.2', ['spam-1.2.tar.gz.sigstore.json']),
     ]
     assert signer.edits == ['v1.0']
     outcomes: dict[str, sign.SignOutcome] = {
@@ -1521,8 +1524,71 @@ def test_a_stopped_signer_still_finishes_the_releases_it_covered(
     assert outcomes['1.0'].status == 'signed'
     for version in ('1.1', '1.2'):
         assert outcomes[version].status == 'failed'
-        assert outcomes[version].reason == f'sigstore failed: {message}'
+    assert outcomes['1.1'].reason == f'sigstore failed: {message}'
+    assert outcomes['1.2'].reason == (
+        f'1 of 2 bundles uploaded, sigstore failed: {message}'
+    )
     assert backfill.exit_status(report) == 1
+
+
+def test_a_partly_signed_release_keeps_its_bundles_for_the_next_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=True)
+    interrupted(world)
+    message: str = (
+        'identity token expired after 1 of 2 files, run again to sign the rest'
+    )
+
+    def stopped(paths: list[pathlib.Path]) -> list[pathlib.Path]:
+        signer.sigstore_calls.append(list(paths))
+        for path in paths:
+            if path.name == SDIST:
+                signing.bundle_path(path).write_text(covering_bundle(path))
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(signing, 'sigstore_sign', stopped)
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert [[p.name for p in call] for call in signer.sigstore_calls] == [
+        [SDIST, WHEEL]
+    ]
+    assert signer.uploads == [('v1.0', [f'{SDIST}.sigstore.json'])]
+    assert signer.edits == []
+    _, outcome, _ = report.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'failed'
+    assert outcome.reason == (
+        f'1 of 2 bundles uploaded, sigstore failed: {message}'
+    )
+    assert backfill.markdown_cell(outcome.reason).startswith(
+        '1 of 2 bundles uploaded'
+    )
+    assert backfill.exit_status(report) == 1
+
+    # The next run finds the sdist bundle on the release and signs the
+    # wheel only, then the release is complete and gets its footer.
+    world.assets[f'{SDIST}.sigstore.json'] = b'bundle'
+    world.releases[0].assets = signed_assets(*sorted(world.assets))
+    signer.sigstore_calls.clear()
+    signer.uploads.clear()
+    world.latest = ['v1.0', 'v1.0']
+    monkeypatch.setattr(signing, 'sigstore_sign', signer.sigstore_sign)
+    again: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    assert [[p.name for p in call] for call in signer.sigstore_calls] == [
+        [WHEEL]
+    ]
+    assert signer.uploads == [('v1.0', [f'{WHEEL}.sigstore.json'])]
+    assert signer.edits == ['v1.0']
+    _, outcome, _ = again.rows[0]
+    assert outcome is not None
+    assert outcome.status == 'signed'
+    assert backfill.exit_status(again) == 0
 
 
 SDIST: str = 'spam-1.0.tar.gz'

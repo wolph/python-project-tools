@@ -9,7 +9,7 @@ import typing
 import pytest
 
 from python_project_tools import cli, common, github, pypi, sign, signing
-from tests.fakes import Recorder
+from tests.fakes import Recorder, covering_bundle
 
 WHL_BYTES: bytes = b'wheel bytes'
 SDIST_BYTES: bytes = b'sdist bytes'
@@ -476,6 +476,62 @@ def test_finish_pending_fails_without_bundles(
     assert 'sigstore wrote no bundle' in done.reason
     assert len(world.uploads) == uploads
     assert world.edits == []
+
+
+def test_salvage_pending_uploads_only_the_covering_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    options.sigstore_later = True
+    target: github.Release = release([])
+    out: sign.SignOutcome = sign.sign_release(target, files, tmp_path, options)
+    whl, sdist = out.pending_bundles
+    signing.bundle_path(whl).write_text(covering_bundle(whl))
+    # A bundle of other bytes is not this file's and stays behind.
+    signing.bundle_path(sdist).write_text(covering_bundle(whl))
+    uploads: int = len(world.uploads)
+    done: sign.SignOutcome = sign.salvage_pending(
+        target, out, options, 'login cancelled'
+    )
+    assert done.status == 'failed'
+    assert done.reason == (
+        '1 of 2 bundles uploaded, sigstore failed: login cancelled'
+    )
+    assert world.uploads[uploads:] == [Upload(['s.whl.sigstore.json'], False)]
+    assert 's.whl.sigstore.json' in done.uploaded
+    assert done.pending_bundles == [sdist]
+    assert world.edits == []
+
+
+def test_salvage_pending_reports_a_failed_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    install(monkeypatch)
+    options.sigstore_later = True
+    target: github.Release = release([])
+    out: sign.SignOutcome = sign.sign_release(target, files, tmp_path, options)
+    for path in out.pending_bundles:
+        signing.bundle_path(path).write_text(covering_bundle(path))
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise RuntimeError('gh release upload: HTTP 502')
+
+    monkeypatch.setattr(github, 'upload_assets', refuse)
+    done: sign.SignOutcome = sign.salvage_pending(
+        target, out, options, 'login cancelled'
+    )
+    assert done.status == 'failed'
+    assert done.reason == (
+        'sigstore failed: login cancelled, uploading its bundles failed: '
+        'gh release upload: HTTP 502'
+    )
+    assert len(done.pending_bundles) == 2
 
 
 def test_main_signs_one_tag_and_exits_zero(

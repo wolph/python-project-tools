@@ -47,6 +47,6 @@ bundle as soon as it exists. The identity token lives about ten minutes, so
 when it expires the script prints `ppt: Sigstore login needed again, N files
 left` and opens the browser login again, six logins per run at most, each
 waiting fifteen minutes for the browser. When it runs out of logins, no
-login arrives or the rate limit persists it stops, the releases whose
-bundles are all there are still finished, and the next run signs only what
-is missing.
+login arrives or the rate limit persists it stops. Every bundle written by
+then is uploaded, a release gets its footer once it has a bundle for every
+file, and the next run signs only what is missing.

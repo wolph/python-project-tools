@@ -1286,8 +1286,10 @@ def sign_pending(runs: list[PackageRun]) -> None:
     All files of all runs go to one signer run, so one browser login covers
     them. A stopped run is included: its releases exist and only their
     bundles are missing. When the signer fails, a release whose bundles
-    all exist and cover their files is finished anyway, and only the
-    releases still missing a bundle are marked failed.
+    all exist and cover their files is finished anyway. A release still
+    missing a bundle is marked failed, and gets the bundles that were
+    written, so the next run signs only the rest: the bundles live in the
+    per-run directory, which is removed at the end.
     """
     pending: list[_Pending] = [entry for run in runs for entry in run.pending]
     if not pending:
@@ -1301,8 +1303,9 @@ def sign_pending(runs: list[PackageRun]) -> None:
             for path in entry.outcome.pending_bundles
         )
         if error and not complete:
-            entry.outcome.status = 'failed'
-            entry.outcome.reason = f'sigstore failed: {error}'
+            sign.salvage_pending(
+                entry.release, entry.outcome, entry.options, error
+            )
         else:
             sign.finish_pending(
                 entry.release,

@@ -335,10 +335,7 @@ def finish_pending(
             raise signing.SigningError(
                 'sigstore wrote no bundle for ' + ', '.join(missing)
             )
-        present: set[str] = {a.name for a in release.assets}
-        new: list[pathlib.Path] = [b for b in bundles if b.name not in present]
-        clobber: list[pathlib.Path] = [b for b in bundles if b.name in present]
-        _upload(release, new, clobber, options, outcome)
+        _upload_bundles(release, bundles, options, outcome)
         _append_footer(release, rebuilt_names, options)
     except HANDLED_ERRORS as error:
         outcome.status = 'failed'
@@ -346,6 +343,60 @@ def finish_pending(
         return outcome
     outcome.pending_bundles = []
     return _finish(outcome)
+
+
+def _upload_bundles(
+    release: github.Release,
+    bundles: list[pathlib.Path],
+    options: SignOptions,
+    outcome: SignOutcome,
+) -> None:
+    """Upload bundles, replacing an asset of the same name."""
+    present: set[str] = {a.name for a in release.assets}
+    new: list[pathlib.Path] = [b for b in bundles if b.name not in present]
+    clobber: list[pathlib.Path] = [b for b in bundles if b.name in present]
+    _upload(release, new, clobber, options, outcome)
+
+
+def salvage_pending(
+    release: github.Release,
+    outcome: SignOutcome,
+    options: SignOptions,
+    error: str,
+) -> SignOutcome:
+    """Upload the deferred bundles a stopped signer run did write.
+
+    Only a bundle whose digest covers its file goes up. The release still
+    misses a bundle, so the footer stays off and the outcome is failed.
+    The next run keeps the uploaded bundles as assets and signs only the
+    files still without one, so nothing is signed twice.
+    """
+    reason: str = f'sigstore failed: {error}'
+    outcome.status = 'failed'
+    outcome.reason = reason
+    covered: list[pathlib.Path] = [
+        path for path in outcome.pending_bundles if signing.bundle_covers(path)
+    ]
+    if not covered:
+        return outcome
+    try:
+        bundles: list[pathlib.Path] = [
+            signing.bundle_path(path) for path in covered
+        ]
+        _upload_bundles(release, bundles, options, outcome)
+    except HANDLED_ERRORS as upload_error:
+        outcome.reason = (
+            f'{reason}, uploading its bundles failed: {upload_error}'
+        )
+        return outcome
+    outcome.reason = (
+        f'{len(covered)} of {len(outcome.pending_bundles)} bundles uploaded, '
+        f'{reason}'
+    )
+    outcome.pending_bundles = [
+        path for path in outcome.pending_bundles if path not in covered
+    ]
+    return outcome
 
 
 def _dry_run(

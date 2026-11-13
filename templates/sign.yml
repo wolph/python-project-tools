@@ -24,6 +24,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: sign-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   sign:
     runs-on: ubuntu-latest
@@ -32,7 +36,6 @@ jobs:
       contents: write
       id-token: write
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ inputs.tag }}
       PACKAGE: ${{ inputs.package }}
@@ -49,18 +52,27 @@ jobs:
           fi
 
       - name: Read the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: gh release view "$TAG" --json assets > assets.json
 
       - name: Download the files already on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir existing
-          if ! gh release download "$TAG" -D existing -p '*.whl' -p '*.tar.gz' -p '*.zip' 2> download.err; then
-            if grep -q 'no assets match' download.err; then
-              echo "No distribution files on the release yet"
-            else
-              cat download.err >&2
-              exit 1
-            fi
+          count="$(python3 -I -c '
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              names = [a["name"] for a in json.load(handle)["assets"]]
+          suffixes = (".whl", ".tar.gz", ".zip")
+          print(sum(1 for name in names if name.endswith(suffixes)))
+          ' assets.json)"
+          if [ "$count" -eq 0 ]; then
+            echo "No distribution files on the release yet"
+          else
+            gh release download "$TAG" -D existing -p '*.whl' -p '*.tar.gz' -p '*.zip'
           fi
 
       - name: Plan
@@ -75,9 +87,11 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           import sys
           import urllib.request
           from pathlib import Path
+          from typing import NoReturn
 
           TAG: str = os.environ['TAG']
           PACKAGE: str = os.environ['PACKAGE']
@@ -89,7 +103,7 @@ jobs:
           DIST_DIR: Path = Path(os.environ['DIST_DIR'])
 
 
-          def fail(message: str) -> None:
+          def fail(message: str) -> NoReturn:
               print(message, file=sys.stderr)
               raise SystemExit(1)
 
@@ -117,7 +131,7 @@ jobs:
               to_upload: list[str] = []
               for entry in files:
                   name: str = entry['filename']
-                  if '/' in name or '\\' in name or name.startswith('.'):
+                  if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+!-]*', name):
                       fail(f'Refusing unsafe file name {name!r}')
                   expected: str = entry['digests']['sha256']
                   data: bytes = fetch(entry['url'])
@@ -164,6 +178,7 @@ jobs:
 
       - name: Upload to the release
         env:
+          GH_TOKEN: ${{ github.token }}
           TO_SIGN: ${{ steps.plan.outputs.to_sign }}
           TO_UPLOAD: ${{ steps.plan.outputs.to_upload }}
         run: |

@@ -50,6 +50,10 @@ def test_template_triggers_and_permissions() -> None:
         'contents': 'write',
         'id-token': 'write',
     }
+    assert DOC['concurrency'] == {
+        'group': 'sign-${{ inputs.tag }}',
+        'cancel-in-progress': False,
+    }
     assert DOC['name'] == 'Sign release'
     assert DOC['run-name'] == 'Sign ${{ inputs.tag }} ${{ inputs.request_id }}'
 
@@ -69,7 +73,22 @@ def test_template_pins_actions_by_sha() -> None:
 
 def test_template_inputs_only_via_env() -> None:
     for step in STEPS:
-        assert '${{ inputs.' not in step.get('run', '')
+        assert '${{' not in step.get('run', '')
+
+
+def test_gh_token_only_on_gh_steps() -> None:
+    assert 'GH_TOKEN' not in DOC['jobs']['sign']['env']
+    for step in STEPS:
+        if step.get('id') == 'plan' or 'sigstore' in step.get('uses', ''):
+            assert 'GH_TOKEN' not in step.get('env', {})
+            assert 'GH_TOKEN' not in step.get('with', {})
+    for name in (
+        'Read the release',
+        'Download the files already on the release',
+        'Upload to the release',
+    ):
+        step: dict[str, Any] = next(s for s in STEPS if s.get('name') == name)
+        assert step['env']['GH_TOKEN'] == '${{ github.token }}'
 
 
 def test_actionlint_clean() -> None:
@@ -161,7 +180,7 @@ class Plan:
             json.dumps({'assets': [{'name': n} for n in assets]})
         )
         return subprocess.run(
-            [sys.executable, '-I', '-'],
+            [shutil.which('python3') or sys.executable, '-I', '-'],
             input=plan_script(),
             cwd=self.tmp,
             env={
@@ -234,3 +253,167 @@ def test_plan_fails_without_files(tmp_path: Path) -> None:
     plan: Plan = Plan(tmp_path)
     result: subprocess.CompletedProcess[str] = plan.run([], [])
     assert result.returncode == 1
+
+
+@pytest.mark.parametrize('name', ['a b.whl', 'a\nb.whl', 'a*.whl', '../a.whl'])
+def test_plan_rejects_unsafe_file_names(tmp_path: Path, name: str) -> None:
+    plan: Plan = Plan(tmp_path)
+    urls: list[dict[str, Any]] = [
+        {
+            'filename': name,
+            'url': (plan.src / 'a.whl').as_uri(),
+            'digests': {'sha256': sha(FILE_A)},
+        }
+    ]
+    result: subprocess.CompletedProcess[str] = plan.run([], urls)
+    assert result.returncode == 1
+    assert 'unsafe' in result.stderr
+
+
+STUB_GH: str = """#!/bin/sh
+printf '%s\\n' "$@" >> "$STUB_LOG"
+printf -- '--\\n' >> "$STUB_LOG"
+if [ -n "$STUB_FAIL" ]; then
+  echo "gh: boom" >&2
+  exit 1
+fi
+"""
+
+
+def run_step(
+    tmp_path: Path,
+    name: str,
+    env: dict[str, str],
+    fail: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    bin_dir: Path = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    stub: Path = bin_dir / 'gh'
+    stub.write_text(STUB_GH)
+    stub.chmod(0o755)
+    log: Path = tmp_path / 'gh.log'
+    log.touch()
+    python3: str = shutil.which('python3') or sys.executable
+    full_env: dict[str, str] = {
+        'PATH': f'{bin_dir}:{Path(python3).parent}:/usr/bin:/bin',
+        'STUB_LOG': str(log),
+        'TAG': 'v1.0',
+        **env,
+    }
+    if fail:
+        full_env['STUB_FAIL'] = '1'
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ['bash', '-c', step_run(name)],
+        cwd=tmp_path,
+        env=full_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    calls: list[list[str]] = []
+    current: list[str] = []
+    for line in log.read_text().splitlines():
+        if line == '--':
+            calls.append(current)
+            current = []
+        else:
+            current.append(line)
+    return result, calls
+
+
+DOWNLOAD: str = 'Download the files already on the release'
+
+
+def write_assets(tmp_path: Path, names: list[str]) -> None:
+    (tmp_path / 'assets.json').write_text(
+        json.dumps({'assets': [{'name': n} for n in names]})
+    )
+
+
+@pytest.mark.parametrize('names', [[], ['notes.txt', 'SHA256SUMS']])
+def test_download_skipped_without_dists(
+    tmp_path: Path, names: list[str]
+) -> None:
+    write_assets(tmp_path, names)
+    result, calls = run_step(tmp_path, DOWNLOAD, {})
+    assert result.returncode == 0, result.stderr
+    assert calls == []
+    assert (tmp_path / 'existing').is_dir()
+
+
+def test_download_runs_with_patterns(tmp_path: Path) -> None:
+    write_assets(tmp_path, ['a.whl', 'a.whl.sigstore.json'])
+    result, calls = run_step(tmp_path, DOWNLOAD, {})
+    assert result.returncode == 0, result.stderr
+    assert calls == [
+        [
+            'release',
+            'download',
+            'v1.0',
+            '-D',
+            'existing',
+            '-p',
+            '*.whl',
+            '-p',
+            '*.tar.gz',
+            '-p',
+            '*.zip',
+        ]
+    ]
+
+
+def test_download_failure_fails_step(tmp_path: Path) -> None:
+    write_assets(tmp_path, ['a.tar.gz'])
+    result, _ = run_step(tmp_path, DOWNLOAD, {}, fail=True)
+    assert result.returncode != 0
+
+
+def test_list_files_to_sign(tmp_path: Path) -> None:
+    out: Path = tmp_path / 'out'
+    out.touch()
+    result, _ = run_step(
+        tmp_path,
+        'List files to sign',
+        {'TO_SIGN': 'a.whl b.tar.gz', 'GITHUB_OUTPUT': str(out)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert out.read_text() == 'sign_inputs=dist/a.whl dist/b.tar.gz\n'
+
+
+def test_upload_argv(tmp_path: Path) -> None:
+    result, calls = run_step(
+        tmp_path,
+        'Upload to the release',
+        {'TO_UPLOAD': 'b.tar.gz c.whl', 'TO_SIGN': 'a.whl b.tar.gz'},
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == [
+        [
+            'release',
+            'upload',
+            'v1.0',
+            'dist/b.tar.gz',
+            'dist/c.whl',
+            'dist/a.whl.sigstore.json',
+            'dist/b.tar.gz.sigstore.json',
+        ]
+    ]
+    assert '--clobber' not in calls[0]
+
+
+def test_upload_nothing_skips_gh(tmp_path: Path) -> None:
+    result, calls = run_step(
+        tmp_path, 'Upload to the release', {'TO_UPLOAD': '', 'TO_SIGN': ''}
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == []
+
+
+def test_upload_failure_fails_step(tmp_path: Path) -> None:
+    result, _ = run_step(
+        tmp_path,
+        'Upload to the release',
+        {'TO_UPLOAD': 'a.whl', 'TO_SIGN': ''},
+        fail=True,
+    )
+    assert result.returncode != 0

@@ -99,6 +99,10 @@ jobs:
           URL_TEMPLATE: str = os.environ.get(
               'PYPI_JSON_URL', 'https://pypi.org/pypi/{package}/{version}/json'
           )
+          # Only files PyPI serves itself are fetched. Tests point it at file://.
+          FILES_PREFIX: str = os.environ.get(
+              'PYPI_FILES_PREFIX', 'https://files.pythonhosted.org/'
+          )
           EXISTING_DIR: Path = Path(os.environ['EXISTING_DIR'])
           DIST_DIR: Path = Path(os.environ['DIST_DIR'])
 
@@ -134,7 +138,10 @@ jobs:
                   if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+!-]*', name):
                       fail(f'Refusing unsafe file name {name!r}')
                   expected: str = entry['digests']['sha256']
-                  data: bytes = fetch(entry['url'])
+                  url: str = entry['url']
+                  if not url.startswith(FILES_PREFIX):
+                      fail(f'Refusing {name}: its URL does not start with {FILES_PREFIX}')
+                  data: bytes = fetch(url)
                   if sha256_of(data) != expected:
                       fail(f'Downloaded {name} does not match the PyPI sha256')
                   (DIST_DIR / name).write_bytes(data)

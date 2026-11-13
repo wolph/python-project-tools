@@ -163,6 +163,7 @@ class Plan:
         self,
         assets: list[str],
         urls: list[dict[str, Any]] | None = None,
+        files_prefix: str | None = 'file://',
     ) -> subprocess.CompletedProcess[str]:
         if urls is None:
             urls = [
@@ -179,19 +180,22 @@ class Plan:
         assets_json.write_text(
             json.dumps({'assets': [{'name': n} for n in assets]})
         )
+        env: dict[str, str] = {
+            'TAG': 'v1.0',
+            'PACKAGE': 'pkg',
+            'PYPI_JSON_URL': pypi.as_uri(),
+            'ASSETS_JSON': str(assets_json),
+            'EXISTING_DIR': str(self.existing),
+            'DIST_DIR': str(self.tmp / 'dist'),
+            'GITHUB_OUTPUT': str(self.output),
+        }
+        if files_prefix is not None:
+            env['PYPI_FILES_PREFIX'] = files_prefix
         return subprocess.run(
             [shutil.which('python3') or sys.executable, '-I', '-'],
             input=plan_script(),
             cwd=self.tmp,
-            env={
-                'TAG': 'v1.0',
-                'PACKAGE': 'pkg',
-                'PYPI_JSON_URL': pypi.as_uri(),
-                'ASSETS_JSON': str(assets_json),
-                'EXISTING_DIR': str(self.existing),
-                'DIST_DIR': str(self.tmp / 'dist'),
-                'GITHUB_OUTPUT': str(self.output),
-            },
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -268,6 +272,37 @@ def test_plan_rejects_unsafe_file_names(tmp_path: Path, name: str) -> None:
     result: subprocess.CompletedProcess[str] = plan.run([], urls)
     assert result.returncode == 1
     assert 'unsafe' in result.stderr
+
+
+@pytest.mark.parametrize(
+    'url',
+    [
+        None,
+        'https://evil.example/a.whl',
+        'https://files.pythonhosted.org.evil.example/a.whl',
+    ],
+    ids=['file', 'other host', 'prefix as host'],
+)
+def test_plan_refuses_urls_outside_pypi_files(
+    tmp_path: Path, url: str | None
+) -> None:
+    plan: Plan = Plan(tmp_path)
+    urls: list[dict[str, Any]] = [
+        {
+            'filename': 'a.whl',
+            'url': url or (plan.src / 'a.whl').as_uri(),
+            'digests': {'sha256': sha(FILE_A)},
+        }
+    ]
+    result: subprocess.CompletedProcess[str] = plan.run(
+        [], urls, files_prefix=None
+    )
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        'Refusing a.whl: its URL does not start with '
+        'https://files.pythonhosted.org/'
+    )
+    assert not (tmp_path / 'dist' / 'a.whl').exists()
 
 
 STUB_GH: str = """#!/bin/sh

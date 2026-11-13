@@ -6,7 +6,9 @@
    login as before.
  * ``templates/sign.yml``: the workflow to copy into ``.github/workflows``.
  * ``ppt verify-release`` checks who signed each Sigstore bundle and verifies
-   ``SHA256SUMS.asc`` with GPG.
+   ``SHA256SUMS.asc`` with GPG. Checking that signature needs Rick's public
+   key, fingerprint ``149325FD15904E9C4EB89E95E81444E9CE1F695D``, in the
+   local keyring.
  * ``VERIFY.md``: how to check a bundle signed by CI.
 
 2.1.0:

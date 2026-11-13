@@ -79,7 +79,7 @@ Since `ppt` 2.2.0 the Sigstore bundles are made by the `sign.yml` workflow of th
 uvx sigstore verify github --bundle FILE.sigstore.json --repository wolph/<repo> --trigger workflow_dispatch --name 'Sign release' FILE
 ```
 
-The repository is written in lowercase because that is how the certificate carries it. The certificate names `sign.yml` on a branch of that repository, unlike the attestation on PyPI, which names `publish.yml`.
+Write the repository the way `gh repo view WoLpH/<repo> --json nameWithOwner` prints it, because the certificate carries that spelling, which is `wolph/<repo>` in lowercase. The certificate names `sign.yml` on a branch of that repository, unlike the attestation on PyPI, which names `publish.yml`.
 
 To pin the exact workflow file and branch, pass the identity instead of the repository. The issuer is the GitHub Actions one, and `sigstore verify github` checks it for you:
 
@@ -87,7 +87,7 @@ To pin the exact workflow file and branch, pass the identity instead of the repo
 uvx sigstore verify github --bundle FILE.sigstore.json --cert-identity https://github.com/wolph/<repo>/.github/workflows/sign.yml@refs/heads/develop --trigger workflow_dispatch FILE
 ```
 
-The certificate issuer is `https://token.actions.githubusercontent.com`. Releases signed before 2.2.0, or by `ppt sign --sigstore-browser`, still carry the identity of the previous section.
+`refs/heads/develop` is the branch the run started from, develop for these repositories at the time of writing. The certificate issuer is `https://token.actions.githubusercontent.com`. Releases signed before 2.2.0, or by `ppt sign --sigstore-browser`, still carry the identity of the previous section.
 
 ## Comparing with PyPI
 

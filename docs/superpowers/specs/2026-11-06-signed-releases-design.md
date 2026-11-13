@@ -3,6 +3,11 @@
 Date: 2026-11-06. Author: Rick van Hattem, written up with Claude from a
 brainstorming session. Status: builder check done, awaiting approval.
 
+Revised 2026-11-13: future releases get their Sigstore bundles from a
+`sign.yml` workflow that `ppt sign` dispatches, so no release needs a
+browser login any more. Section 4 is rewritten, and decision 5, the `ppt
+sign` command, section 5, the prerequisites and the risks follow it.
+
 ## Intent
 
 Anyone who installs one of Rick's packages should be able to check that the
@@ -117,7 +122,10 @@ Things that would make this a failure even if every file gets signed:
 5. Future releases: Sigstore in CI, GPG as the last step of the
    release-python-package skill on Rick's machine. The key stays local. A
    release that only ran through CI picks up its GPG signatures the next time
-   the sign command runs.
+   the sign command runs. Revised 2026-11-13: Rick wants every release fully
+   signed and no browser login in the workflow at all, so the local step
+   never signs with Sigstore itself. When bundles are missing it has CI make
+   them (section 4).
 6. Home of the tooling: python-project-tools, fully modernised. Dearchive,
    drop the 2012 code (it stays in history), new package with pyproject, uv,
    ruff, ty, pytest, the same publish.yml as the other repositories, and a
@@ -251,6 +259,8 @@ Commands the design needs. Exact grouping and flag names are the builder's.
   backfill and by the release skill. `--gpg-only` and `--sigstore-only` so
   the unattended GPG half and the interactive Sigstore half can run apart,
   and so the skill adds only GPG to a release CI already Sigstore-signed.
+  Revised 2026-11-13: for future releases the Sigstore half comes from CI,
+  as section 4 describes, and the browser signer is opt-in only.
 - `ppt backfill PACKAGE [--only VERSION] [--dry-run]`: the loop over every
   PyPI version: tag lookup, match, release creation, sign. Prints the report.
   Dry run prints every action it would take and creates nothing.
@@ -283,23 +293,113 @@ result before the remaining 555 versions go.
 
 ### 4. Future releases
 
-CI, in the shared publish.yml rolled out to thirteen repositories: after
-publishing to PyPI, the release job downloads that version's files from PyPI,
-checks their sha256 against the PyPI JSON, signs each with the workflow's OIDC
-identity through `sigstore/gh-action-sigstore-python`, and uploads files,
-bundles and `SHA256SUMS` to the release. The identity is the same one PyPI's
-attestation names, so a verifier can check both against one certificate
-identity. python-progressbar migrates from release.yml to this publish.yml,
-with its preflight reading the version from `progressbar/__about__.py`
-instead of pyproject.toml. speedups keeps build_wheels.yml and gains the same
-download, check, sign and upload steps for its PyPI files, which there
-include the cibuildwheel wheels.
+Revised 2026-11-13. The first version of this section put the signing steps
+into the shared publish.yml. That workflow turned out not to be shared in
+practice: python-utils publishes on a `v*` tag push, python-statsd on
+`release: published`, python-progressbar through release.yml, and in most
+repositories the GitHub release is created by the skill after the publish run,
+so a step inside publish.yml would find no release to upload to. Signing moves
+into a workflow of its own, which does not care how the package reached PyPI.
+publish.yml, release.yml and build_wheels.yml stay as they are.
 
-Local, in the release-python-package skill, phase 2 after the publish run is
-green: `ppt sign vX.Y.Z --gpg-only`. Downloads from PyPI, verifies sha256,
-signs, uploads `.asc` files and `SHA256SUMS.asc`. `ppt verify-release` then
-fails when any of the signatures are missing, so a release is not reported
-complete without them.
+#### sign.yml
+
+One file, identical in every repository, with a template in
+python-project-tools (`templates/sign.yml`) as its single source.
+
+- Trigger: `workflow_dispatch` only, with two required inputs, `tag` and
+  `package` (the PyPI name). It always runs from the default branch.
+- Permissions: `contents: write` for release assets and `id-token: write` for
+  Sigstore. No environment, no secrets, no other permission.
+- Steps:
+  1. Fail unless a GitHub release exists for `tag`.
+  2. Download every file PyPI lists for the version into an empty directory
+     and check each sha256 against the PyPI JSON. Fail when PyPI lists no
+     files or a hash differs.
+  3. Skip a file whose `<file>.sigstore.json` on the release already verifies
+     against that file with one of the two accepted identities (below).
+  4. Sign the rest with `sigstore/gh-action-sigstore-python`, pinned by
+     commit sha, writing `<file>.sigstore.json`.
+  5. Upload the dist files the release lacks and the new bundles, never
+     with `--clobber`. An asset with the same name and different bytes fails
+     the run and names the asset.
+- sign.yml does not write `SHA256SUMS`. `ppt sign` owns `SHA256SUMS` and
+  `SHA256SUMS.asc` as a pair, as it does today, and replaces the pair when
+  the set of files changed (a late wheel, a partial first run). A late file
+  only needs a new sign.yml run for its own bundle.
+- Certificate identity: `https://github.com/WoLpH/<repo>/.github/workflows/sign.yml@refs/heads/<branch>`,
+  issuer `https://token.actions.githubusercontent.com`, trigger
+  `workflow_dispatch`. Any branch of that repository is accepted, because
+  every default branch is `develop` today and may be renamed to `master`
+  later, and an exact pin would then fail every earlier bundle. Push access
+  to any branch is the same trust as push access to the default one. ppt
+  dispatches on the default branch. This identity differs from the one on
+  PyPI's own attestation, which names publish.yml.
+
+What a CI bundle proves: this repository's sign.yml saw these exact bytes on
+PyPI and the transparency log recorded it on that date. It does not prove
+Rick ran it. The GPG signature, which only Rick's machine can make, carries
+that.
+
+#### ppt sign, local
+
+`ppt sign vX.Y.Z` is the release skill's step 3b and needs no browser:
+
+1. Download the PyPI files into a fresh empty directory and verify sha256, as
+   today. PyPI must already list the files. The command does not wait for
+   them.
+2. Check every dist file for a bundle on the release that verifies with one
+   of the accepted identities.
+3. When any are missing or fail, check that sign.yml exists on the default
+   branch (stop otherwise, naming the template and the repository), run
+   `gh workflow run sign.yml -f tag=... -f package=...`, find that run, follow
+   it with `gh run watch --exit-status` and check the bundles again. A failed
+   run stops ppt with the run URL. No automatic retry.
+4. Write `SHA256SUMS` over the verified PyPI files, sign each dist file and
+   `SHA256SUMS` with GPG, and upload the `.asc` files with `SHA256SUMS`, as
+   today.
+5. Append the verification footer, as today.
+
+`--gpg-only` keeps its meaning and skips steps 2 and 3. `ppt sign --all`
+dispatches sign.yml only for releases created on or after the day sign.yml
+landed in that repository. An older release that lacks a bundle, and any
+rebuilt file (PyPI lists none, so sign.yml cannot sign it), goes into the
+report instead, so retroactive signing stays under Rick's identity and
+visibly retroactive. The browser signer
+stays in the package behind an explicit `--sigstore-browser` flag, for a
+repository without Actions or an Actions outage. The skill passes it in one
+case only, by Rick's decision on 2026-11-13: a release in a repository whose
+sign.yml PR is not merged yet, so every release is fully signed during the
+rollout and the browser disappears per repository once its PR lands.
+
+The skill text for step 3b becomes `ppt sign vX.Y.Z` with "no browser" and
+the "becomes --gpg-only" sentence goes.
+
+#### Accepted identities
+
+Per dist file, `ppt verify-release` and `ppt sign` accept a bundle that
+verifies against either:
+
+- the CI identity of that repository's sign.yml, as above, or
+- Rick's identity (`wolph@wol.ph`, issuer `https://github.com/login/oauth`),
+  which the backfilled bundles carry.
+
+Any other identity fails. `verify-release` keeps failing a release that lacks
+a bundle, an `.asc` per dist file, `SHA256SUMS` or `SHA256SUMS.asc`.
+
+#### Rollout
+
+1. Template and ppt changes land in python-project-tools.
+2. Pilot: python-utils, by Rick's choice on 2026-11-13. sign.yml lands there
+   first, then WoLpH/python-utils#78 is merged and released, and that
+   release runs the whole chain, checked by `ppt verify-release`. tissue has
+   no workflows and is dropped from the pilot.
+3. After a green pilot, one PR per repository adds sign.yml to the other
+   repositories of decision 10, each watched to green and merged only when
+   Rick asks. For speedups, sign.yml signs the PyPI files, cibuildwheel wheels
+   included, and leaves the hand-uploaded wheel sets alone.
+4. The python-progressbar migration from release.yml to publish.yml is no
+   longer needed for signing and leaves this plan.
 
 ### 5. VERIFY.md
 
@@ -307,8 +407,10 @@ One page in python-project-tools, linked from every release footer. How to
 fetch the key (fingerprint, both key servers, `https://github.com/wolph.gpg`
 once the key there is current), `gpg --verify`, `sha256sum -c SHA256SUMS`,
 `sigstore verify identity` with Rick's identity and issuer for backfilled
-files, `sigstore verify github` with the workflow identity for CI-signed
-files, and how to compare with PyPI's own attestation. Plain register,
+files, `sigstore verify github` with the sign.yml identity from section 4 for
+CI-signed files (filling the "Checking a bundle signed by CI" placeholder),
+and how to compare with PyPI's own attestation, which names publish.yml
+rather than sign.yml. Plain register,
 ASCII punctuation, British spelling, as everything else Rick writes.
 
 ## Prerequisites that only Rick can do
@@ -321,7 +423,10 @@ ASCII punctuation, British spelling, as everything else Rick writes.
 3. Be present for the Sigstore sign step of the backfill: it opens a browser
    for the GitHub OIDC login and the resulting certificate is valid for about
    ten minutes, which covers one package's files per login. Twenty-two logins
-   in total, or fewer if several small packages share one.
+   in total, or fewer if several small packages share one. Revised
+   2026-11-13: this was for the backfill only, which is done. Future releases
+   need no login.
+5. Merge the sign.yml PR in each repository (merged only on Rick's request).
 4. Disable python-progressbar's release.yml before its backfill (`gh workflow
    disable release.yml`), or approve the tool asking for it.
 
@@ -336,9 +441,12 @@ ASCII punctuation, British spelling, as everything else Rick writes.
 - Test fixtures: a fake PyPI JSON, a scratch git repository with tags, and a
   recorded `gh` interaction layer, so `backfill --dry-run` is unit-testable
   without the network.
-- The rollout mechanics of the shared publish.yml to thirteen repositories
-  (one PR per repository, each watched to green, as the git rules in
-  CLAUDE.md require).
+- The rollout mechanics of sign.yml to the repositories of decision 10 (one
+  PR per repository, each watched to green, as the git rules in CLAUDE.md
+  require).
+- How ppt finds the run it dispatched (`gh workflow run` prints no run id),
+  and how sign.yml checks an existing bundle (the sigstore CLI in the job or
+  the action's own verify step).
 - Whether `inventory` caches PyPI JSON on disk between runs.
 
 ## Risks worth naming
@@ -348,7 +456,18 @@ ASCII punctuation, British spelling, as everything else Rick writes.
   The byte comparison against the sdist is the guard, and "closest to the
   upload date" only breaks ties between commits that all pass it.
 - Sigstore's OIDC flow is interactive. The backfill cannot run unattended for
-  the Sigstore half. The GPG half can, with the agent unlocked.
+  the Sigstore half. The GPG half can, with the agent unlocked. For future
+  releases sign.yml removes that: the runner gets its OIDC token without a
+  browser.
+- The public Sigstore instance answering HTTP 429 or being down fails the
+  sign.yml run. ppt stops with the run URL, and running `ppt sign` again later
+  dispatches a run that skips the bundles already made. An Actions outage
+  leaves the release unsigned until then, with `--sigstore-browser` as the
+  last resort.
+- Anyone who can push to the default branch can change sign.yml and sign
+  whatever they like under the CI identity. That identity is worth exactly
+  as much as push access to the repository, which is why the GPG signature
+  stays required next to it.
 - GitHub rate limits: around 566 release creations and roughly 4000 asset
   uploads. Well under the hourly limits for an authenticated user when spread
   over a session, and the tool resumes where it stopped because it is

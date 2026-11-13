@@ -47,6 +47,7 @@ class Release:
     prerelease: bool
     draft: bool
     assets: list[Asset]
+    created_at: str = ''
 
 
 def _paginated(path: str) -> list[object]:
@@ -93,6 +94,7 @@ def _release(raw: dict[str, typing.Any]) -> Release:
         prerelease=bool(raw.get('prerelease', False)),
         draft=bool(raw.get('draft', False)),
         assets=[_asset(asset) for asset in raw.get('assets') or []],
+        created_at=str(raw.get('created_at') or ''),
     )
 
 

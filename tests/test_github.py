@@ -282,3 +282,15 @@ def test_download_asset_uses_fetch_bytes(
 def test_recorder_unmatched_raises() -> None:
     with pytest.raises(AssertionError, match='no canned reply'):
         Recorder({})(['gh', 'nope'])
+
+
+def test_release_created_at_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw: dict[str, object] = json.loads(_release_json('v1.0'))
+    raw['created_at'] = '2026-11-01T10:00:00Z'
+    page: str = json.dumps([raw])
+    rec: Recorder = Recorder(
+        {f'gh api --paginate repos/{REPO}/releases': completed(page)}
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    assert github.releases(REPO)[0].created_at == '2026-11-01T10:00:00Z'
+    assert github._release(json.loads(_release_json('v1.0'))).created_at == ''

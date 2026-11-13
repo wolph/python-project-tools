@@ -214,14 +214,66 @@ def _needed(name: str, present: set[str], options: SignOptions) -> bool:
     return options.replace_assets or name not in present
 
 
+def _sums_match(
+    listing: pathlib.Path, dists: list[pathlib.Path], options: SignOptions
+) -> bool:
+    """Whether ``listing`` has the entries write_sha256sums would write."""
+    entries: dict[str, str] = {p.name: common.sha256_of(p) for p in dists}
+    comments: dict[str, str] = {
+        p.name: options.rebuilt[p.name]
+        for p in dists
+        if p.name in options.rebuilt
+    }
+    return (
+        signing.parse_sha256sums(listing) == entries
+        and signing.sha256sums_comments(listing) == comments
+    )
+
+
+def _sums_current(
+    release: github.Release,
+    dists: list[pathlib.Path],
+    workdir: pathlib.Path,
+    options: SignOptions,
+) -> bool:
+    """Whether the SHA256SUMS pair on the release can stay as it is.
+
+    The list and its signature are a pair: when either is missing, or the
+    list names other files, digests or comments than these dists get (a
+    late wheel, a partial first run), both are regenerated, so the uploaded
+    signature matches the uploaded list. Raises SigningError when the list
+    is out of date but GPG is off, which would orphan its signature.
+    """
+    assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
+    signature: str = f'{SUMS_NAME}.asc'
+    if options.replace_assets or SUMS_NAME not in assets:
+        return False
+    if options.gpg and signature not in assets:
+        return False
+    listing: pathlib.Path = github.download_asset(
+        assets[SUMS_NAME], workdir / EXISTING_DIR
+    )
+    if _sums_match(listing, dists, options):
+        return True
+    if not options.gpg and signature in assets:
+        raise signing.SigningError(
+            f'{SUMS_NAME} on the release is out of date and {signature} '
+            'signs it, so both need regenerating: run ppt sign without '
+            '--sigstore-only'
+        )
+    return False
+
+
 def _make_signatures(
     dists: list[pathlib.Path],
     workdir: pathlib.Path,
     options: SignOptions,
     present: set[str],
+    refresh_sums: bool,
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """Produce only the signature and sums files the release still lacks.
 
+    ``refresh_sums`` writes the SHA256SUMS pair (see ``_sums_current``).
     Returns the produced files and the dists whose Sigstore bundle was left
     for later (empty unless ``options.sigstore_later``).
     """
@@ -243,12 +295,7 @@ def _make_signatures(
             deferred = todo
         elif todo:
             produced.extend(signing.sigstore_sign(todo))
-    # The list and its signature are a pair: if either is missing both are
-    # regenerated, so the uploaded signature matches the uploaded list.
-    pair_missing: bool = _needed(SUMS_NAME, present, options) or (
-        options.gpg and _needed(f'{SUMS_NAME}.asc', present, options)
-    )
-    if pair_missing:
+    if refresh_sums:
         sums: pathlib.Path = signing.write_sha256sums(
             workdir, dists, options.rebuilt
         )
@@ -579,7 +626,10 @@ def _sign_files(
             release, files, dists, new, release_dir, options, outcome
         )
     present: set[str] = {a.name for a in release.assets}
-    produced, deferred = _make_signatures(dists, release_dir, options, present)
+    refresh: bool = not _sums_current(release, dists, release_dir, options)
+    produced, deferred = _make_signatures(
+        dists, release_dir, options, present, refresh
+    )
     sig_new, sig_clobber = _split_signatures(
         produced, present, [d.name for d in dists], options, outcome
     )

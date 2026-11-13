@@ -36,6 +36,27 @@ ALL_NAMES: list[str] = [
 ]
 
 
+def sums_text(entries: dict[str, bytes]) -> bytes:
+    """A SHA256SUMS listing of ``entries``."""
+    import hashlib
+
+    lines: str = ''.join(
+        f'{hashlib.sha256(data).hexdigest()}  {name}\n'
+        for name, data in entries.items()
+    )
+    return lines.encode()
+
+
+BOTH_SUMS: bytes = sums_text({'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES})
+SDIST_SET: list[str] = [
+    's.tar.gz',
+    's.tar.gz.asc',
+    's.tar.gz.sigstore.json',
+    'SHA256SUMS',
+    'SHA256SUMS.asc',
+]
+
+
 class Upload(typing.NamedTuple):
     names: list[str]
     clobber: bool
@@ -191,7 +212,8 @@ def test_sign_release_is_idempotent(
     options: sign.SignOptions,
 ) -> None:
     world, rec = install(
-        monkeypatch, {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES}
+        monkeypatch,
+        {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES, 'SHA256SUMS': BOTH_SUMS},
     )
     signed: github.Release = release(
         ALL_NAMES, body=f'notes\n\n{sign.FOOTER_MARKER}\nSigned'
@@ -203,8 +225,9 @@ def test_sign_release_is_idempotent(
     assert world.uploads == []
     assert world.edits == []
     assert not any('release edit' in ' '.join(c) for c in rec.calls)
-    # Dist files are compared by content, signatures are not downloaded.
-    assert sorted(world.downloaded) == sorted(DISTS)
+    # Dist files and SHA256SUMS are compared by content, signatures are not
+    # downloaded.
+    assert sorted(world.downloaded) == sorted([*DISTS, 'SHA256SUMS'])
     assert world.sigstore_calls == 0
     assert world.signed == []
 
@@ -1250,3 +1273,159 @@ def test_ci_conflicting_asset_stops_before_dispatch(
     assert out.reason == 'conflicting assets stop sign.yml: s.whl'
     assert ci.dispatches == []
     assert world.uploads == []
+
+
+@pytest.mark.parametrize('mode', ['browser', 'off'])
+def test_late_wheel_regenerates_and_clobbers_the_sums_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+    mode: sign.SigstoreMode,
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {
+            's.tar.gz': SDIST_BYTES,
+            'SHA256SUMS': sums_text({'s.tar.gz': SDIST_BYTES}),
+        },
+    )
+    options.sigstore = mode
+    out: sign.SignOutcome = sign.sign_release(
+        release(SDIST_SET, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'signed', out.reason
+    assert 'SHA256SUMS' in world.downloaded
+    assert world.signed == ['s.whl', 'SHA256SUMS']
+    assert Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True) in world.uploads
+    plain: list[str] = [
+        n for u in world.uploads if not u.clobber for n in u.names
+    ]
+    bundle: list[str] = ['s.whl.sigstore.json'] if mode == 'browser' else []
+    assert sorted(plain) == sorted(['s.whl', 's.whl.asc', *bundle])
+    assert 'SHA256SUMS' not in out.kept
+    assert 'SHA256SUMS.asc' not in out.kept
+
+
+def test_identical_sha256sums_keeps_the_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES, 'SHA256SUMS': BOTH_SUMS},
+    )
+    have: list[str] = [n for n in ALL_NAMES if n != 's.whl.asc']
+    out: sign.SignOutcome = sign.sign_release(
+        release(have, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'signed', out.reason
+    assert 'SHA256SUMS' in world.downloaded
+    assert world.signed == ['s.whl']
+    assert world.uploads == [Upload(['s.whl.asc'], False)]
+    assert {'SHA256SUMS', 'SHA256SUMS.asc'} <= set(out.kept)
+
+
+@pytest.mark.parametrize(
+    ('listing', 'rebuilt'),
+    [
+        (sums_text({'s.whl': b'other', 's.tar.gz': SDIST_BYTES}), {}),
+        (b'# x\n' + BOTH_SUMS, {}),
+        (BOTH_SUMS, {'s.whl': '# s.whl rebuilt'}),
+    ],
+    ids=['digest', 'stale comment', 'missing comment'],
+)
+def test_differing_sha256sums_regenerates_the_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+    listing: bytes,
+    rebuilt: dict[str, str],
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES, 'SHA256SUMS': listing},
+    )
+    options.rebuilt = rebuilt
+    out: sign.SignOutcome = sign.sign_release(
+        release(ALL_NAMES, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'signed', out.reason
+    assert world.signed == ['SHA256SUMS']
+    assert world.uploads == [Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True)]
+
+
+def test_stale_sums_without_gpg_refuses_to_orphan_the_signature(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {
+            's.tar.gz': SDIST_BYTES,
+            'SHA256SUMS': sums_text({'s.tar.gz': SDIST_BYTES}),
+        },
+    )
+    options.gpg = False
+    out: sign.SignOutcome = sign.sign_release(
+        release(SDIST_SET, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'failed'
+    assert out.reason == (
+        'SHA256SUMS on the release is out of date and SHA256SUMS.asc signs '
+        'it, so both need regenerating: run ppt sign without --sigstore-only'
+    )
+    assert world.uploads == []
+
+
+def test_ci_late_wheel_regenerates_the_sums_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {
+            's.tar.gz': SDIST_BYTES,
+            'SHA256SUMS': sums_text({'s.tar.gz': SDIST_BYTES}),
+        },
+    )
+    target: github.Release = release(
+        SDIST_SET, body=sign.FOOTER_MARKER, created_at=AFTER
+    )
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert len(ci.dispatches) == 1
+    assert world.signed == ['s.whl', 'SHA256SUMS']
+    assert world.uploads == [
+        Upload(['s.whl.asc'], False),
+        Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True),
+    ]
+
+
+def test_ci_partial_bundles_dispatch_once_for_the_missing_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release(['s.whl.sigstore.json'], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master')]
+    assert ci.checked == [['s.whl'], ['s.tar.gz']]
+    assert 's.whl.sigstore.json' in out.kept
+    assert 's.tar.gz.sigstore.json' in out.uploaded

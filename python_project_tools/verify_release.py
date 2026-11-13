@@ -236,6 +236,19 @@ def check_signatures(tag: str) -> common.Result:
     return check_identities(repo, matches[0], dists)
 
 
+SUMS_LINE: re.Pattern[str] = re.compile(r'[0-9a-fA-F]{64}  \S.*')
+
+
+def malformed_sums_line(path: pathlib.Path) -> str | None:
+    """The first line that is not ``<64 hex>  <name>``, comments excepted."""
+    for line in path.read_text().splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        if not SUMS_LINE.fullmatch(line):
+            return line
+    return None
+
+
 def check_identities(
     repo: str, release: github.Release, dists: list[str]
 ) -> common.Result:
@@ -245,13 +258,31 @@ def check_identities(
     themselves stay off the download list.
     """
     by_name: dict[str, github.Asset] = {a.name: a for a in release.assets}
-    wanted: list[str] = ['SHA256SUMS']
+    wanted: list[str] = ['SHA256SUMS', 'SHA256SUMS.asc']
     wanted += [f'{dist}.sigstore.json' for dist in dists]
     with tempfile.TemporaryDirectory(prefix='ppt-signatures-') as directory:
         folder: pathlib.Path = pathlib.Path(directory)
         try:
             for name in wanted:
                 github.download_asset(by_name[name], folder)
+            if not signing.gpg_verify_key(
+                folder / 'SHA256SUMS',
+                folder / 'SHA256SUMS.asc',
+                signing.DEFAULT_GPG_KEY,
+            ):
+                return common.Result(
+                    'signatures',
+                    'FAIL',
+                    'SHA256SUMS.asc is not a good signature by '
+                    f'{signing.DEFAULT_GPG_KEY}',
+                )
+            bad: str | None = malformed_sums_line(folder / 'SHA256SUMS')
+            if bad is not None:
+                return common.Result(
+                    'signatures',
+                    'FAIL',
+                    f'malformed line in SHA256SUMS: {bad}',
+                )
             sums: dict[str, str] = signing.parse_sha256sums(
                 folder / 'SHA256SUMS'
             )

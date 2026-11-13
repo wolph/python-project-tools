@@ -163,6 +163,7 @@ def _patch_identities(
     monkeypatch: pytest.MonkeyPatch,
     sums: str,
     verdicts: dict[str, identities.Identity | None],
+    gpg_good: bool = True,
 ) -> list[list[identities.BundleCheck]]:
     seen: list[list[identities.BundleCheck]] = []
 
@@ -180,7 +181,19 @@ def _patch_identities(
 
     monkeypatch.setattr(gh, 'download_asset', download)
     monkeypatch.setattr(identities, 'verify_bundles', verify)
+    monkeypatch.setattr(
+        signing, 'gpg_verify_key', lambda path, sig, key: gpg_good
+    )
     return seen
+
+
+def _refuse_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    def verify(
+        checks: list[identities.BundleCheck], repo: str
+    ) -> dict[str, identities.Identity | None]:
+        raise AssertionError('verify_bundles must not be called')
+
+    monkeypatch.setattr(identities, 'verify_bundles', verify)
 
 
 SUMS: str = f'{DIGEST}  s.whl\n{DIGEST}  s.tar.gz\n'
@@ -219,18 +232,22 @@ def test_signatures_dist_missing_from_sums(
 ) -> None:
     _patch_release(monkeypatch, FULL_SET)
     _patch_identities(monkeypatch, f'{DIGEST}  s.whl\n', {})
+    _refuse_verify(monkeypatch)
     res: common.Result = verify_release.check_signatures('v1.0')
     assert res.status == 'FAIL'
     assert 's.tar.gz' in res.evidence
+    assert 'SHA256SUMS' in res.evidence
 
 
 def test_signatures_bad_sums_line_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_release(monkeypatch, FULL_SET)
-    _patch_identities(monkeypatch, 'nonsense\n', {})
+    _patch_identities(monkeypatch, f'{SUMS}nonsense\n', {})
+    _refuse_verify(monkeypatch)
     res: common.Result = verify_release.check_signatures('v1.0')
     assert res.status == 'FAIL'
+    assert res.evidence == 'malformed line in SHA256SUMS: nonsense'
 
 
 def test_signatures_non_hex_digest_fails(
@@ -314,3 +331,64 @@ def test_signatures_skip_group(monkeypatch: pytest.MonkeyPatch) -> None:
     assert called == []
     verify_release.main([*base, '--skip', rest])
     assert called == ['v1.0']
+
+
+def test_signatures_bad_sums_signature_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(
+        monkeypatch, SUMS, {'s.whl': 'ci', 's.tar.gz': 'ci'}, gpg_good=False
+    )
+    _refuse_verify(monkeypatch)
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert res.evidence == (
+        f'SHA256SUMS.asc is not a good signature by {signing.DEFAULT_GPG_KEY}'
+    )
+
+
+def test_signatures_real_gpg_signature(
+    monkeypatch: pytest.MonkeyPatch, gnupg_home: str
+) -> None:
+    real_run = common.run
+    _patch_release(monkeypatch, FULL_SET)
+
+    def run(
+        argv: list[str],
+        check: bool = False,
+        cwd: pathlib.Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[0] == 'gh':
+            return subprocess.CompletedProcess([], 0, 'spam/eggs\n', '')
+        return real_run(argv, check=check, cwd=cwd, env=env)
+
+    monkeypatch.setattr(common, 'run', run)
+    monkeypatch.setattr(signing, 'DEFAULT_GPG_KEY', gnupg_home)
+    tamper: list[bool] = [False]
+
+    def download(asset: gh.Asset, into: pathlib.Path) -> pathlib.Path:
+        target: pathlib.Path = into / asset.name
+        if asset.name == 'SHA256SUMS':
+            target.write_text(SUMS)
+            signing.gpg_sign(target, gnupg_home)
+            if tamper[0]:
+                target.write_text(SUMS + f'{DIGEST}  evil.whl\n')
+        elif asset.name != 'SHA256SUMS.asc':
+            target.write_text('{}')
+        return target
+
+    monkeypatch.setattr(gh, 'download_asset', download)
+    monkeypatch.setattr(
+        identities,
+        'verify_bundles',
+        lambda checks, repo: {check.name: 'rick' for check in checks},
+    )
+    first: common.Result = verify_release.check_signatures('v1.0')
+    assert first.status == 'PASS', first.evidence
+    tamper[0] = True
+    _refuse_verify(monkeypatch)
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 'not a good signature' in res.evidence

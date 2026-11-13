@@ -41,10 +41,10 @@ def test_verify_bundles_runs_helper_once(
     monkeypatch.setattr(common, 'run', recorder)
     checks: list[identities.BundleCheck] = [
         identities.BundleCheck(
-            'a.whl', 'aa', tmp_path / 'a.whl.sigstore.json'
+            'a.whl', 'aa' * 32, tmp_path / 'a.whl.sigstore.json'
         ),
         identities.BundleCheck(
-            'a.tar.gz', 'bb', tmp_path / 'a.tar.gz.sigstore.json'
+            'a.tar.gz', 'bb' * 32, tmp_path / 'a.tar.gz.sigstore.json'
         ),
     ]
     result: dict[str, identities.Identity | None] = identities.verify_bundles(
@@ -60,12 +60,12 @@ def test_verify_bundles_runs_helper_once(
         [
             {
                 'name': 'a.whl',
-                'sha256': 'aa',
+                'sha256': 'aa' * 32,
                 'bundle': str(tmp_path / 'a.whl.sigstore.json'),
             },
             {
                 'name': 'a.tar.gz',
-                'sha256': 'bb',
+                'sha256': 'bb' * 32,
                 'bundle': str(tmp_path / 'a.tar.gz.sigstore.json'),
             },
         ]
@@ -81,13 +81,16 @@ def test_verify_bundles_raises_on_helper_failure(
     monkeypatch.setattr(common, 'run', recorder)
     with pytest.raises(signing.SigningError, match='boom'):
         identities.verify_bundles(
-            [identities.BundleCheck('a', 'aa', tmp_path / 'a.json')], 'WoLpH/x'
+            [identities.BundleCheck('a', 'aa' * 32, tmp_path / 'a.json')],
+            'WoLpH/x',
         )
 
 
-def test_real_backfilled_bundle_verifies_as_rick(
-    tmp_path: pathlib.Path,
-) -> None:
+def _tissue_bundle(directory: pathlib.Path) -> tuple[pathlib.Path, str]:
+    """The backfilled bundle of tissue 0.9.2 and the sha256 of its sdist.
+
+    Skips the test when gh, uvx or the network is unavailable.
+    """
     if shutil.which('gh') is None or shutil.which('uvx') is None:
         pytest.skip('gh or uvx is not installed')
     name: str = 'tissue-0.9.2.tar.gz'
@@ -102,7 +105,7 @@ def test_real_backfilled_bundle_verifies_as_rick(
             '--pattern',
             f'{name}.sigstore.json',
             '--dir',
-            str(tmp_path),
+            str(directory),
         ],
         capture_output=True,
         text=True,
@@ -121,12 +124,80 @@ def test_real_backfilled_bundle_verifies_as_rick(
         for url in urls
         if url['filename'] == name
     )
+    return directory / f'{name}.sigstore.json', digest
+
+
+def test_real_backfilled_bundle_verifies_as_rick(
+    tmp_path: pathlib.Path,
+) -> None:
+    bundle: pathlib.Path
+    digest: str
+    bundle, digest = _tissue_bundle(tmp_path)
+    result: dict[str, identities.Identity | None] = identities.verify_bundles(
+        [identities.BundleCheck('tissue', digest, bundle)], 'WoLpH/tissue'
+    )
+    assert result == {'tissue': 'rick'}
+
+
+def test_real_bundle_with_other_digest_or_junk_gives_none(
+    tmp_path: pathlib.Path,
+) -> None:
+    bundle: pathlib.Path
+    digest: str
+    bundle, digest = _tissue_bundle(tmp_path)
+    junk: pathlib.Path = tmp_path / 'junk.sigstore.json'
+    junk.write_text('{"not": "a bundle"}')
     result: dict[str, identities.Identity | None] = identities.verify_bundles(
         [
-            identities.BundleCheck(
-                name, digest, tmp_path / f'{name}.sigstore.json'
-            )
+            identities.BundleCheck('right', digest, bundle),
+            identities.BundleCheck('other-digest', '00' * 32, bundle),
+            identities.BundleCheck('junk', digest, junk),
         ],
         'WoLpH/tissue',
     )
-    assert result == {name: 'rick'}
+    assert result == {'right': 'rick', 'other-digest': None, 'junk': None}
+
+
+def test_verify_bundles_rejects_duplicate_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    check: identities.BundleCheck = identities.BundleCheck(
+        'a', '00' * 32, tmp_path / 'a.json'
+    )
+    with pytest.raises(ValueError, match='duplicate'):
+        identities.verify_bundles([check, check], 'WoLpH/x')
+
+
+@pytest.mark.parametrize('sha256', ['aa', 'zz' * 32, '00' * 33, ''])
+def test_bundle_check_rejects_bad_sha256(sha256: str) -> None:
+    with pytest.raises(ValueError, match='64 hex'):
+        identities.BundleCheck('a', sha256, pathlib.Path('a.json'))
+
+
+@pytest.mark.parametrize(
+    'output',
+    [
+        {'a': 'ci', 'extra': None},
+        {},
+        {'a': 'admin'},
+        {'a': True},
+        ['a'],
+    ],
+)
+def test_verify_bundles_rejects_unexpected_helper_output(
+    output: object, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def write_output(argv: list[str]) -> None:
+        pathlib.Path(_argument(argv, '--output')).write_text(
+            json.dumps(output)
+        )
+
+    recorder: Recorder = Recorder(
+        {PREFIX: completed()}, hooks={PREFIX: write_output}
+    )
+    monkeypatch.setattr(common, 'run', recorder)
+    with pytest.raises(signing.SigningError, match='unexpected output'):
+        identities.verify_bundles(
+            [identities.BundleCheck('a', '00' * 32, tmp_path / 'a.json')],
+            'WoLpH/x',
+        )

@@ -31,8 +31,11 @@ RICK_IDENTITY: str = 'wolph@wol.ph'
 
 EXIT_USAGE: int = 2
 
+SOURCE_REPOSITORY_OID: str = '1.3.6.1.4.1.57264.1.12'
+SHA256_PATTERN: re.Pattern[str] = re.compile(r'[0-9a-fA-F]{64}')
+
 _CI_SAN: re.Pattern[str] = re.compile(
-    r'https://github\.com/(?P<repo>[^/@]+/[^/@]+)'
+    r'https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)'
     r'/\.github/workflows/sign\.yml@refs/heads/(?P<branch>.+)'
 )
 
@@ -49,7 +52,24 @@ def ci_identity_matches(san: str, repo: str) -> bool:
     return match.group('repo').lower() == repo.lower()
 
 
-def _ci_policy(repo: str) -> typing.Any:
+def decode_utf8string(raw: bytes) -> str:
+    """Decode a DER UTF8String, as the 1.8 and later extensions hold."""
+    if len(raw) < 2 or raw[0] != 0x0C:
+        raise ValueError('not a DER UTF8String')
+    length: int = raw[1]
+    start: int = 2
+    if length & 0x80:
+        count: int = length & 0x7F
+        length = int.from_bytes(raw[2 : 2 + count], 'big')
+        start = 2 + count
+    body: bytes = raw[start:]
+    if len(body) != length:
+        raise ValueError('DER length does not match')
+    return body.decode()
+
+
+def ci_policy(repo: str) -> typing.Any:
+    """The policy for a sign.yml run of ``repo`` started by hand."""
     from cryptography import x509  # ty: ignore[import-not-found]
     from sigstore.errors import VerificationError  # ty: ignore[import-not-found]
     from sigstore.verify.policy import (  # ty: ignore[import-not-found]
@@ -75,10 +95,29 @@ def _ci_policy(repo: str) -> typing.Any:
                     f'no sign.yml identity of {repo} in {sans}'
                 )
 
+    class SourceRepository:
+        """Policy: the source repository extension names ``repo``."""
+
+        def verify(self, cert: x509.Certificate) -> None:
+            try:
+                raw: bytes = cert.extensions.get_extension_for_oid(
+                    x509.ObjectIdentifier(SOURCE_REPOSITORY_OID)
+                ).value.value
+                found: str = decode_utf8string(raw)
+            except (x509.ExtensionNotFound, ValueError) as error:
+                raise VerificationError(
+                    f'no usable source repository: {error}'
+                ) from error
+            if found.lower() != f'https://github.com/{repo}'.lower():
+                raise VerificationError(
+                    f'source repository {found} is not {repo}'
+                )
+
     return AllOf(
         [
             OIDCIssuerV2(CI_ISSUER),
             GitHubWorkflowTrigger('workflow_dispatch'),
+            SourceRepository(),
             SignYmlSan(),
         ]
     )
@@ -107,22 +146,21 @@ def verify_entries(
 
     verifier: typing.Any = Verifier.production()
     policies: list[tuple[str, typing.Any]] = [
-        ('ci', _ci_policy(repo)),
+        ('ci', ci_policy(repo)),
         ('rick', _rick_policy()),
     ]
     verdicts: dict[str, str | None] = {}
     for entry in entries:
         verdicts[entry['name']] = None
+        raw: bytes = pathlib.Path(entry['bundle']).read_bytes()
         try:
-            bundle: typing.Any = Bundle.from_json(
-                pathlib.Path(entry['bundle']).read_bytes()
-            )
-            digest: typing.Any = Hashed(
-                algorithm=HashAlgorithm.SHA2_256,
-                digest=bytes.fromhex(entry['sha256']),
-            )
-        except (InvalidBundle, OSError, ValueError):
+            bundle: typing.Any = Bundle.from_json(raw)
+        except (InvalidBundle, ValueError):
             continue
+        digest: typing.Any = Hashed(
+            algorithm=HashAlgorithm.SHA2_256,
+            digest=bytes.fromhex(entry['sha256']),
+        )
         for identity, policy in policies:
             try:
                 verifier.verify_artifact(digest, bundle, policy)
@@ -146,6 +184,9 @@ def main(argv: list[str]) -> int:
     except (argparse.ArgumentError, SystemExit):
         return EXIT_USAGE
     entries: list[dict[str, str]] = json.loads(args.manifest.read_text())
+    if not all(SHA256_PATTERN.fullmatch(entry['sha256']) for entry in entries):
+        print('sha256 must be 64 hex characters', file=sys.stderr)  # noqa: T201
+        return EXIT_USAGE
     verdicts: dict[str, str | None] = verify_entries(entries, args.repo)
     args.output.write_text(json.dumps(verdicts))
     return 0

@@ -27,6 +27,11 @@ class BundleCheck:
     sha256: str
     bundle: pathlib.Path
 
+    def __post_init__(self) -> None:
+        """Reject a sha256 that is not 64 hex characters."""
+        if not bundle_verifier.SHA256_PATTERN.fullmatch(self.sha256):
+            raise ValueError(f'sha256 of {self.name} is not 64 hex characters')
+
 
 def verify_bundles(
     checks: list[BundleCheck], repo: str
@@ -35,8 +40,12 @@ def verify_bundles(
 
     ``repo`` is ``OWNER/NAME``, the repository whose sign.yml counts as CI.
     A name maps to None when its bundle matches neither identity. Raises
-    SigningError when the helper itself fails.
+    SigningError when the helper fails or returns anything but one verdict
+    per name, ValueError for duplicate names.
     """
+    names: list[str] = [check.name for check in checks]
+    if len(set(names)) != len(names):
+        raise ValueError('duplicate names in bundle checks')
     with tempfile.TemporaryDirectory(prefix='ppt-verify-') as directory:
         manifest: pathlib.Path = pathlib.Path(directory) / 'manifest.json'
         output: pathlib.Path = pathlib.Path(directory) / 'output.json'
@@ -67,5 +76,15 @@ def verify_bundles(
             raise signing.SigningError(
                 f'bundle verification failed: {done.stderr.strip()}'
             )
-        verdicts: dict[str, Identity | None] = json.loads(output.read_text())
+        verdicts: object = json.loads(output.read_text())
+    if (
+        not isinstance(verdicts, dict)
+        or set(verdicts) != set(names)
+        or not all(
+            value in ('ci', 'rick', None) for value in verdicts.values()
+        )
+    ):
+        raise signing.SigningError(
+            f'bundle verification returned unexpected output: {verdicts!r}'
+        )
     return verdicts

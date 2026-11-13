@@ -37,7 +37,7 @@ repository = 'https://github.com/WoLpH/python-project-tools/'
 ppt = 'python_project_tools.cli:main'
 
 [project.optional-dependencies]
-tests = ['pytest>=8', 'pytest-cov>=5']
+tests = ['pytest>=8', 'pytest-cov>=5', 'pyyaml>=6']
 
 [dependency-groups]
 dev = ['python-project-tools[tests]', 'ruff', 'ty', 'tox-uv', 'tox>=4.21']

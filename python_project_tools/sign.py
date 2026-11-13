@@ -197,16 +197,46 @@ def _compare_dists(
         if asset is None:
             new.append(path)
             continue
-        fetched: pathlib.Path = github.download_asset(
-            asset, workdir / EXISTING_DIR
-        )
-        if common.sha256_of(fetched) == common.sha256_of(path):
+        if _same_as_asset(asset, path, workdir):
             outcome.kept.append(path.name)
             continue
         outcome.conflicts.append(path.name)
         if options.replace_assets:
             clobber.append(path)
     return new, clobber
+
+
+def _same_as_asset(
+    asset: github.Asset, path: pathlib.Path, workdir: pathlib.Path
+) -> bool:
+    """Whether the release asset has the bytes of the local ``path``."""
+    fetched: pathlib.Path = github.download_asset(
+        asset, workdir / EXISTING_DIR
+    )
+    return common.sha256_of(fetched) == common.sha256_of(path)
+
+
+def _check_ci_dists(
+    release: github.Release,
+    dists: list[pathlib.Path],
+    workdir: pathlib.Path,
+) -> None:
+    """Compare the dists sign.yml uploaded with the verified PyPI bytes.
+
+    Raises SigningError naming every asset that differs, so nothing is
+    signed with GPG or listed in SHA256SUMS on the word of the workflow.
+    """
+    assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
+    differ: list[str] = [
+        path.name
+        for path in dists
+        if not _same_as_asset(assets[path.name], path, workdir)
+    ]
+    if differ:
+        raise signing.SigningError(
+            f'{ci_sign.WORKFLOW} uploaded files that differ from PyPI: '
+            + ', '.join(differ)
+        )
 
 
 def _needed(name: str, present: set[str], options: SignOptions) -> bool:
@@ -659,7 +689,8 @@ def _take_ci_bundles(
 
     Returns the release as it stands afterwards and the dists ppt sign
     still has to upload. The dists and bundles sign.yml added count as
-    uploaded by this run.
+    uploaded by this run, and the dists it added must match the local
+    PyPI bytes (see ``_check_ci_dists``).
     """
     workflow: ci_bundles.Workflow = (
         options.ci_workflow or ci_bundles.check_workflow(options.repo)
@@ -683,6 +714,11 @@ def _take_ci_bundles(
         a.name for a in fresh.assets if a.name in ours and a.name not in before
     )
     after: set[str] = {a.name for a in fresh.assets}
+    _check_ci_dists(
+        fresh,
+        [d for d in dists if d.name in after and d.name not in before],
+        release_dir,
+    )
     return fresh, [p for p in new if p.name not in after]
 
 

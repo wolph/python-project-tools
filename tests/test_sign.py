@@ -829,6 +829,10 @@ class Ci:
         old: github.Release = self.current[self.dispatches[-1][1]]
         have: set[str] = {a.name for a in old.assets}
         added: list[str] = [n for n in DISTS if n not in have]
+        data: dict[str, bytes] = {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES}
+        for name in added:
+            # A test that sets other bytes makes sign.yml upload those.
+            self.world.asset_bytes.setdefault(name, data[name])
         added += BUNDLES if self.leaves is None else self.leaves
         names: list[str] = [a.name for a in old.assets] + [
             n for n in added if n not in have
@@ -1429,3 +1433,40 @@ def test_ci_partial_bundles_dispatch_once_for_the_missing_one(
     assert ci.checked == [['s.whl'], ['s.tar.gz']]
     assert 's.whl.sigstore.json' in out.kept
     assert 's.tar.gz.sigstore.json' in out.uploaded
+
+
+def test_ci_dist_uploaded_by_sign_yml_is_compared_with_pypi(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch, {'s.whl': b'tampered'})
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'sign.yml uploaded files that differ from PyPI: s.whl'
+    assert len(ci.dispatches) == 1
+    assert sorted(world.downloaded) == sorted(DISTS + tuple(BUNDLES))
+    assert world.uploads == []
+    assert world.signed == []
+    assert world.edits == []
+
+
+def test_ci_dists_uploaded_by_sign_yml_are_downloaded_and_compared(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert set(DISTS) <= set(world.downloaded)

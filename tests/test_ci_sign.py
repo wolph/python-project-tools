@@ -145,9 +145,46 @@ def test_dispatch_gives_up(
         }
     )
     monkeypatch.setattr(common, 'run', rec)
-    with pytest.raises(signing.SigningError, match=r'sign\.yml'):
+    with pytest.raises(signing.SigningError, match=r'sign\.yml') as info:
         ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
     assert clock.now >= ci_sign.FIND_SECONDS
+    assert OURS in str(info.value)
+    assert f'github.com/{REPO}/actions/workflows/sign.yml' in str(info.value)
+
+
+def test_dispatch_list_failure_raises_at_once(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    _ids(monkeypatch, OURS)
+    rec: Recorder = Recorder(
+        {
+            f'gh workflow run sign.yml -R {REPO}': completed(),
+            LIST: completed(returncode=1, stderr='HTTP 502'),
+        }
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    with pytest.raises(signing.SigningError, match='HTTP 502') as info:
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+    assert OURS in str(info.value)
+    assert 'already dispatched' in str(info.value)
+    assert clock.now == 0
+
+
+def test_dispatch_list_invalid_json_raises(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    _ids(monkeypatch, OURS)
+    rec: Recorder = Recorder(
+        {
+            f'gh workflow run sign.yml -R {REPO}': completed(),
+            LIST: completed('not json'),
+        }
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    with pytest.raises(signing.SigningError, match='invalid JSON') as info:
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+    assert OURS in str(info.value)
+    assert clock.now == 0
 
 
 def test_dispatch_failure_raises(
@@ -166,6 +203,7 @@ def test_watch_failure_names_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match=r'example\.com/r/5'):
         ci_sign.watch(REPO, ci_sign.Run(5, 'https://example.com/r/5'))
+    assert rec.captures == [False]
     assert rec.calls[0] == [
         'gh', 'run', 'watch', '5', '-R', REPO, '--exit-status',
     ]  # fmt: skip
@@ -187,9 +225,7 @@ def test_workflow_since_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ci_sign.workflow_since(REPO, 'master') is None
 
 
-def test_workflow_since_404_is_absent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_workflow_since_404_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     rec: Recorder = Recorder(
         {
             'gh api --paginate': completed(
@@ -198,7 +234,8 @@ def test_workflow_since_404_is_absent(
         }
     )
     monkeypatch.setattr(common, 'run', rec)
-    assert ci_sign.workflow_since(REPO, 'master') is None
+    with pytest.raises(RuntimeError, match='404'):
+        ci_sign.workflow_since(REPO, 'master')
 
 
 def test_workflow_since_other_failure_raises(

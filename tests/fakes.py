@@ -60,6 +60,7 @@ class Recorder:
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.timeouts: list[float | None] = []
+        self.captures: list[bool] = []
 
     @staticmethod
     def _joined(args: list[str]) -> str:
@@ -82,6 +83,7 @@ class Recorder:
         self.calls.append(list(args))
         self.envs.append(env)
         self.timeouts.append(timeout)
+        self.captures.append(capture)
         joined: str = self._joined(args)
         matches: list[str] = [
             key for key in self.replies if joined.startswith(key)

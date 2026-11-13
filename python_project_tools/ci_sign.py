@@ -50,30 +50,36 @@ def default_branch(repo: str) -> str:
 def workflow_since(repo: str, branch: str) -> dt.date | None:
     """Date of the first commit touching sign.yml on ``branch``.
 
-    None means there is no such commit, so sign.yml is absent. Any other
-    failure of gh raises and is never read as absent.
+    None means the commit list is empty, so sign.yml is absent. Every
+    failure of gh raises, a 404 included, and is never read as absent.
     """
     path: str = urllib.parse.quote(WORKFLOW_PATH, safe='/')
     sha: str = urllib.parse.quote(branch, safe='')
-    try:
-        commits: list[typing.Any] = typing.cast(
-            'list[typing.Any]',
-            github._paginated(
-                f'repos/{repo}/commits?path={path}&sha={sha}&per_page=100'
-            ),
-        )
-    except RuntimeError as error:
-        if 'HTTP 404' in str(error) or 'Not Found' in str(error):
-            return None
-        raise
+    commits: list[typing.Any] = typing.cast(
+        'list[typing.Any]',
+        github._paginated(
+            f'repos/{repo}/commits?path={path}&sha={sha}&per_page=100'
+        ),
+    )
     if not commits:
         return None
     oldest: str = str(commits[-1]['commit']['committer']['date'])
     return dt.datetime.fromisoformat(oldest.replace('Z', '+00:00')).date()
 
 
+def _dispatched_note(repo: str, request_id: str) -> str:
+    return (
+        f'{WORKFLOW} was already dispatched in {repo} with request_id '
+        f'{request_id}, so do not dispatch again. Look for the run at '
+        f'https://github.com/{repo}/actions/workflows/{WORKFLOW}'
+    )
+
+
 def _find_run(repo: str, request_id: str) -> Run | None:
-    """The run whose title ends with ``request_id`` as its last word."""
+    """The run whose title ends with ``request_id`` as its last word.
+
+    None means no such run is listed yet. A failing gh raises.
+    """
     done: subprocess.CompletedProcess[str] = common.run(
         [
             'gh', 'run', 'list', '-R', repo, '--workflow', WORKFLOW,
@@ -82,11 +88,17 @@ def _find_run(repo: str, request_id: str) -> Run | None:
         ]
     )  # fmt: skip
     if done.returncode != 0:
-        return None
+        raise SigningError(
+            f'gh run list failed: {(done.stderr or "").strip()}. '
+            f'{_dispatched_note(repo, request_id)}'
+        )
     try:
         raw: list[typing.Any] = json.loads(done.stdout or '[]')
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as error:
+        raise SigningError(
+            f'gh run list printed invalid JSON ({error}). '
+            f'{_dispatched_note(repo, request_id)}'
+        ) from error
     for item in raw:
         title: str = str(item.get('displayTitle', ''))
         if title.endswith(f' {request_id}'):
@@ -115,8 +127,8 @@ def dispatch(repo: str, tag: str, package: str, branch: str) -> Run:
             return run
         if time.monotonic() >= deadline:
             raise SigningError(
-                f'{WORKFLOW} was started in {repo} but its run did not '
-                f'appear within {FIND_SECONDS:g} seconds'
+                f'its run did not appear within {FIND_SECONDS:g} seconds. '
+                f'{_dispatched_note(repo, request_id)}'
             )
         time.sleep(POLL_SECONDS)
 

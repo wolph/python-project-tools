@@ -148,8 +148,11 @@ def test_dispatch_gives_up(
     with pytest.raises(signing.SigningError, match=r'sign\.yml') as info:
         ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
     assert clock.now >= ci_sign.FIND_SECONDS
-    assert OURS in str(info.value)
-    assert f'github.com/{REPO}/actions/workflows/sign.yml' in str(info.value)
+    assert str(info.value) == (
+        f'sign.yml run for request_id {OURS} did not appear within 120 s. '
+        f'Find it at https://github.com/{REPO}/actions/workflows/sign.yml, '
+        'and once it is green rerun ppt sign (bundles already made are kept)'
+    )
 
 
 def test_dispatch_list_failure_raises_at_once(
@@ -201,8 +204,12 @@ def test_dispatch_failure_raises(
 def test_watch_failure_names_url(monkeypatch: pytest.MonkeyPatch) -> None:
     rec: Recorder = Recorder({'gh run watch': completed(returncode=1)})
     monkeypatch.setattr(common, 'run', rec)
-    with pytest.raises(signing.SigningError, match=r'example\.com/r/5'):
+    with pytest.raises(signing.SigningError) as info:
         ci_sign.watch(REPO, ci_sign.Run(5, 'https://example.com/r/5'))
+    assert str(info.value) == (
+        'sign.yml run failed: https://example.com/r/5. Check the run, then '
+        'rerun ppt sign to retry (bundles already made are kept)'
+    )
     assert rec.captures == [False]
     assert rec.calls[0] == [
         'gh', 'run', 'watch', '5', '-R', REPO, '--exit-status',

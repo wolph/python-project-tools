@@ -67,11 +67,26 @@ def workflow_since(repo: str, branch: str) -> dt.date | None:
     return dt.datetime.fromisoformat(oldest.replace('Z', '+00:00')).date()
 
 
+KEPT_NOTE: str = '(bundles already made are kept)'
+
+
+def _workflow_url(repo: str) -> str:
+    return f'https://github.com/{repo}/actions/workflows/{WORKFLOW}'
+
+
 def _dispatched_note(repo: str, request_id: str) -> str:
     return (
         f'{WORKFLOW} was already dispatched in {repo} with request_id '
         f'{request_id}, so do not dispatch again. Look for the run at '
-        f'https://github.com/{repo}/actions/workflows/{WORKFLOW}'
+        f'{_workflow_url(repo)}'
+    )
+
+
+def _not_found(repo: str, request_id: str) -> str:
+    return (
+        f'{WORKFLOW} run for request_id {request_id} did not appear within '
+        f'{FIND_SECONDS:g} s. Find it at {_workflow_url(repo)}, and once it '
+        f'is green rerun ppt sign {KEPT_NOTE}'
     )
 
 
@@ -126,10 +141,7 @@ def dispatch(repo: str, tag: str, package: str, branch: str) -> Run:
         if run is not None:
             return run
         if time.monotonic() >= deadline:
-            raise SigningError(
-                f'its run did not appear within {FIND_SECONDS:g} seconds. '
-                f'{_dispatched_note(repo, request_id)}'
-            )
+            raise SigningError(_not_found(repo, request_id))
         time.sleep(POLL_SECONDS)
 
 
@@ -140,4 +152,7 @@ def watch(repo: str, run: Run) -> None:
         capture=False,
     )
     if done.returncode != 0:
-        raise SigningError(f'{WORKFLOW} run failed: {run.url}')
+        raise SigningError(
+            f'{WORKFLOW} run failed: {run.url}. Check the run, then rerun '
+            f'ppt sign to retry {KEPT_NOTE}'
+        )

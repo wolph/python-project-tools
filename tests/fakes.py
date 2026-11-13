@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import typing
 
 
 def covering_bundle(path: pathlib.Path) -> str:
@@ -45,12 +46,17 @@ class Recorder:
     Keys of ``replies`` are joined argv prefixes. The argv is cut at the
     first token starting with ``--notes-file`` before joining, so temporary
     paths never take part in matching. The longest matching key wins.
+    ``hooks`` maps the same keys to callables run with the argv before the
+    reply is returned, for a command whose result is a file it writes.
     """
 
     def __init__(
-        self, replies: dict[str, subprocess.CompletedProcess[str]]
+        self,
+        replies: dict[str, subprocess.CompletedProcess[str]],
+        hooks: dict[str, typing.Callable[[list[str]], None]] | None = None,
     ) -> None:
         self.replies: dict[str, subprocess.CompletedProcess[str]] = replies
+        self.hooks: dict[str, typing.Callable[[list[str]], None]] = hooks or {}
         self.calls: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.timeouts: list[float | None] = []
@@ -82,4 +88,7 @@ class Recorder:
         ]
         if not matches:
             raise AssertionError(f'no canned reply for argv {args!r}')
-        return self.replies[max(matches, key=len)]
+        key: str = max(matches, key=len)
+        if key in self.hooks:
+            self.hooks[key](args)
+        return self.replies[key]

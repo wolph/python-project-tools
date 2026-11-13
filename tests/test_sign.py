@@ -1470,3 +1470,76 @@ def test_ci_dists_uploaded_by_sign_yml_are_downloaded_and_compared(
     )
     assert out.status == 'signed', out.reason
     assert set(DISTS) <= set(world.downloaded)
+
+
+CI_BUNDLE_LINE: str = (
+    f'Each file has a GPG signature (`.asc`, key {signing.DEFAULT_GPG_KEY}) '
+    'and a Sigstore bundle (`.sigstore.json`) made by the sign.yml workflow '
+    'of this repository.'
+)
+BROWSER_BUNDLE_LINE: str = (
+    f'Each file has a GPG signature (`.asc`, key {signing.DEFAULT_GPG_KEY}) '
+    'and a Sigstore bundle (`.sigstore.json`).'
+)
+
+
+def test_footer_for_bundles_made_by_sign_yml(
+    ci_options: sign.SignOptions,
+) -> None:
+    lines: list[str] = _footer_lines(
+        sign.footer(ci_options, [], by_workflow=True)
+    )
+    assert lines == [
+        sign.FOOTER_MARKER,
+        'Signed on 2026-11-06 with `ppt sign`, after the release.',
+        sign.FILES_PYPI,
+        CI_BUNDLE_LINE,
+        '`SHA256SUMS.asc` signs the checksum list.',
+        'Rebuilt files, if any: none.',
+        f'How to verify: {sign.VERIFY_URL}',
+    ]
+
+
+def test_browser_footer_is_unchanged(options: sign.SignOptions) -> None:
+    assert BROWSER_BUNDLE_LINE in _footer_lines(sign.footer(options, []))
+
+
+def test_ci_run_appends_the_sign_yml_footer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert world.edits[0].startswith(sign.FOOTER_MARKER)
+    assert CI_BUNDLE_LINE in _footer_lines(world.edits[0])
+
+
+@pytest.mark.parametrize(
+    'verdicts',
+    [{'s.whl': 'rick', 's.tar.gz': 'rick'}, {'s.whl': 'rick'}],
+    ids=['all by rick', 'mixed'],
+)
+def test_ci_footer_names_sign_yml_only_when_it_made_every_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+    verdicts: dict[str, identities.Identity | None],
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release(BUNDLES, created_at=AFTER)
+    Ci(monkeypatch, world, [target], verdicts=verdicts)
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    lines: list[str] = _footer_lines(world.edits[0])
+    assert BROWSER_BUNDLE_LINE in lines
+    assert CI_BUNDLE_LINE not in lines

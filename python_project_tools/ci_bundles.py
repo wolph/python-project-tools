@@ -84,12 +84,14 @@ def _missing_bundles(
     dists: list[pathlib.Path],
     workdir: pathlib.Path,
     repo: str,
+    signers: dict[str, identities.Identity],
 ) -> list[str]:
     """Verify the bundles the release has, return the dists without one.
 
-    Raises SigningError naming every bundle that matches no accepted
-    identity, so a bad bundle is never answered with a dispatch whose
-    upload would collide with it.
+    Records who signed each verified bundle in ``signers``. Raises
+    SigningError naming every bundle that matches no accepted identity, so
+    a bad bundle is never answered with a dispatch whose upload would
+    collide with it.
     """
     assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
     checks: list[identities.BundleCheck] = []
@@ -116,6 +118,11 @@ def _missing_bundles(
             raise signing.SigningError(
                 'invalid bundle on the release: ' + ', '.join(invalid)
             )
+        signers.update(
+            (name, verdict)
+            for name, verdict in verdicts.items()
+            if verdict is not None
+        )
     return missing
 
 
@@ -138,24 +145,44 @@ class Target:
     conflicts: list[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class Settled:
+    """The bundles of a release once ``ensure`` is done."""
+
+    # The release read again after a sign.yml run, None when every bundle
+    # was there already and nothing was dispatched.
+    release: github.Release | None
+    # Who signed the bundle of each dist, by dist name.
+    signers: dict[str, identities.Identity]
+
+    @property
+    def by_workflow(self) -> bool:
+        """Whether sign.yml made every bundle."""
+        return bool(self.signers) and all(
+            signer == 'ci' for signer in self.signers.values()
+        )
+
+
 def ensure(
     target: Target,
     workdir: pathlib.Path,
     repo: str,
     package: str,
     workflow: Workflow,
-) -> github.Release | None:
+) -> Settled:
     """Give every dist of the release an accepted bundle.
 
-    Returns the release read again after a sign.yml run, or None when every
-    bundle was there already and nothing was dispatched. Raises SigningError
-    when a bundle is invalid, when sign.yml may not sign the release, when
-    its run fails and when the run leaves a bundle out.
+    Raises SigningError when a bundle is invalid, when sign.yml may not
+    sign the release, when its run fails and when the run leaves a bundle
+    out.
     """
     release: github.Release = target.release
-    missing: list[str] = _missing_bundles(release, target.dists, workdir, repo)
+    signers: dict[str, identities.Identity] = {}
+    missing: list[str] = _missing_bundles(
+        release, target.dists, workdir, repo, signers
+    )
     if not missing:
-        return None
+        return Settled(release=None, signers=signers)
     reason: str | None = refusal(release, target.rebuilt, workflow)
     if reason is not None:
         raise signing.SigningError(reason)
@@ -171,10 +198,10 @@ def ensure(
     ci_sign.watch(repo, run)
     fresh: github.Release = _reread(repo, release.tag)
     waited: list[pathlib.Path] = [p for p in target.dists if p.name in missing]
-    still: list[str] = _missing_bundles(fresh, waited, workdir, repo)
+    still: list[str] = _missing_bundles(fresh, waited, workdir, repo, signers)
     if still:
         raise signing.SigningError(
             f'{ci_sign.WORKFLOW} ran but left no bundle for '
             + ', '.join(still)
         )
-    return fresh
+    return Settled(release=fresh, signers=signers)

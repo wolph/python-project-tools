@@ -117,19 +117,33 @@ def _files_sentence(options: SignOptions, rebuilt_names: list[str]) -> str:
     return FILES_PYPI
 
 
-def footer(options: SignOptions, rebuilt_names: list[str]) -> str:
+def _bundles_sentence(options: SignOptions, by_workflow: bool) -> str:
+    """What the footer says about the signatures of each file."""
+    bundle: str = 'a Sigstore bundle (`.sigstore.json`)'
+    if by_workflow:
+        # Points the reader at the CI section of VERIFY.md.
+        bundle += ' made by the sign.yml workflow of this repository'
+    return (
+        f'Each file has a GPG signature (`.asc`, key {options.gpg_key}) and '
+        f'{bundle}.'
+    )
+
+
+def footer(
+    options: SignOptions, rebuilt_names: list[str], by_workflow: bool = False
+) -> str:
     """The note appended to a release body once it is signed.
 
     One sentence per line, so Markdown renders one paragraph. The marker
     line comes first, and rebuilt files are listed after the paragraph.
+    ``by_workflow`` says the repository's sign.yml made every bundle.
     """
     lines: list[str] = [
         FOOTER_MARKER,
         f'Signed on {options.signed_on.isoformat()} with `ppt sign`, after '
         'the release.',
         _files_sentence(options, rebuilt_names),
-        f'Each file has a GPG signature (`.asc`, key {options.gpg_key}) and '
-        'a Sigstore bundle (`.sigstore.json`).',
+        _bundles_sentence(options, by_workflow),
         '`SHA256SUMS.asc` signs the checksum list.',
     ]
     if not rebuilt_names and not options.multi_version:
@@ -394,10 +408,11 @@ def _append_footer(
     release: github.Release,
     rebuilt_names: list[str],
     options: SignOptions,
+    by_workflow: bool = False,
 ) -> None:
     if FOOTER_MARKER in release.body:
         return
-    text: str = footer(options, rebuilt_names)
+    text: str = footer(options, rebuilt_names, by_workflow)
     body: str = (
         f'{release.body.rstrip()}\n\n{text}' if release.body.strip() else text
     )
@@ -646,13 +661,14 @@ def _sign_files(
         release, dists, release_dir, options, outcome
     )
     if outcome.conflicts and not options.replace_assets:
-        outcome.status = 'failed'
-        outcome.reason = 'conflicting assets left alone: ' + ', '.join(
-            outcome.conflicts
+        _failed(
+            outcome,
+            'conflicting assets left alone: ' + ', '.join(outcome.conflicts),
         )
         return False
+    by_workflow: bool = False
     if options.sigstore == 'ci':
-        release, new = _take_ci_bundles(
+        release, new, by_workflow = _take_ci_bundles(
             release, files, dists, new, release_dir, options, outcome
         )
     present: set[str] = {a.name for a in release.assets}
@@ -672,7 +688,7 @@ def _sign_files(
             deferred, workdir / BUNDLES_DIR / release.tag
         )
     else:
-        _append_footer(release, rebuilt_names, options)
+        _append_footer(release, rebuilt_names, options, by_workflow)
     return True
 
 
@@ -684,11 +700,12 @@ def _take_ci_bundles(
     release_dir: pathlib.Path,
     options: SignOptions,
     outcome: SignOutcome,
-) -> tuple[github.Release, list[pathlib.Path]]:
+) -> tuple[github.Release, list[pathlib.Path], bool]:
     """Have sign.yml supply the missing bundles before anything is signed.
 
-    Returns the release as it stands afterwards and the dists ppt sign
-    still has to upload. The dists and bundles sign.yml added count as
+    Returns the release as it stands afterwards, the dists ppt sign still
+    has to upload and whether sign.yml made every bundle of the release
+    (see ``ci_bundles.Settled``). The dists and bundles sign.yml added count as
     uploaded by this run, and the dists it added must match the local
     PyPI bytes (see ``_check_ci_dists``).
     """
@@ -701,11 +718,12 @@ def _take_ci_bundles(
         rebuilt=_is_rebuilt(files),
         conflicts=list(outcome.conflicts),
     )
-    fresh: github.Release | None = ci_bundles.ensure(
+    settled: ci_bundles.Settled = ci_bundles.ensure(
         target, release_dir, options.repo, options.package, workflow
     )
+    fresh: github.Release | None = settled.release
     if fresh is None:
-        return release, new
+        return release, new, settled.by_workflow
     before: set[str] = {a.name for a in release.assets}
     ours: set[str] = {d.name for d in dists} | {
         ci_bundles.bundle_name(d.name) for d in dists
@@ -719,7 +737,7 @@ def _take_ci_bundles(
         [d for d in dists if d.name in after and d.name not in before],
         release_dir,
     )
-    return fresh, [p for p in new if p.name not in after]
+    return fresh, [p for p in new if p.name not in after], settled.by_workflow
 
 
 def releases_missing_signatures(

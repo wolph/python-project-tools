@@ -8,7 +8,17 @@ import typing
 
 import pytest
 
-from python_project_tools import cli, common, github, pypi, sign, signing
+from python_project_tools import (
+    ci_bundles,
+    ci_sign,
+    cli,
+    common,
+    github,
+    identities,
+    pypi,
+    sign,
+    signing,
+)
 from tests.fakes import Recorder, covering_bundle
 
 WHL_BYTES: bytes = b'wheel bytes'
@@ -41,6 +51,7 @@ class World:
         self.downloaded: list[str] = []
         self.signed: list[str] = []
         self.sigstore_calls: int = 0
+        self.events: list[str] = []
 
     @property
     def uploaded(self) -> list[str]:
@@ -62,7 +73,10 @@ def pypi_file(name: str, data: bytes) -> pypi.PypiFile:
 
 
 def release(
-    names: list[str], body: str = '', tag: str = 'v1.0'
+    names: list[str],
+    body: str = '',
+    tag: str = 'v1.0',
+    created_at: str = '',
 ) -> github.Release:
     return github.Release(
         tag=tag,
@@ -73,6 +87,7 @@ def release(
         assets=[
             github.Asset(n, 1, f'https://assets.example/{n}') for n in names
         ],
+        created_at=created_at,
     )
 
 
@@ -86,6 +101,7 @@ def options() -> sign.SignOptions:
     return sign.SignOptions(
         repo='o/r',
         package='s',
+        sigstore='browser',
         signed_on=dt.date(2026, 11, 6),
     )
 
@@ -109,6 +125,7 @@ def install(
         out: pathlib.Path = path.with_name(path.name + '.asc')
         out.write_text(f'sig {key}')
         world.signed.append(path.name)
+        world.events.append(f'gpg {path.name}')
         return out
 
     def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
@@ -237,7 +254,7 @@ def test_gpg_only_skips_sigstore(
     options: sign.SignOptions,
 ) -> None:
     world, _ = install(monkeypatch)
-    options.sigstore = False
+    options.sigstore = 'off'
     out: sign.SignOutcome = sign.sign_release(
         release([]), files, tmp_path, options
     )
@@ -544,7 +561,7 @@ def test_main_signs_one_tag_and_exits_zero(
         pypi, 'project', lambda package: project_with({'1.0': files})
     )
     monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
-    code: int = sign.main(['v1.0', '--package', 's'])
+    code: int = sign.main(['v1.0', '--package', 's', '--sigstore-browser'])
     assert code == 0
     assert 'v1.0: signed (uploaded 8, kept 0, conflicts 0)' in (
         capsys.readouterr().out
@@ -567,7 +584,7 @@ def test_main_exits_one_when_a_version_fails(
         pypi, 'project', lambda package: project_with({'1.0': files})
     )
     monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
-    assert sign.main(['--all', '--package', 's']) == 1
+    assert sign.main(['--all', '--package', 's', '--sigstore-browser']) == 1
     printed: str = capsys.readouterr().out
     assert 'v1.0: failed' in printed
     assert 'bad hash' in printed
@@ -700,7 +717,7 @@ def test_all_continues_after_a_signing_error(
         'releases',
         lambda repo: [release([], tag='v1.0'), release([], tag='v2.0')],
     )
-    assert sign.main(['--all', '--package', 's']) == 1
+    assert sign.main(['--all', '--package', 's', '--sigstore-browser']) == 1
     printed: str = capsys.readouterr().out
     assert 'v1.0: failed' in printed
     assert 'gpg exploded' in printed
@@ -725,3 +742,511 @@ def test_sums_pair_is_regenerated_together(
     clobbered: list[Upload] = [u for u in world.uploads if u.clobber]
     assert len(clobbered) == 1
     assert 'SHA256SUMS' in clobbered[0].names
+
+
+BUNDLES: list[str] = ['s.whl.sigstore.json', 's.tar.gz.sigstore.json']
+SINCE: dt.date = dt.date(2026, 11, 1)
+AFTER: str = '2026-11-10T12:00:00Z'
+BEFORE: str = '2026-10-01T12:00:00Z'
+RUN_URL: str = 'https://github.com/o/r/actions/runs/7'
+
+
+class Ci:
+    """sign.yml, its dispatch and the bundle verifier, all in memory.
+
+    ``current`` holds the releases as GitHub has them. A dispatch adds the
+    files the workflow would upload, the missing dists and their bundles,
+    unless ``leaves`` names the bundles it adds instead.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        world: World,
+        releases: list[github.Release],
+        verdicts: dict[str, identities.Identity | None] | None = None,
+        since: dt.date | None = SINCE,
+    ) -> None:
+        self.world: World = world
+        self.current: dict[str, github.Release] = {r.tag: r for r in releases}
+        self.verdicts: dict[str, identities.Identity | None] = verdicts or {}
+        self.since: dt.date | None = since
+        self.dispatches: list[tuple[str, str, str, str]] = []
+        self.watches: list[ci_sign.Run] = []
+        self.checked: list[list[str]] = []
+        self.since_calls: int = 0
+        self.watch_error: str = ''
+        self.leaves: list[str] | None = None
+        for name in BUNDLES:
+            world.asset_bytes.setdefault(name, b'bundle')
+        monkeypatch.setattr(ci_sign, 'default_branch', lambda repo: 'master')
+        monkeypatch.setattr(ci_sign, 'workflow_since', self.workflow_since)
+        monkeypatch.setattr(ci_sign, 'dispatch', self.dispatch)
+        monkeypatch.setattr(ci_sign, 'watch', self.watch)
+        monkeypatch.setattr(identities, 'verify_bundles', self.verify)
+        monkeypatch.setattr(
+            github, 'releases', lambda repo: list(self.current.values())
+        )
+
+    def workflow_since(self, repo: str, branch: str) -> dt.date | None:
+        self.since_calls += 1
+        return self.since
+
+    def dispatch(
+        self, repo: str, tag: str, package: str, branch: str
+    ) -> ci_sign.Run:
+        self.dispatches.append((repo, tag, package, branch))
+        self.world.events.append(f'dispatch {tag}')
+        return ci_sign.Run(7, RUN_URL)
+
+    def watch(self, repo: str, run: ci_sign.Run) -> None:
+        self.watches.append(run)
+        if self.watch_error:
+            raise signing.SigningError(self.watch_error)
+        old: github.Release = self.current[self.dispatches[-1][1]]
+        have: set[str] = {a.name for a in old.assets}
+        added: list[str] = [n for n in DISTS if n not in have]
+        added += BUNDLES if self.leaves is None else self.leaves
+        names: list[str] = [a.name for a in old.assets] + [
+            n for n in added if n not in have
+        ]
+        self.current[old.tag] = release(
+            names, body=old.body, tag=old.tag, created_at=old.created_at
+        )
+
+    def verify(
+        self, checks: list[identities.BundleCheck], repo: str
+    ) -> dict[str, identities.Identity | None]:
+        import hashlib
+
+        data: dict[str, bytes] = {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES}
+        for check in checks:
+            assert check.sha256 == hashlib.sha256(data[check.name]).hexdigest()
+            assert check.bundle.name == f'{check.name}.sigstore.json'
+            assert check.bundle.parent.name == ci_bundles.BUNDLES_DIR
+            assert check.bundle.is_file()
+        self.checked.append([c.name for c in checks])
+        return {c.name: self.verdicts.get(c.name, 'ci') for c in checks}
+
+
+@pytest.fixture
+def ci_options() -> sign.SignOptions:
+    return sign.SignOptions(
+        repo='o/r',
+        package='s',
+        signed_on=dt.date(2026, 11, 6),
+        ci_workflow=ci_bundles.Workflow(branch='master', since=SINCE),
+    )
+
+
+def test_sigstore_defaults_to_ci() -> None:
+    assert sign.SignOptions(repo='o/r', package='s').sigstore == 'ci'
+    assert sign.EXIT_NO_WORKFLOW == 3
+
+
+def test_ci_bundles_present_no_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release(BUNDLES, created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed'
+    assert ci.dispatches == []
+    assert ci.checked == [['s.whl', 's.tar.gz']]
+    assert world.sigstore_calls == 0
+    assert sorted(world.uploaded) == sorted(
+        n for n in ALL_NAMES if n not in BUNDLES
+    )
+    assert sorted(out.kept) == sorted(BUNDLES)
+    assert len(world.edits) == 1
+
+
+def test_ci_missing_dispatches_then_signs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master')]
+    assert ci.watches == [ci_sign.Run(7, RUN_URL)]
+    # Only the bundles that were missing are checked after the run.
+    assert ci.checked == [['s.whl', 's.tar.gz']]
+    assert world.events[0] == 'dispatch v1.0'
+    assert world.signed == ['s.whl', 's.tar.gz', 'SHA256SUMS']
+    # sign.yml uploaded the dists and bundles, ppt sign the rest.
+    assert sorted(world.uploaded) == [
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+        's.tar.gz.asc',
+        's.whl.asc',
+    ]
+    assert sorted(out.uploaded) == sorted(ALL_NAMES)
+    assert out.kept == []
+    assert world.sigstore_calls == 0
+
+
+def test_ci_invalid_bundle_stops(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release(['s.whl.sigstore.json'], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target], verdicts={'s.whl': None})
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'invalid bundle on the release: s.whl'
+    assert ci.dispatches == []
+    assert world.uploads == []
+    assert world.signed == []
+    assert world.edits == []
+
+
+def test_ci_run_failure_reports_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    ci.watch_error = f'sign.yml run failed: {RUN_URL}'
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert RUN_URL in out.reason
+    assert len(ci.dispatches) == 1
+    assert world.uploads == []
+    assert world.signed == []
+    assert world.edits == []
+
+
+def test_ci_run_that_leaves_a_bundle_out_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    ci.leaves = ['s.whl.sigstore.json']
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'sign.yml ran but left no bundle for s.tar.gz'
+    assert ci.checked == [['s.whl']]
+    assert world.uploads == []
+    assert world.signed == []
+
+
+def test_ci_invalid_bundle_after_the_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at=AFTER)
+    Ci(monkeypatch, world, [target], verdicts={'s.tar.gz': None})
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'invalid bundle on the release: s.tar.gz'
+    assert world.uploads == []
+
+
+def test_no_workflow_exits_3_before_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, rec = install(monkeypatch)
+    ci: Ci = Ci(
+        monkeypatch, world, [release([], created_at=AFTER)], since=None
+    )
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0': files})
+    )
+    code: int = sign.main(['v1.0', '--package', 's'])
+    assert code == sign.EXIT_NO_WORKFLOW == 3
+    assert world.uploads == []
+    assert not any('release upload' in ' '.join(c) for c in rec.calls)
+    assert world.signed == []
+    assert ci.dispatches == []
+    err: str = capsys.readouterr().err
+    assert err.strip() == (
+        'no sign.yml on master of o/r: copy templates/sign.yml from '
+        'python-project-tools, or pass --sigstore-browser'
+    )
+
+
+def test_no_workflow_error_is_a_runtime_error() -> None:
+    assert issubclass(sign.NoWorkflowError, RuntimeError)
+
+
+def test_all_skips_releases_before_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    old: github.Release = release([], tag='v1.0', created_at=BEFORE)
+    new: github.Release = release([], tag='v2.0', created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [old, new])
+    monkeypatch.setattr(
+        pypi,
+        'project',
+        lambda package: project_with({'1.0': files, '2.0': files}),
+    )
+    assert sign.main(['--all', '--package', 's']) == 1
+    printed: str = capsys.readouterr().out
+    assert 'v1.0: failed (uploaded 0, kept 0, conflicts 0): predates ' in (
+        printed
+    )
+    assert 'predates sign.yml, sign with --sigstore-browser' in printed
+    assert 'v2.0: signed' in printed
+    assert [d[1] for d in ci.dispatches] == ['v2.0']
+    assert ci.since_calls == 1
+
+
+def test_release_without_created_at_counts_as_predating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([])
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'predates sign.yml, sign with --sigstore-browser'
+    assert ci.dispatches == []
+    assert world.uploads == []
+
+
+def test_release_on_the_cutover_day_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], created_at='2026-11-01T00:00:01Z')
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert len(ci.dispatches) == 1
+
+
+def test_rebuilt_files_not_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    local_dir: pathlib.Path = tmp_path / 'local'
+    local_dir.mkdir()
+    local: pathlib.Path = local_dir / 's.whl'
+    local.write_bytes(WHL_BYTES)
+    ci_options.rebuilt = {'s.whl': '# rebuilt from tag'}
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, [local], tmp_path / 'work', ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'predates sign.yml, sign with --sigstore-browser'
+    assert ci.dispatches == []
+    assert world.uploads == []
+    assert world.signed == []
+
+
+def test_rick_bundles_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    target: github.Release = release(BUNDLES, created_at=BEFORE)
+    ci: Ci = Ci(
+        monkeypatch,
+        world,
+        [target],
+        verdicts={'s.whl': 'rick', 's.tar.gz': 'rick'},
+    )
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert ci.dispatches == []
+    assert 's.whl.asc' in world.uploaded
+
+
+def test_ci_sigstore_only_skips_gpg(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch)
+    ci_options.gpg = False
+    target: github.Release = release([], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'signed', out.reason
+    assert len(ci.dispatches) == 1
+    assert world.signed == []
+    assert world.uploaded == ['SHA256SUMS']
+
+
+def test_ci_dry_run_names_the_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, rec = install(monkeypatch)
+    ci_options.dry_run = True
+    target: github.Release = release(['s.whl.sigstore.json'], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    printed: str = capsys.readouterr().out
+    assert 'would dispatch sign.yml for s.tar.gz\n' in printed
+    assert 'would upload s.tar.gz.sigstore.json' not in printed
+    assert 'would upload s.whl.asc' in printed
+    assert ci.dispatches == []
+    assert ci.checked == []
+    assert rec.calls == []
+    assert world.uploads == []
+    assert 's.whl.sigstore.json' in out.kept
+
+
+def test_ci_dry_run_reports_a_release_before_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    ci_options.dry_run = True
+    target: github.Release = release([], created_at=BEFORE)
+    Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert 'would dispatch' not in capsys.readouterr().out
+    assert out.status == 'failed'
+    assert out.reason == 'predates sign.yml, sign with --sigstore-browser'
+
+
+def test_sigstore_browser_flag_uses_browser_signer(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+) -> None:
+    world, _ = install(monkeypatch)
+
+    def forbidden(*args: object, **kwargs: object) -> typing.NoReturn:
+        raise AssertionError('ci_sign must not run with --sigstore-browser')
+
+    for name in ('default_branch', 'workflow_since', 'dispatch', 'watch'):
+        monkeypatch.setattr(ci_sign, name, forbidden)
+    monkeypatch.setattr(identities, 'verify_bundles', forbidden)
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0': files})
+    )
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    assert sign.main(['v1.0', '--package', 's', '--sigstore-browser']) == 0
+    assert world.sigstore_calls == 1
+    assert sorted(world.uploaded) == sorted(ALL_NAMES)
+
+
+def test_sigstore_browser_with_sigstore_only_skips_gpg(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+) -> None:
+    world, _ = install(monkeypatch)
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0': files})
+    )
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    argv: list[str] = ['v1.0', '--package', 's']
+    assert sign.main([*argv, '--sigstore-browser', '--sigstore-only']) == 0
+    assert world.sigstore_calls == 1
+    assert world.signed == []
+
+
+def test_gpg_only_with_sigstore_browser_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        sign.main(['v1.0', '--gpg-only', '--sigstore-browser'])
+    assert raised.value.code == 2
+    assert '--sigstore-browser cannot be used with --gpg-only' in (
+        capsys.readouterr().err
+    )
+
+
+def test_gpg_only_needs_no_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+) -> None:
+    world, _ = install(monkeypatch)
+    ci: Ci = Ci(monkeypatch, world, [release([])], since=None)
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0': files})
+    )
+    assert sign.main(['v1.0', '--package', 's', '--gpg-only']) == 0
+    assert ci.since_calls == 0
+    assert 's.whl.asc' in world.uploaded
+
+
+def test_ci_conflicting_asset_stops_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch, {'s.whl': b'other'})
+    ci_options.replace_assets = True
+    target: github.Release = release(['s.whl'], created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == 'conflicting assets stop sign.yml: s.whl'
+    assert ci.dispatches == []
+    assert world.uploads == []

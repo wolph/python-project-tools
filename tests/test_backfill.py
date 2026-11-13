@@ -2329,3 +2329,31 @@ def test_dry_run_names_the_existing_latest_as_the_target(
     lines: list[str] = capsys.readouterr().out.splitlines()
     assert lines[0] == 'target: v1.0 (the existing Latest)'
     assert lines[1] == 'order: 0.9, 1.0'
+
+
+def test_signed_names_follow_the_sigstore_mode() -> None:
+    names: list[str] = ['spam-1.0.tar.gz']
+    off: sign.SignOptions = sign.SignOptions(
+        repo='o/r', package='spam', sigstore='off'
+    )
+    browser: sign.SignOptions = sign.SignOptions(
+        repo='o/r', package='spam', sigstore='browser'
+    )
+    assert backfill._signed_names(names, off) == {
+        'SHA256SUMS',
+        'SHA256SUMS.asc',
+        'spam-1.0.tar.gz',
+        'spam-1.0.tar.gz.asc',
+    }
+    assert 'spam-1.0.tar.gz.sigstore.json' in backfill._signed_names(
+        names, browser
+    )
+
+
+def test_backfill_maps_its_sigstore_flag_to_a_mode() -> None:
+    options: backfill.BackfillOptions = backfill.BackfillOptions(
+        repo='o/r', checkout=pathlib.Path('.')
+    )
+    assert backfill._sign_options('spam', options).sigstore == 'browser'
+    options.sigstore = False
+    assert backfill._sign_options('spam', options).sigstore == 'off'

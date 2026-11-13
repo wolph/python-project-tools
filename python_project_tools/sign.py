@@ -1,9 +1,11 @@
 """``ppt sign``: GPG and Sigstore signatures on a GitHub release.
 
 Files are taken from PyPI (sha256 verified) or from local rebuilds, signed,
-and attached to the release next to a ``SHA256SUMS`` list. Call the other
-modules through their attributes (``pypi.download``, ``github.upload_assets``)
-so tests can replace them.
+and attached to the release next to a ``SHA256SUMS`` list. By default the
+Sigstore bundles come from the repository's sign.yml workflow (see
+``ci_bundles``), the browser signer only runs with ``--sigstore-browser``.
+Call the other modules through their attributes (``pypi.download``,
+``github.upload_assets``) so tests can replace them.
 """
 
 from __future__ import annotations
@@ -15,8 +17,22 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import typing
 
-from python_project_tools import common, github, pypi, signing, versions
+from python_project_tools import (
+    ci_bundles,
+    ci_sign,
+    common,
+    github,
+    pypi,
+    signing,
+    versions,
+)
+from python_project_tools.ci_bundles import NoWorkflowError
+
+# 'ci': bundles from sign.yml, 'browser': signed here through a browser
+# login, 'off': no Sigstore bundles at all.
+SigstoreMode = typing.Literal['ci', 'browser', 'off']
 
 FOOTER_MARKER: str = '<!-- ppt-signed -->'
 VERIFY_URL: str = (
@@ -24,6 +40,7 @@ VERIFY_URL: str = (
 )
 SUMS_NAME: str = signing.SHA256SUMS_NAME
 EXISTING_DIR: str = 'existing'
+EXIT_NO_WORKFLOW: int = 3
 BUNDLES_DIR: str = 'bundles'
 PENDING: str = 'bundles pending'
 FILES_PYPI: str = (
@@ -75,7 +92,7 @@ class SignOptions:
     repo: str
     package: str
     gpg: bool = True
-    sigstore: bool = True
+    sigstore: SigstoreMode = 'ci'
     gpg_key: str = signing.DEFAULT_GPG_KEY
     replace_assets: bool = False
     dry_run: bool = False
@@ -86,6 +103,9 @@ class SignOptions:
     sigstore_later: bool = False
     # The release holds the files of several versions (the untagged anchor).
     multi_version: bool = False
+    # The sign.yml of the repository, checked once per run by main. Mode
+    # 'ci' looks it up per release when it is left out.
+    ci_workflow: ci_bundles.Workflow | None = None
 
 
 def _files_sentence(options: SignOptions, rebuilt_names: list[str]) -> str:
@@ -136,8 +156,8 @@ def _signature_names(dist_names: list[str], options: SignOptions) -> list[str]:
     for name in dist_names:
         if options.gpg:
             names.append(f'{name}.asc')
-        if options.sigstore:
-            names.append(f'{name}.sigstore.json')
+        if options.sigstore != 'off':
+            names.append(ci_bundles.bundle_name(name))
     names.append(SUMS_NAME)
     if options.gpg:
         names.append(f'{SUMS_NAME}.asc')
@@ -213,7 +233,7 @@ def _make_signatures(
             for p in dists
             if _needed(f'{p.name}.asc', present, options)
         )
-    if options.sigstore:
+    if options.sigstore == 'browser':
         todo: list[pathlib.Path] = [
             p
             for p in dists
@@ -267,10 +287,13 @@ def _split_signatures(
         if p.name in present and (options.replace_assets or p.name in pair)
     ]
     replaced: set[str] = {p.name for p in clobber}
+    # Until _upload runs, outcome.uploaded holds only what sign.yml added.
     outcome.kept.extend(
         name
         for name in _signature_names(dist_names, options)
-        if name in present and name not in replaced
+        if name in present
+        and name not in replaced
+        and name not in outcome.uploaded
     )
     return new, clobber
 
@@ -405,12 +428,12 @@ def _dry_run(
     options: SignOptions,
     outcome: SignOutcome,
 ) -> SignOutcome:
-    """Print every action of a run and perform none."""
+    """Print every action of a run and perform none.
+
+    Raises SigningError when sign.yml may not sign the release.
+    """
     present: set[str] = {a.name for a in release.assets}
-    dist_names: list[str] = [
-        item.name if isinstance(item, pathlib.Path) else item.filename
-        for item in files
-    ]
+    dist_names: list[str] = _dist_names(files)
     for item in files:
         if not isinstance(item, pathlib.Path):
             _say(f'would download {item.filename}')
@@ -421,6 +444,8 @@ def _dry_run(
     wanted: list[str] = [
         n for n in dist_names if n not in present
     ] + _signature_names(dist_names, options)
+    if options.sigstore == 'ci':
+        wanted = _dry_run_ci(release, files, wanted, options, outcome)
     for name in wanted:
         if name not in present or options.replace_assets:
             _say(f'would upload {name}')
@@ -430,6 +455,58 @@ def _dry_run(
     if FOOTER_MARKER not in release.body:
         _say('would append footer')
     return _finish(outcome)
+
+
+def _dry_run_ci(
+    release: github.Release,
+    files: list[pypi.PypiFile] | list[pathlib.Path],
+    wanted: list[str],
+    options: SignOptions,
+    outcome: SignOutcome,
+) -> list[str]:
+    """Say what sign.yml would do, return the names left for ppt sign.
+
+    Bundles are never uploaded by ppt sign in mode 'ci', and a dispatched
+    sign.yml uploads the missing dists as well. Bundles do not get checked
+    here, because a dry run downloads nothing. Raises SigningError when
+    sign.yml may not sign the release.
+    """
+    present: set[str] = {a.name for a in release.assets}
+    dist_names: list[str] = _dist_names(files)
+    bundles: set[str] = {ci_bundles.bundle_name(n) for n in dist_names}
+    outcome.kept.extend(n for n in wanted if n in bundles and n in present)
+    left: list[str] = [n for n in wanted if n not in bundles]
+    missing: list[str] = [
+        n for n in dist_names if ci_bundles.bundle_name(n) not in present
+    ]
+    if not missing:
+        return left
+    if options.ci_workflow is not None:
+        reason: str | None = ci_bundles.refusal(
+            release, _is_rebuilt(files), options.ci_workflow
+        )
+        if reason is not None:
+            raise signing.SigningError(reason)
+    _say(f'would dispatch {ci_sign.WORKFLOW} for {", ".join(missing)}')
+    return [n for n in left if n not in dist_names]
+
+
+def _dist_names(files: list[pypi.PypiFile] | list[pathlib.Path]) -> list[str]:
+    return [
+        item.name if isinstance(item, pathlib.Path) else item.filename
+        for item in files
+    ]
+
+
+def _is_rebuilt(files: list[pypi.PypiFile] | list[pathlib.Path]) -> bool:
+    """Whether any file was built here, which sign.yml cannot sign."""
+    return any(isinstance(item, pathlib.Path) for item in files)
+
+
+def _failed(outcome: SignOutcome, reason: str) -> SignOutcome:
+    outcome.status = 'failed'
+    outcome.reason = reason
+    return outcome
 
 
 def sign_release(
@@ -452,11 +529,12 @@ def sign_release(
         reason='',
     )
     if not files:
-        outcome.status = 'failed'
-        outcome.reason = 'no files for this version'
-        return outcome
+        return _failed(outcome, 'no files for this version')
     if options.dry_run:
-        return _dry_run(release, files, options, outcome)
+        try:
+            return _dry_run(release, files, options, outcome)
+        except HANDLED_ERRORS as error:
+            return _failed(outcome, str(error))
     release_dir: pathlib.Path = workdir / release.tag
     try:
         release_dir.mkdir(parents=True, exist_ok=True)
@@ -465,9 +543,7 @@ def sign_release(
         ):
             return outcome
     except HANDLED_ERRORS as error:
-        outcome.status = 'failed'
-        outcome.reason = str(error)
-        return outcome
+        return _failed(outcome, str(error))
     finally:
         shutil.rmtree(release_dir, ignore_errors=True)
     return _finish(outcome)
@@ -483,8 +559,10 @@ def _sign_files(
 ) -> bool:
     """The steps of ``sign_release``, False when conflicts stop it.
 
-    Deferred bundles are staged in ``workdir / 'bundles' / tag``, which
-    outlives ``release_dir``, and the footer then waits for them.
+    In mode 'ci' the bundles are settled first, so a failing sign.yml
+    leaves the release without any file from this run. Deferred bundles
+    are staged in ``workdir / 'bundles' / tag``, which outlives
+    ``release_dir``, and the footer then waits for them.
     """
     dists: list[pathlib.Path] = _local_dists(files, release_dir)
     new, clobber = _compare_dists(
@@ -496,6 +574,10 @@ def _sign_files(
             outcome.conflicts
         )
         return False
+    if options.sigstore == 'ci':
+        release, new = _take_ci_bundles(
+            release, files, dists, new, release_dir, options, outcome
+        )
     present: set[str] = {a.name for a in release.assets}
     produced, deferred = _make_signatures(dists, release_dir, options, present)
     sig_new, sig_clobber = _split_signatures(
@@ -512,6 +594,46 @@ def _sign_files(
     else:
         _append_footer(release, rebuilt_names, options)
     return True
+
+
+def _take_ci_bundles(
+    release: github.Release,
+    files: list[pypi.PypiFile] | list[pathlib.Path],
+    dists: list[pathlib.Path],
+    new: list[pathlib.Path],
+    release_dir: pathlib.Path,
+    options: SignOptions,
+    outcome: SignOutcome,
+) -> tuple[github.Release, list[pathlib.Path]]:
+    """Have sign.yml supply the missing bundles before anything is signed.
+
+    Returns the release as it stands afterwards and the dists ppt sign
+    still has to upload. The dists and bundles sign.yml added count as
+    uploaded by this run.
+    """
+    workflow: ci_bundles.Workflow = (
+        options.ci_workflow or ci_bundles.check_workflow(options.repo)
+    )
+    target: ci_bundles.Target = ci_bundles.Target(
+        release=release,
+        dists=dists,
+        rebuilt=_is_rebuilt(files),
+        conflicts=list(outcome.conflicts),
+    )
+    fresh: github.Release | None = ci_bundles.ensure(
+        target, release_dir, options.repo, options.package, workflow
+    )
+    if fresh is None:
+        return release, new
+    before: set[str] = {a.name for a in release.assets}
+    ours: set[str] = {d.name for d in dists} | {
+        ci_bundles.bundle_name(d.name) for d in dists
+    }
+    outcome.uploaded.extend(
+        a.name for a in fresh.assets if a.name in ours and a.name not in before
+    )
+    after: set[str] = {a.name for a in fresh.assets}
+    return fresh, [p for p in new if p.name not in after]
 
 
 def releases_missing_signatures(
@@ -570,6 +692,12 @@ def _build_parser() -> argparse.ArgumentParser:
     only = parser.add_mutually_exclusive_group()
     only.add_argument('--gpg-only', action='store_true')
     only.add_argument('--sigstore-only', action='store_true')
+    parser.add_argument(
+        '--sigstore-browser',
+        action='store_true',
+        help='sign with Sigstore here through a browser login instead of '
+        'taking the bundles from sign.yml',
+    )
     parser.add_argument('--gpg-key', default=signing.DEFAULT_GPG_KEY)
     parser.add_argument('--replace-assets', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
@@ -643,9 +771,37 @@ def _sign_all(
     return outcomes
 
 
+def _sigstore_mode(args: argparse.Namespace) -> SigstoreMode:
+    if args.gpg_only:
+        return 'off'
+    if args.sigstore_browser:
+        return 'browser'
+    return 'ci'
+
+
+def _options(args: argparse.Namespace, repo: str, package: str) -> SignOptions:
+    return SignOptions(
+        repo=repo,
+        package=package,
+        gpg=not args.sigstore_only,
+        sigstore=_sigstore_mode(args),
+        gpg_key=args.gpg_key,
+        replace_assets=args.replace_assets,
+        dry_run=args.dry_run,
+    )
+
+
 def main(argv: list[str]) -> int:
-    """Run ``ppt sign`` and return its exit status."""
-    args: argparse.Namespace = _build_parser().parse_args(argv)
+    """Run ``ppt sign`` and return its exit status.
+
+    In mode 'ci' sign.yml is looked up once, before the first release, so
+    a repository without it exits with EXIT_NO_WORKFLOW and nothing
+    uploaded.
+    """
+    parser: argparse.ArgumentParser = _build_parser()
+    args: argparse.Namespace = parser.parse_args(argv)
+    if args.gpg_only and args.sigstore_browser:
+        parser.error('--sigstore-browser cannot be used with --gpg-only')
     package: str = args.package or common.read_package_name()
     if not package:
         _fail('no --package and no pyproject.toml here')
@@ -656,19 +812,21 @@ def main(argv: list[str]) -> int:
         if not repo:
             _fail(f'no --repo and PyPI has none for {package}')
             return 2
-        options: SignOptions = SignOptions(
-            repo=repo,
-            package=package,
-            gpg=not args.sigstore_only,
-            sigstore=not args.gpg_only,
-            gpg_key=args.gpg_key,
-            replace_assets=args.replace_assets,
-            dry_run=args.dry_run,
-        )
+        options: SignOptions = _options(args, repo, package)
         targets: list[github.Release] = _resolve_targets(
             args, options, project
         )
-    except (LookupError, RuntimeError, common.FetchError) as error:
+        if options.sigstore == 'ci' and targets:
+            options.ci_workflow = ci_bundles.check_workflow(repo)
+    except NoWorkflowError as error:
+        _fail(str(error))
+        return EXIT_NO_WORKFLOW
+    except (
+        LookupError,
+        RuntimeError,
+        signing.SigningError,
+        common.FetchError,
+    ) as error:
         _fail(str(error))
         return 2
     outcomes: list[SignOutcome] = _sign_all(targets, project, options)

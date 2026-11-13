@@ -824,7 +824,7 @@ def _signed_names(entries: list[str], options: sign.SignOptions) -> set[str]:
     if options.gpg:
         names.add(f'{sign.SUMS_NAME}.asc')
         names.update(f'{entry}.asc' for entry in entries)
-    if options.sigstore:
+    if options.sigstore != 'off':
         names.update(f'{entry}{signing.BUNDLE_SUFFIX}' for entry in entries)
     return names
 
@@ -1353,7 +1353,8 @@ def _sign_options(package: str, options: BackfillOptions) -> sign.SignOptions:
         repo=options.repo,
         package=package,
         gpg=options.gpg,
-        sigstore=options.sigstore,
+        # The backfill signs old releases, which predate sign.yml.
+        sigstore='browser' if options.sigstore else 'off',
         gpg_key=options.gpg_key,
         replace_assets=options.replace_assets,
         dry_run=options.dry_run,

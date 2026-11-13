@@ -1,3 +1,14 @@
+2.2.0:
+
+ * ``ppt sign`` takes the Sigstore bundles from the ``sign.yml`` workflow of
+   the repository instead of a browser login. It exits 3 when the repository
+   has no ``sign.yml`` yet, and ``--sigstore-browser`` signs with the browser
+   login as before.
+ * ``templates/sign.yml``: the workflow to copy into ``.github/workflows``.
+ * ``ppt verify-release`` checks who signed each Sigstore bundle and verifies
+   ``SHA256SUMS.asc`` with GPG.
+ * ``VERIFY.md``: how to check a bundle signed by CI.
+
 2.1.0:
 
  * ``ppt inventory``: PyPI versions against GitHub tags, releases and

@@ -24,7 +24,7 @@ shows how to check them.
 - `inventory`: list the PyPI versions of a package against GitHub tags, releases and signatures.
 - `conda-forge`: inspect and update the conda-forge feedstock of a package.
 - `match-tag`: find the commit whose tracked files match a PyPI sdist byte for byte and create a signed tag for it.
-- `sign`: sign the PyPI files of a GitHub release with GPG and Sigstore and attach the signatures.
+- `sign`: sign the PyPI files of a GitHub release with GPG and Sigstore and attach the signatures. The Sigstore bundles come from the `sign.yml` workflow of the repository (copy `templates/sign.yml` to `.github/workflows/sign.yml`). `ppt sign` exits 3 when the default branch has no `sign.yml`, and `--sigstore-browser` signs with a browser login instead.
 - `backfill`: give every PyPI version a tag, a release and signed files, rebuilding from the tag when PyPI has none.
 
 `ppt backfill --batch FILE` backfills several packages in one run and needs a

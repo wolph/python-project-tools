@@ -73,7 +73,21 @@ The identity was read from the first real bundle, tissue 0.9.2, signed on 2026-1
 
 ## Checking a bundle signed by CI
 
-Files signed by a GitHub Actions workflow use a different identity, the workflow itself, and a different command. That arrives with the CI signing step and this page will get its own section then.
+Since `ppt` 2.2.0 the Sigstore bundles are made by the `sign.yml` workflow of the repository, triggered by hand with `workflow_dispatch`, so the certificate names that workflow instead of a person. Verify with the repository, the trigger and the workflow name:
+
+```bash
+uvx sigstore verify github --bundle FILE.sigstore.json --repository wolph/<repo> --trigger workflow_dispatch --name 'Sign release' FILE
+```
+
+The repository is written in lowercase because that is how the certificate carries it. The certificate names `sign.yml` on a branch of that repository, unlike the attestation on PyPI, which names `publish.yml`.
+
+To pin the exact workflow file and branch, pass the identity instead of the repository. The issuer is the GitHub Actions one, and `sigstore verify github` checks it for you:
+
+```bash
+uvx sigstore verify github --bundle FILE.sigstore.json --cert-identity https://github.com/wolph/<repo>/.github/workflows/sign.yml@refs/heads/develop --trigger workflow_dispatch FILE
+```
+
+The certificate issuer is `https://token.actions.githubusercontent.com`. Releases signed before 2.2.0, or by `ppt sign --sigstore-browser`, still carry the identity of the previous section.
 
 ## Comparing with PyPI
 

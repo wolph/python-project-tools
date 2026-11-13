@@ -29,7 +29,7 @@ import tempfile
 import time
 from collections.abc import Callable
 
-from python_project_tools import common, github
+from python_project_tools import common, github, identities, signing
 from python_project_tools.toml_compat import tomllib
 
 CHANGELOG_NAMES: tuple[str, ...] = (
@@ -233,10 +233,64 @@ def check_signatures(tag: str) -> common.Result:
         return common.Result(
             'signatures', 'FAIL', f'missing {", ".join(missing)}'
         )
+    return check_identities(repo, matches[0], dists)
+
+
+def check_identities(
+    repo: str, release: github.Release, dists: list[str]
+) -> common.Result:
+    """Every Sigstore bundle was made by the CI workflow or by Rick.
+
+    The digests come from SHA256SUMS, which Rick's key signed, so the dists
+    themselves stay off the download list.
+    """
+    by_name: dict[str, github.Asset] = {a.name: a for a in release.assets}
+    wanted: list[str] = ['SHA256SUMS']
+    wanted += [f'{dist}.sigstore.json' for dist in dists]
+    with tempfile.TemporaryDirectory(prefix='ppt-signatures-') as directory:
+        folder: pathlib.Path = pathlib.Path(directory)
+        try:
+            for name in wanted:
+                github.download_asset(by_name[name], folder)
+            sums: dict[str, str] = signing.parse_sha256sums(
+                folder / 'SHA256SUMS'
+            )
+            checks: list[identities.BundleCheck] = []
+            for dist in dists:
+                if not sums.get(dist):
+                    return common.Result(
+                        'signatures', 'FAIL', f'{dist} is not in SHA256SUMS'
+                    )
+                checks.append(
+                    identities.BundleCheck(
+                        dist, sums[dist], folder / f'{dist}.sigstore.json'
+                    )
+                )
+            verdicts: dict[str, identities.Identity | None] = (
+                identities.verify_bundles(checks, repo)
+            )
+        except (
+            common.FetchError,
+            signing.SigningError,
+            OSError,
+            ValueError,
+        ) as error:
+            return common.Result('signatures', 'FAIL', str(error))
+    unknown: list[str] = [d for d in dists if verdicts.get(d) is None]
+    if unknown:
+        return common.Result(
+            'signatures',
+            'FAIL',
+            f'{", ".join(unknown)}: signed by neither the CI workflow '
+            f'nor Rick',
+        )
+    ci: int = sum(1 for d in dists if verdicts[d] == 'ci')
+    rick: int = len(dists) - ci
     return common.Result(
         'signatures',
         'PASS',
-        f'{len(dists)} files with .asc and .sigstore.json, SHA256SUMS signed',
+        f'{len(dists)} files with .asc and .sigstore.json '
+        f'(ci: {ci}, rick: {rick}), SHA256SUMS signed',
     )
 
 

@@ -7,6 +7,8 @@ from python_project_tools import (
     cli,
     common,
     github as gh,
+    identities,
+    signing,
     verify_release,
 )
 
@@ -154,10 +156,122 @@ def _patch_release(
     monkeypatch.setattr(gh, 'releases', lambda repo: found)
 
 
-def test_check_signatures_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+DIGEST: str = 'a' * 64
+
+
+def _patch_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    sums: str,
+    verdicts: dict[str, identities.Identity | None],
+) -> list[list[identities.BundleCheck]]:
+    seen: list[list[identities.BundleCheck]] = []
+
+    def download(asset: gh.Asset, into: pathlib.Path) -> pathlib.Path:
+        target: pathlib.Path = into / asset.name
+        target.write_text(sums if asset.name == 'SHA256SUMS' else '{}')
+        return target
+
+    def verify(
+        checks: list[identities.BundleCheck], repo: str
+    ) -> dict[str, identities.Identity | None]:
+        seen.append(checks)
+        assert repo == 'spam/eggs'
+        return verdicts
+
+    monkeypatch.setattr(gh, 'download_asset', download)
+    monkeypatch.setattr(identities, 'verify_bundles', verify)
+    return seen
+
+
+SUMS: str = f'{DIGEST}  s.whl\n{DIGEST}  s.tar.gz\n'
+
+
+def test_signatures_identity_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_release(monkeypatch, FULL_SET)
+    seen: list[list[identities.BundleCheck]] = _patch_identities(
+        monkeypatch, SUMS, {'s.whl': 'ci', 's.tar.gz': 'rick'}
+    )
     res: common.Result = verify_release.check_signatures('v1.0')
     assert res.status == 'PASS'
+    assert res.evidence == (
+        '2 files with .asc and .sigstore.json (ci: 1, rick: 1), '
+        'SHA256SUMS signed'
+    )
+    assert {check.name: check.sha256 for check in seen[0]} == {
+        's.whl': DIGEST,
+        's.tar.gz': DIGEST,
+    }
+
+
+def test_signatures_identity_fail_names_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(monkeypatch, SUMS, {'s.whl': 'ci', 's.tar.gz': None})
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 's.tar.gz' in res.evidence
+    assert 's.whl' not in res.evidence
+
+
+def test_signatures_dist_missing_from_sums(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(monkeypatch, f'{DIGEST}  s.whl\n', {})
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 's.tar.gz' in res.evidence
+
+
+def test_signatures_bad_sums_line_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(monkeypatch, 'nonsense\n', {})
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+
+
+def test_signatures_non_hex_digest_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(
+        monkeypatch, f'{"z" * 64}  s.whl\n{DIGEST}  s.tar.gz\n', {}
+    )
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 's.whl' in res.evidence
+
+
+def test_signatures_helper_error_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+    _patch_identities(monkeypatch, SUMS, {})
+
+    def boom(checks: list[identities.BundleCheck], repo: str) -> None:
+        raise signing.SigningError('spam helper broke')
+
+    monkeypatch.setattr(identities, 'verify_bundles', boom)
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 'spam helper broke' in res.evidence
+
+
+def test_signatures_download_error_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_release(monkeypatch, FULL_SET)
+
+    def download(asset: gh.Asset, into: pathlib.Path) -> pathlib.Path:
+        raise common.FetchError(f'cannot fetch {asset.url}')
+
+    monkeypatch.setattr(gh, 'download_asset', download)
+    res: common.Result = verify_release.check_signatures('v1.0')
+    assert res.status == 'FAIL'
+    assert 'cannot fetch' in res.evidence
 
 
 def test_check_signatures_lists_missing(

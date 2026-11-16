@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -24,6 +25,8 @@ SIGSTORE_ARGV: list[str] = ['uvx', '--from', 'sigstore==4.5.1', 'python', '-I']
 SIGNER_SCRIPT: pathlib.Path = pathlib.Path(sigstore_signer.__file__)
 SHA256SUMS_NAME: str = 'SHA256SUMS'
 BUNDLE_SUFFIX: str = '.sigstore.json'
+# One entry of a SHA256SUMS file, as ``write_sha256sums`` writes it.
+SUMS_LINE: re.Pattern[str] = re.compile(r'[0-9A-Fa-f]{64}  \S.*')
 # On top of the logins: the signer paces and backs off per file. Each
 # login waits sigstore_signer.LOGIN_WAIT_SECONDS for the browser, and a run
 # has sigstore_signer.MAX_LOGINS of them at most.
@@ -334,10 +337,9 @@ def write_sha256sums(
     return target
 
 
-def parse_sha256sums(path: pathlib.Path) -> dict[str, str]:
-    """Read a SHA256SUMS file into ``{name: sha256}``, skipping comments."""
+def _sums_entries(text: str) -> dict[str, str]:
     sums: dict[str, str] = {}
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         if not line.strip() or line.startswith('#'):
             continue
         digest, _, name = line.partition('  ')
@@ -345,14 +347,10 @@ def parse_sha256sums(path: pathlib.Path) -> dict[str, str]:
     return sums
 
 
-def sha256sums_comments(path: pathlib.Path) -> dict[str, str]:
-    """``{name: comment}`` for each entry with a comment line right above.
-
-    The inverse of the ``rebuilt`` argument of ``write_sha256sums``.
-    """
+def _sums_comments(text: str) -> dict[str, str]:
     comments: dict[str, str] = {}
     comment: str = ''
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         if line.startswith('#'):
             comment = line
             continue
@@ -364,3 +362,37 @@ def sha256sums_comments(path: pathlib.Path) -> dict[str, str]:
             comments[name] = comment
         comment = ''
     return comments
+
+
+def parse_sha256sums(path: pathlib.Path) -> dict[str, str]:
+    """Read a SHA256SUMS file into ``{name: sha256}``, skipping comments."""
+    return _sums_entries(path.read_text())
+
+
+def sha256sums_comments(path: pathlib.Path) -> dict[str, str]:
+    """``{name: comment}`` for each entry with a comment line right above.
+
+    The inverse of the ``rebuilt`` argument of ``write_sha256sums``.
+    """
+    return _sums_comments(path.read_text())
+
+
+def read_sha256sums(
+    path: pathlib.Path,
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    """The entries and comments of a SHA256SUMS file, strictly.
+
+    None when the file is not UTF-8 or has a line that is neither blank,
+    a ``#`` comment nor ``<64 hex digits>  <name>``, which is never a list
+    ``write_sha256sums`` wrote. Such a file never raises.
+    """
+    try:
+        text: str = path.read_bytes().decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    for line in text.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        if SUMS_LINE.fullmatch(line) is None:
+            return None
+    return _sums_entries(text), _sums_comments(text)

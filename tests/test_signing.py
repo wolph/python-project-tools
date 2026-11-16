@@ -434,3 +434,32 @@ def test_write_sha256sums_writes_exactly_sha256sums_bytes(
     assert sums.read_bytes() == expected
     # LF line ends on every platform, Windows included.
     assert expected == (f'{comment}\n{common.sha256_of(a)}  a.whl\n'.encode())
+
+
+@pytest.mark.parametrize(
+    'data',
+    [
+        b'\xff\xfe\n',
+        b'not a sums line\n',
+        b'zzzz  a.whl\n',
+        ('ab' * 32 + ' a.whl\n').encode(),
+    ],
+    ids=['not utf-8', 'no digest', 'digest not hex', 'one space'],
+)
+def test_read_sha256sums_is_none_for_a_list_ppt_never_writes(
+    tmp_path: pathlib.Path, data: bytes
+) -> None:
+    sums: pathlib.Path = tmp_path / 'SHA256SUMS'
+    sums.write_bytes(data)
+    assert signing.read_sha256sums(sums) is None
+
+
+def test_read_sha256sums_reads_entries_and_comments(
+    tmp_path: pathlib.Path,
+) -> None:
+    sums: pathlib.Path = tmp_path / 'SHA256SUMS'
+    sums.write_bytes(('# rebuilt\n' + 'ab' * 32 + '  x y.whl\n\n').encode())
+    assert signing.read_sha256sums(sums) == (
+        {'x y.whl': 'ab' * 32},
+        {'x y.whl': '# rebuilt'},
+    )

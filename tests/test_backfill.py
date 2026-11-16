@@ -1797,6 +1797,85 @@ def test_a_sums_list_that_cannot_be_resumed_fails_the_version(
     _assert_failed_untouched(world, signer, report, reason)
 
 
+def _listing(*lines: str) -> bytes:
+    """A SHA256SUMS of the two rebuilt dists of ``interrupted``, plus lines."""
+    entries: list[str] = []
+    for name, data in ((SDIST, b'sdist bytes'), (WHEEL, b'wheel bytes')):
+        digest: str = hashlib.sha256(data).hexdigest()
+        entries.extend([REBUILT_COMMENT, f'{digest}  {name}'])
+    return ('\n'.join([*lines, *entries]) + '\n').encode()
+
+
+UNREADABLE_SUMS: str = (
+    'SHA256SUMS on the release is not UTF-8 or has malformed lines'
+)
+
+
+@pytest.mark.parametrize(
+    'listing',
+    [
+        b'\xff\xfe not utf-8\n' + _listing(),
+        _listing('not a sums line'),
+        _listing(f'zzzz  {SDIST}'),
+    ],
+    ids=['not utf-8', 'malformed line', 'digest not hex'],
+)
+def test_an_unreadable_sums_list_fails_the_resume_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    listing: bytes,
+) -> None:
+    world: World = install(monkeypatch, World(), fake_sign=False)
+    signer: Signer = Signer(monkeypatch)
+    Verifier(monkeypatch, good=True)
+    interrupted(world)
+    world.assets['SHA256SUMS'] = listing
+    report: backfill.BackfillReport = backfill.run_backfill(
+        'spam', options(tmp_path)
+    )
+    _assert_failed_untouched(world, signer, report, UNREADABLE_SUMS)
+    # No dist is fetched from a list that cannot be read.
+    assert SDIST not in world.asset_downloads
+    assert WHEEL not in world.asset_downloads
+
+
+@pytest.mark.parametrize(
+    'listing',
+    [b'\xff\xfe not utf-8\n', _listing(f'zzzz  {SDIST}')],
+    ids=['not utf-8', 'digest not hex'],
+)
+def test_already_signed_reads_an_unreadable_list_as_unsigned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    listing: bytes,
+) -> None:
+    world: World = install(monkeypatch, World())
+    interrupted(world)
+    for name in (SDIST, WHEEL):
+        world.assets[f'{name}.sigstore.json'] = b'bundle'
+    world.assets['SHA256SUMS'] = listing
+    names: list[str] = sorted(world.assets)
+    plan: backfill.Plan = backfill.plan_versions(
+        world.project, world.tags, world.releases
+    )[0]
+    opts: backfill.BackfillOptions = options(tmp_path)
+    signed: github.Release = dataclasses.replace(
+        release('v1.0', body=f'notes\n\n{sign.FOOTER_MARKER}\n'),
+        assets=signed_assets(*names),
+    )
+    run: backfill.PackageRun = backfill.PackageRun(
+        package='spam',
+        options=opts,
+        project=world.project,
+        tags=world.tags,
+        releases={'v1.0': signed},
+        workdir=tmp_path / 'work',
+        sign_options=backfill._sign_options('spam', opts),
+    )
+    # Not signed, so the run goes on to resume or rebuild the release.
+    assert backfill._already_signed(run, plan) is None
+
+
 def test_already_signed_needs_the_footer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:

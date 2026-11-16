@@ -85,6 +85,9 @@ RESUMED_NOTE: str = (
     'signed SHA256SUMS'
 )
 SUMS_SIGNATURE: str = f'{signing.SHA256SUMS_NAME}.asc'
+UNREADABLE_SUMS: str = (
+    'SHA256SUMS on the release is not UTF-8 or has malformed lines'
+)
 RELEASE_WORKFLOW_NOTE: str = 'release would fire {names} at the tagged commit'
 LATEST_MARKED: str = (
     'GitHub marked {tag} as Latest despite --latest=false, stopping'
@@ -776,10 +779,14 @@ def _resume_files(
         return None
     assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
     sums: pathlib.Path = _verified_sums(run, tag, assets)
-    listed: dict[str, str] = signing.parse_sha256sums(sums)
+    read: tuple[dict[str, str], dict[str, str]] | None = (
+        signing.read_sha256sums(sums)
+    )
+    if read is None:
+        raise ResumeError(UNREADABLE_SUMS)
+    listed, comments = read
     if not listed:
         raise ResumeError('SHA256SUMS lists no files')
-    comments: dict[str, str] = signing.sha256sums_comments(sums)
     unmarked: list[str] = [name for name in listed if name not in comments]
     if unmarked:
         raise ResumeError(
@@ -849,7 +856,13 @@ def _already_signed(run: PackageRun, plan: Plan) -> sign.SignOutcome | None:
     path: pathlib.Path = github.download_asset(
         sums, run.workdir / SUMS_DIR / plan.tag
     )
-    entries: list[str] = sorted(signing.parse_sha256sums(path))
+    read: tuple[dict[str, str], dict[str, str]] | None = (
+        signing.read_sha256sums(path)
+    )
+    if read is None:
+        # Not a list ppt wrote, so the release goes on to be completed.
+        return None
+    entries: list[str] = sorted(read[0])
     wanted: set[str] = _signed_names(entries, run.sign_options)
     if not entries or not wanted <= set(assets):
         return None

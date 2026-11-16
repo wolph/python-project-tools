@@ -384,7 +384,8 @@ def test_stale_prs_are_the_ones_main_overtook() -> None:
 def test_bot_title_regex_accepts_both_title_forms() -> None:
     match = conda_forge.BOT_TITLE.match('[bot-automerge] portalocker v4.4.1')
     assert match is not None and match.group(2) == '4.4.1'
-    assert conda_forge.BOT_TITLE.match('numpy-stl v4.1.0').group(2) == '4.1.0'  # ty: ignore[unresolved-attribute]
+    plain = conda_forge.BOT_TITLE.match('numpy-stl v4.1.0')
+    assert plain is not None and plain.group(2) == '4.1.0'
     assert conda_forge.BOT_TITLE.match('Rebuild for python 3.15') is None
 
 

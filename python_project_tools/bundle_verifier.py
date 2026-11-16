@@ -71,7 +71,9 @@ def decode_utf8string(raw: bytes) -> str:
 def ci_policy(repo: str) -> typing.Any:
     """The policy for a sign.yml run of ``repo`` started by hand."""
     from cryptography import x509  # ty: ignore[import-not-found]
-    from sigstore.errors import VerificationError  # ty: ignore[import-not-found]
+    from sigstore.errors import (  # ty: ignore[import-not-found]
+        VerificationError,
+    )
     from sigstore.verify.policy import (  # ty: ignore[import-not-found]
         AllOf,
         GitHubWorkflowTrigger,
@@ -133,7 +135,9 @@ def verify_entries(
     entries: list[dict[str, str]], repo: str
 ) -> dict[str, str | None]:
     """The verdict per entry name, the CI policy tried before Rick's."""
-    from sigstore.errors import VerificationError  # ty: ignore[import-not-found]
+    from sigstore.errors import (  # ty: ignore[import-not-found]
+        VerificationError,
+    )
     from sigstore.hashes import (  # ty: ignore[import-not-found]
         HashAlgorithm,
         Hashed,

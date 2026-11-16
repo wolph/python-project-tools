@@ -20,8 +20,12 @@ import types
 import typing
 
 from cryptography import x509  # ty: ignore[import-not-found]
-from cryptography.hazmat.primitives import hashes  # ty: ignore[import-not-found]
-from cryptography.hazmat.primitives.asymmetric import ec  # ty: ignore[import-not-found]
+from cryptography.hazmat.primitives import (  # ty: ignore[import-not-found]
+    hashes,
+)
+from cryptography.hazmat.primitives.asymmetric import (  # ty: ignore[import-not-found]
+    ec,
+)
 from cryptography.x509.oid import NameOID  # ty: ignore[import-not-found]
 from sigstore.errors import VerificationError  # ty: ignore[import-not-found]
 

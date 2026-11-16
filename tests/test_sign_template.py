@@ -20,6 +20,13 @@ DOC: dict[Any, Any] = yaml.safe_load(TEXT)
 STEPS: list[dict[str, Any]] = DOC['jobs']['sign']['steps']
 
 
+# The workflow steps run in bash on ubuntu-latest, so their shell tests
+# need a POSIX shell and POSIX paths, which the Windows runners lack.
+POSIX_ONLY: pytest.MarkDecorator = pytest.mark.skipif(
+    sys.platform == 'win32', reason='sign.yml runs in bash on Linux'
+)
+
+
 def step_run(name: str) -> str:
     for step in STEPS:
         if step.get('id') == name or step.get('name') == name:
@@ -104,6 +111,7 @@ def test_actionlint_clean() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@POSIX_ONLY
 def test_input_validation_rejects_injection(tmp_path: Path) -> None:
     script: str = step_run('Validate inputs')
     result: subprocess.CompletedProcess[str] = subprocess.run(
@@ -122,6 +130,7 @@ def test_input_validation_rejects_injection(tmp_path: Path) -> None:
     assert not (tmp_path / 'pwned').exists()
 
 
+@POSIX_ONLY
 def test_input_validation_accepts_normal(tmp_path: Path) -> None:
     script: str = step_run('Validate inputs')
     result: subprocess.CompletedProcess[str] = subprocess.run(
@@ -365,6 +374,7 @@ def write_assets(tmp_path: Path, names: list[str]) -> None:
     )
 
 
+@POSIX_ONLY
 @pytest.mark.parametrize('names', [[], ['notes.txt', 'SHA256SUMS']])
 def test_download_skipped_without_dists(
     tmp_path: Path, names: list[str]
@@ -376,6 +386,7 @@ def test_download_skipped_without_dists(
     assert (tmp_path / 'existing').is_dir()
 
 
+@POSIX_ONLY
 def test_download_runs_with_patterns(tmp_path: Path) -> None:
     write_assets(tmp_path, ['a.whl', 'a.whl.sigstore.json'])
     result, calls = run_step(tmp_path, DOWNLOAD, {})
@@ -397,12 +408,14 @@ def test_download_runs_with_patterns(tmp_path: Path) -> None:
     ]
 
 
+@POSIX_ONLY
 def test_download_failure_fails_step(tmp_path: Path) -> None:
     write_assets(tmp_path, ['a.tar.gz'])
     result, _ = run_step(tmp_path, DOWNLOAD, {}, fail=True)
     assert result.returncode != 0
 
 
+@POSIX_ONLY
 def test_list_files_to_sign(tmp_path: Path) -> None:
     out: Path = tmp_path / 'out'
     out.touch()
@@ -415,6 +428,7 @@ def test_list_files_to_sign(tmp_path: Path) -> None:
     assert out.read_text() == 'sign_inputs=dist/a.whl dist/b.tar.gz\n'
 
 
+@POSIX_ONLY
 def test_upload_argv(tmp_path: Path) -> None:
     result, calls = run_step(
         tmp_path,
@@ -436,6 +450,7 @@ def test_upload_argv(tmp_path: Path) -> None:
     assert '--clobber' not in calls[0]
 
 
+@POSIX_ONLY
 def test_upload_nothing_skips_gh(tmp_path: Path) -> None:
     result, calls = run_step(
         tmp_path, 'Upload to the release', {'TO_UPLOAD': '', 'TO_SIGN': ''}
@@ -444,6 +459,7 @@ def test_upload_nothing_skips_gh(tmp_path: Path) -> None:
     assert calls == []
 
 
+@POSIX_ONLY
 def test_upload_failure_fails_step(tmp_path: Path) -> None:
     result, _ = run_step(
         tmp_path,

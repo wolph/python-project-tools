@@ -744,6 +744,46 @@ def test_main_fails_with_the_error_of_the_version_json(
     assert world.uploads == []
 
 
+def test_main_fails_a_version_json_without_files(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    empty: dict[str, object] = {**VERSION_DOC, 'urls': []}
+    fake_fetch(monkeypatch, {PROJECT_URL: LAGGING_PROJECT, VERSION_URL: empty})
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    code: int = sign.main(['v1.0', '--package', 's', '--sigstore-browser'])
+    assert code == 1
+    assert (
+        'v1.0: failed (uploaded 0, kept 0, conflicts 0): no files for this '
+        'version'
+    ) in capsys.readouterr().out
+    assert world.uploads == []
+    assert world.edits == []
+
+
+def test_ci_dispatch_through_the_lagging_path_carries_info_version(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # PyPI answers the normalised 1.0.beta with the version as uploaded.
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], tag='v1.0-beta', created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    beta_url: str = 'https://pypi.org/pypi/s/1.0.beta/json'
+    beta: dict[str, object] = {
+        **VERSION_DOC,
+        'info': {'name': 's', 'version': '1.0-beta'},
+    }
+    asked: list[str] = fake_fetch(
+        monkeypatch, {PROJECT_URL: LAGGING_PROJECT, beta_url: beta}
+    )
+    code: int = sign.main(['v1.0-beta', '--package', 's'])
+    assert code == 0, capsys.readouterr()
+    assert asked == [PROJECT_URL, beta_url]
+    assert ci.dispatches == [('o/r', 'v1.0-beta', 's', 'master', '1.0-beta')]
+
+
 def test_all_never_asks_for_a_version_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

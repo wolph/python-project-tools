@@ -1,3 +1,21 @@
+2.2.1:
+
+ * ``ppt sign`` regenerates ``SHA256SUMS`` and ``SHA256SUMS.asc`` when the
+   signature on the release does not sign the list, as after an upload that
+   stopped between the two files, and when the list differs in any byte from
+   the one it would write. A list that is not UTF-8 no longer stops
+   ``ppt sign --all``. With ``--sigstore-only`` it refuses to write a
+   ``SHA256SUMS`` next to an existing ``SHA256SUMS.asc`` and says to rerun
+   without that option.
+ * ``ppt sign`` signs a version that the PyPI project JSON does not list yet,
+   right after an upload, by asking PyPI for that version itself.
+ * ``templates/sign.yml`` takes a ``version`` input, and ``ppt sign`` passes
+   the PyPI version it matched, so a tag in another form than the version
+   (``v1.0-post1`` for ``1.0.post1``) no longer fails the run. A repository
+   whose ``sign.yml`` predates the input gets an error saying to copy the
+   new template.
+ * ``VERIFY.md`` names the footer sentence of a release signed through CI.
+
 2.2.0:
 
  * ``ppt sign`` takes the Sigstore bundles from the ``sign.yml`` workflow of

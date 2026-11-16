@@ -1687,6 +1687,40 @@ def test_ci_sigstore_only_refuses_before_dispatching(
     assert world.uploads == []
 
 
+@pytest.mark.parametrize(
+    ('names', 'replace', 'reason'),
+    REFUSED_BEFORE_DOWNLOAD,
+    ids=['list absent', 'replace assets'],
+)
+@pytest.mark.parametrize('mode', ['browser', 'ci'])
+def test_sigstore_only_dry_run_prints_the_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+    capsys: pytest.CaptureFixture[str],
+    names: list[str],
+    replace: bool,
+    reason: str,
+    mode: sign.SigstoreMode,
+) -> None:
+    world, _ = install(monkeypatch)
+    options.gpg = False
+    options.replace_assets = replace
+    options.dry_run = True
+    options.sigstore = mode
+    out: sign.SignOutcome = sign.sign_release(
+        release(names, created_at=AFTER), files, tmp_path, options
+    )
+    printed: str = capsys.readouterr().out
+    assert out.status == 'failed'
+    assert out.reason == reason
+    assert f'would refuse: {reason}' in printed
+    assert 'would upload SHA256SUMS' not in printed
+    assert world.uploads == []
+    assert world.downloaded == []
+
+
 def test_sigstore_only_keeps_a_pair_whose_signature_signs_the_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

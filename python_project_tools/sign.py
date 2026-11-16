@@ -610,8 +610,14 @@ def _dry_run(
 ) -> SignOutcome:
     """Print every action of a run and perform none.
 
-    Raises SigningError when sign.yml may not sign the release.
+    Raises SigningError when sign.yml may not sign the release, and when
+    the real run would refuse to touch SHA256SUMS (``_orphan_refusal``),
+    which it prints first instead of any upload.
     """
+    refusal: str | None = _orphan_refusal(release, options)
+    if refusal is not None:
+        _say(f'would refuse: {refusal}')
+        raise signing.SigningError(refusal)
     present: set[str] = {a.name for a in release.assets}
     dist_names: list[str] = _dist_names(files)
     for item in files:

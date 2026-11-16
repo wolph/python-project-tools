@@ -48,7 +48,7 @@ jobs:
     steps:
       - name: Validate inputs
         run: |
-          if ! [[ "$TAG" =~ ^v?[0-9][0-9A-Za-z.+!-]*$ ]]; then
+          if ! [[ "$TAG" =~ ^v?[0-9][0-9A-Za-z._+!-]*$ ]]; then
             echo "Invalid tag input" >&2
             exit 1
           fi
@@ -56,7 +56,7 @@ jobs:
             echo "Invalid package input" >&2
             exit 1
           fi
-          if [ -n "$PYPI_VERSION" ] && ! [[ "$PYPI_VERSION" =~ ^v?[0-9][0-9A-Za-z.+!-]*$ ]]; then
+          if [ -n "$PYPI_VERSION" ] && ! [[ "$PYPI_VERSION" =~ ^v?[0-9][0-9A-Za-z._+!-]*$ ]]; then
             echo "Invalid version input" >&2
             exit 1
           fi

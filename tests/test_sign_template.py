@@ -171,7 +171,8 @@ def validate(tmp_path: Path, version: str) -> subprocess.CompletedProcess[str]:
 
 @POSIX_ONLY
 @pytest.mark.parametrize(
-    'version', ['1;touch pwned', '../1.0', '1.0/json', 'x1.0', '1.0 2.0']
+    'version',
+    ['1;touch pwned', '../1.0', '1.0/json', 'x1.0', '1.0 2.0', '1_0;x'],
 )
 def test_input_validation_rejects_a_bad_version(
     tmp_path: Path, version: str
@@ -189,6 +190,49 @@ def test_input_validation_accepts_a_version(
 ) -> None:
     result: subprocess.CompletedProcess[str] = validate(tmp_path, version)
     assert result.returncode == 0, result.stderr
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    ('tag', 'version'), [('v1_0', ''), ('v1.0', '1_0'), ('v1_0_post1', '1_0')]
+)
+def test_input_validation_accepts_underscore_separators(
+    tmp_path: Path, tag: str, version: str
+) -> None:
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ['bash', '-c', step_run('Validate inputs')],
+        cwd=tmp_path,
+        env={
+            'TAG': tag,
+            'PACKAGE': 'pkg',
+            'PYPI_VERSION': version,
+            'PATH': '/usr/bin:/bin',
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    'tag', ['v1_0;touch pwned', 'v1_0$(touch pwned)', 'v1_0 x', 'v1_0/..']
+)
+def test_input_validation_still_rejects_an_injected_tag(
+    tmp_path: Path, tag: str
+) -> None:
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ['bash', '-c', step_run('Validate inputs')],
+        cwd=tmp_path,
+        env={'TAG': tag, 'PACKAGE': 'pkg', 'PATH': '/usr/bin:/bin'},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert result.stderr == 'Invalid tag input\n'
+    assert not (tmp_path / 'pwned').exists()
 
 
 FILE_A: bytes = b'wheel bytes'

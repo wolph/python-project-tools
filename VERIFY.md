@@ -109,6 +109,6 @@ The next sentence says where the files came from, in one of three forms:
 - "The files above are the PyPI uploads for this version where PyPI has them", ending in "except the rebuilt files listed below": PyPI had none left for some files, so they were built from the tag. The footer lists them and `SHA256SUMS` marks them. Their bytes are not the bytes PyPI once served.
 - "The files above are the exact PyPI uploads of the versions listed in these notes": the shared release of the versions without a matching commit, with every file checked against PyPI.
 
-A release signed through CI says so in the sentence after that, which ends in "made by the sign.yml workflow of this repository", and its bundles are checked as in "Checking a bundle signed by CI" above.
+When CI made every bundle of a release, the sentence after that ends in "made by the sign.yml workflow of this repository", and the bundles are checked as in "Checking a bundle signed by CI" above. A release with bundles from both CI and Rick's login gets the plain sentence without that phrase, so check each bundle against the identity in its certificate, with one of the two sections above.
 
 For a PyPI upload the signature proves that the file was the PyPI upload when it was signed, and that it has not changed since. For a rebuilt file it proves only that this build of the tag was signed on that date. Neither proves who built the original. The Sigstore transparency log records when the bundle was made, so the date in the footer cannot be moved backwards without the log disagreeing.

@@ -2026,3 +2026,11 @@ def test_verify_md_names_the_ci_footer_sentence_and_its_section(
     _, _, meaning = text.partition('## What "Signed on <date>" means')
     assert f'"{phrase}"' in meaning
     assert f'"{heading}"' in meaning
+    # Only when CI made every bundle, a mix gets the plain sentence.
+    mixed: ci_bundles.Settled = ci_bundles.Settled(
+        release=None, signers={'s.whl': 'ci', 's.tar.gz': 'rick'}
+    )
+    assert mixed.by_workflow is False
+    assert phrase not in sign.footer(options, [], by_workflow=False)
+    assert 'When CI made every bundle of a release' in meaning
+    assert 'bundles from both' in meaning

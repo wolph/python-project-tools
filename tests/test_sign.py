@@ -1874,3 +1874,17 @@ def test_ci_footer_names_sign_yml_only_when_it_made_every_bundle(
     lines: list[str] = _footer_lines(world.edits[0])
     assert BROWSER_BUNDLE_LINE in lines
     assert CI_BUNDLE_LINE not in lines
+
+
+def test_verify_md_names_the_ci_footer_sentence_and_its_section(
+    options: sign.SignOptions,
+) -> None:
+    phrase: str = 'made by the sign.yml workflow of this repository'
+    assert f'{phrase}.' in sign.footer(options, [], by_workflow=True)
+    verify: pathlib.Path = pathlib.Path(__file__).parent.parent / 'VERIFY.md'
+    text: str = verify.read_text(encoding='utf-8')
+    heading: str = 'Checking a bundle signed by CI'
+    assert f'\n## {heading}\n' in text
+    _, _, meaning = text.partition('## What "Signed on <date>" means')
+    assert f'"{phrase}"' in meaning
+    assert f'"{heading}"' in meaning

@@ -1652,6 +1652,41 @@ def test_sigstore_only_never_orphans_the_sums_signature(
     assert world.uploads == []
 
 
+REFUSED_BEFORE_DOWNLOAD: list[tuple[list[str], bool, str]] = [
+    ([n for n in SDIST_SET if n != 'SHA256SUMS'], False, ORPHAN_ABSENT),
+    (SDIST_SET, True, ORPHAN_REPLACE),
+]
+
+
+@pytest.mark.parametrize(
+    ('names', 'replace', 'reason'),
+    REFUSED_BEFORE_DOWNLOAD,
+    ids=['list absent', 'replace assets'],
+)
+def test_ci_sigstore_only_refuses_before_dispatching(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    ci_options: sign.SignOptions,
+    names: list[str],
+    replace: bool,
+    reason: str,
+) -> None:
+    # The wheel and its bundle are missing, so sign.yml would be run.
+    world, _ = install(monkeypatch, {'s.tar.gz': SDIST_BYTES})
+    ci_options.gpg = False
+    ci_options.replace_assets = replace
+    target: github.Release = release(names, created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    out: sign.SignOutcome = sign.sign_release(
+        target, files, tmp_path, ci_options
+    )
+    assert out.status == 'failed'
+    assert out.reason == reason
+    assert ci.dispatches == []
+    assert world.uploads == []
+
+
 def test_sigstore_only_keeps_a_pair_whose_signature_signs_the_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

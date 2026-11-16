@@ -316,6 +316,26 @@ def _sums_signed(
     return signing.gpg_verify_key(listing, signature, options.gpg_key)
 
 
+def _orphan_refusal(
+    release: github.Release, options: SignOptions
+) -> str | None:
+    """Why a run without GPG must not touch SHA256SUMS, from names alone.
+
+    None unless GPG is off and SHA256SUMS.asc is on the release. Then
+    --replace-assets or a missing list would write a list the signature
+    does not sign. These need no download, so the run can refuse before
+    sign.yml is dispatched or a dry run promises an upload.
+    """
+    names: set[str] = {a.name for a in release.assets}
+    if options.gpg or SUMS_SIGNATURE not in names:
+        return None
+    if options.replace_assets:
+        return ORPHAN_REPLACE
+    if SUMS_NAME not in names:
+        return ORPHAN_ABSENT
+    return None
+
+
 def _sums_unsigned_current(
     assets: dict[str, github.Asset],
     dists: list[pathlib.Path],
@@ -326,9 +346,10 @@ def _sums_unsigned_current(
 
     With SHA256SUMS.asc on the release any new list would orphan that
     signature, so every case that would write the list raises
-    SigningError instead, before anything is uploaded. A list that stays
-    must still be the one the signature signs, which needs only the
-    public key.
+    SigningError instead, before anything is uploaded. The cases seen from
+    names alone are ``_orphan_refusal``, checked first by the caller. A
+    list that stays must still be the one the signature signs, which
+    needs only the public key.
     """
     if SUMS_SIGNATURE not in assets:
         return (
@@ -336,10 +357,6 @@ def _sums_unsigned_current(
             and SUMS_NAME in assets
             and _sums_identical(_fetch_sums(assets, workdir), dists, options)
         )
-    if options.replace_assets:
-        raise signing.SigningError(ORPHAN_REPLACE)
-    if SUMS_NAME not in assets:
-        raise signing.SigningError(ORPHAN_ABSENT)
     listing: pathlib.Path = _fetch_sums(assets, workdir)
     if not _sums_identical(listing, dists, options):
         raise signing.SigningError(ORPHAN_STALE)
@@ -363,6 +380,9 @@ def _sums_current(
     signature matches the uploaded list. Without GPG see
     ``_sums_unsigned_current``.
     """
+    refusal: str | None = _orphan_refusal(release, options)
+    if refusal is not None:
+        raise signing.SigningError(refusal)
     assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
     if not options.gpg:
         return _sums_unsigned_current(assets, dists, workdir, options)
@@ -729,6 +749,9 @@ def _sign_files(
     are staged in ``workdir / 'bundles' / tag``, which outlives
     ``release_dir``, and the footer then waits for them.
     """
+    refusal: str | None = _orphan_refusal(release, options)
+    if refusal is not None:
+        raise signing.SigningError(refusal)
     dists: list[pathlib.Path] = _local_dists(files, release_dir)
     new, clobber = _compare_dists(
         release, dists, release_dir, options, outcome

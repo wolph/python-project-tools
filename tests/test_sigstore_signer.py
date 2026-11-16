@@ -707,9 +707,15 @@ def test_a_429_on_one_worker_pauses_the_others(
     later: list[tuple[float, str, str]] = starts[3:]
     assert len(later) == 7
     # Nobody tried again before the back-off of spam-0 was over, the
-    # workers of spam-1 and spam-2 included. 10 ms of slack between the
-    # wall clock of the signer and the monotonic clock of the test.
-    assert min(start for start, _, _ in later) >= hit[0] + 0.4 - 0.01
+    # workers of spam-1 and spam-2 included. The signer reads the wall
+    # clock and the test the monotonic clock, so the slack is 10 ms plus
+    # one tick of each, which is about 16 ms on Windows.
+    slack: float = (
+        0.01
+        + time.get_clock_info('time').resolution
+        + time.get_clock_info('monotonic').resolution
+    )
+    assert min(start for start, _, _ in later) >= hit[0] + 0.4 - slack
     others: set[str] = {
         thread for _, name, thread in starts[:3] if name != 'spam-0.whl'
     }

@@ -401,11 +401,83 @@ def test_manifest_runs_isolated_without_site_packages(
         return subprocess.CompletedProcess(cmd, 0, stdout='{}', stderr='')
 
     monkeypatch.setattr(check_compat, 'must', fake_must)
+    site: pathlib.Path = tmp_path / 'venv/lib/python3.13/site-packages'
+    site.mkdir(parents=True)
+    python: pathlib.Path = tmp_path / 'venv/bin/python'
     result: dict[str, object] = check_compat.manifest(
-        pathlib.Path(sys.executable), tmp_path, ['spamlib']
+        python, tmp_path, ['spamlib']
     )
     assert result == {}
     argv: list[str] = captured[0]
     assert '-I' in argv
     assert '-S' in argv
     assert api_manifest.__file__ in argv
+    # -S hides the venv, so its site-packages is handed over by name.
+    assert argv[argv.index('--site') + 1] == str(site)
+
+
+def test_site_dirs_finds_posix_and_windows_layouts(
+    tmp_path: pathlib.Path,
+) -> None:
+    posix: pathlib.Path = tmp_path / 'posix/lib/python3.10/site-packages'
+    posix.mkdir(parents=True)
+    windows: pathlib.Path = tmp_path / 'windows/Lib/site-packages'
+    windows.mkdir(parents=True)
+    assert check_compat.site_dirs(tmp_path / 'posix/bin/python') == [posix]
+    assert check_compat.site_dirs(tmp_path / 'windows/Scripts/python.exe') == [
+        windows
+    ]
+    assert check_compat.site_dirs(tmp_path / 'missing/bin/python') == []
+
+
+def run_manifest_with_dependency(
+    tmp_path: pathlib.Path, with_site: bool
+) -> subprocess.CompletedProcess[str]:
+    """Run api_manifest.py on a package that imports eggs from another directory."""  # noqa: E501
+    root: pathlib.Path = make_package(
+        tmp_path / 'root', 'import eggs\n\nSPAM = eggs.EGGS\n'
+    )
+    site: pathlib.Path = tmp_path / 'site'
+    site.mkdir()
+    (site / 'eggs.py').write_text('EGGS = 3\n')
+    # A .pth file is what -S keeps from running.
+    (site / 'ham.pth').write_text('import sys; sys.exit(13)\n')
+    extra: list[str] = ['--site', str(site)] if with_site else []
+    return subprocess.run(
+        [
+            sys.executable,
+            '-I',
+            '-S',
+            api_manifest.__file__,
+            '--path',
+            str(root),
+            *extra,
+            '--package',
+            'spamlib',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_manifest_imports_a_dependency_from_a_site_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    done: subprocess.CompletedProcess[str] = run_manifest_with_dependency(
+        tmp_path, with_site=True
+    )
+    assert done.returncode == 0, done.stderr
+    modules: dict[str, object] = json.loads(done.stdout)['modules']
+    assert 'spamlib' in modules
+    assert 'eggs' not in modules
+
+
+def test_manifest_without_the_site_dir_cannot_import_the_dependency(
+    tmp_path: pathlib.Path,
+) -> None:
+    done: subprocess.CompletedProcess[str] = run_manifest_with_dependency(
+        tmp_path, with_site=False
+    )
+    assert done.returncode != 0
+    assert "No module named 'eggs'" in done.stderr

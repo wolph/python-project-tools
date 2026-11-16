@@ -1,3 +1,13 @@
+2.2.2:
+
+ * ``ppt check-compat`` works again for a package that imports a dependency
+   at import time, such as numpy-stl with numpy. Since 2.0.0 the API
+   manifest ran with ``-S``, which hides the site-packages of the venv, so
+   the import failed and the check stopped with exit status 2. The manifest
+   still runs with ``-S``, and the site-packages directories of the venv
+   are now passed to it by name. They come after the tree under test on
+   ``sys.path`` and their ``.pth`` files are not processed.
+
 2.2.1:
 
  * ``ppt sign`` regenerates ``SHA256SUMS`` and ``SHA256SUMS.asc`` when the

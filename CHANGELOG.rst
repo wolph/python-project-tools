@@ -4,17 +4,26 @@
    signature on the release does not sign the list, as after an upload that
    stopped between the two files, and when the list differs in any byte from
    the one it would write. A list that is not UTF-8 no longer stops
-   ``ppt sign --all``. With ``--sigstore-only`` it refuses to write a
-   ``SHA256SUMS`` next to an existing ``SHA256SUMS.asc`` and says to rerun
-   without that option.
- * ``ppt sign`` signs a version that the PyPI project JSON does not list yet,
-   right after an upload, by asking PyPI for that version itself.
+   ``ppt sign --all``.
+ * ``ppt sign --sigstore-only`` never writes a ``SHA256SUMS`` next to an
+   existing ``SHA256SUMS.asc``, and keeps a list only when that signature
+   signs it, which needs only the public key. Otherwise it fails and says to
+   rerun without ``--sigstore-only``. When the asset names already show it
+   will refuse, it does so before dispatching ``sign.yml``, and
+   ``--dry-run`` prints the refusal.
+ * ``ppt sign`` with a single tag signs a version that the PyPI project JSON
+   does not list yet, right after an upload, by asking PyPI for that
+   version itself. ``--all`` still uses the project JSON alone.
  * ``templates/sign.yml`` takes a ``version`` input, and ``ppt sign`` passes
    the PyPI version it matched, so a tag in another form than the version
-   (``v1.0-post1`` for ``1.0.post1``) no longer fails the run. A repository
-   whose ``sign.yml`` predates the input gets an error saying to copy the
-   new template.
- * ``VERIFY.md`` names the footer sentence of a release signed through CI.
+   (``v4-2-2`` for ``4.2.2``) no longer fails the run. The tag and version
+   inputs accept ``_`` as well. A repository whose ``sign.yml`` predates the
+   input gets an error saying to copy the new template.
+ * ``ppt backfill`` reads ``SHA256SUMS`` strictly. A list that is not UTF-8
+   or has a malformed line fails the resume of a rebuilt release with that
+   reason, where a line with a non-hex digest let it go on before.
+ * ``VERIFY.md`` names the footer sentence of a release whose bundles all
+   came from CI.
 
 2.2.0:
 

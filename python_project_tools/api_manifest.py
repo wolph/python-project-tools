@@ -5,7 +5,11 @@ only and works on Python 3.9 and later. The directory given with --path goes fir
 imported package must come from it, so the manifest describes exactly the
 tree that was asked for::
 
-    python -I api_manifest.py --path <site-dir> --package python_utils
+    python -I -S api_manifest.py --path <target-dir> --package python_utils
+
+With -S the interpreter has no site-packages of its own. Dependencies of
+the packages are imported from the directories given with --site, which
+come after --path on sys.path and whose .pth files are not processed.
 
 The manifest lists every public module, and for each module every public
 name: what ``__all__`` lists, plus whatever ``dir()`` shows without a
@@ -338,6 +342,12 @@ def main(argv: list[str]) -> int:
         '--path', required=True, help='directory to import the packages from'
     )
     parser.add_argument(
+        '--site',
+        action='append',
+        default=[],
+        help='directory to import dependencies from, repeatable',
+    )
+    parser.add_argument(
         '--package',
         action='append',
         required=True,
@@ -346,6 +356,9 @@ def main(argv: list[str]) -> int:
     args: argparse.Namespace = parser.parse_args(argv)
     root: pathlib.Path = pathlib.Path(args.path).resolve()
     sys.path.insert(0, str(root))
+    # Appended, so --path wins, and added as plain entries, so the .pth
+    # files of a site directory never run.
+    sys.path.extend(str(pathlib.Path(site).resolve()) for site in args.site)
     json.dump(
         manifest(args.package, root), sys.stdout, indent=1, sort_keys=True
     )

@@ -308,12 +308,31 @@ def ensure_deps(
     )
 
 
+def site_dirs(python: pathlib.Path) -> list[pathlib.Path]:
+    """The site-packages directories of the venv this interpreter lives in."""  # noqa: E501
+    venv: pathlib.Path = python.parent.parent
+    return sorted(
+        [
+            *venv.glob('lib/python*/site-packages'),
+            *venv.glob('Lib/site-packages'),
+        ]
+    )
+
+
 def manifest(
     python: pathlib.Path, target: pathlib.Path, names: list[str]
 ) -> dict[str, object]:
-    """The API manifest of the packages installed in target."""
+    """The API manifest of the packages installed in target.
+
+    The interpreter runs with -S, so no .pth file of the venv runs and
+    the packages under test can only come from target. Their dependencies
+    live in the venv, whose site-packages directories are passed by name.
+    """
     packages: list[str] = [
         arg for name in names for arg in ('--package', name)
+    ]
+    sites: list[str] = [
+        arg for site in site_dirs(python) for arg in ('--site', str(site))
     ]
     done: subprocess.CompletedProcess[str] = must(
         [
@@ -323,6 +342,7 @@ def manifest(
             str(pathlib.Path(api_manifest.__file__)),
             '--path',
             str(target),
+            *sites,
             *packages,
         ],
         cwd=target,

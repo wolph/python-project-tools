@@ -419,3 +419,18 @@ def test_sha256sums_comments_are_the_rebuilt_lines(
         tmp_path, [a, b], {'b.tar.gz': comment}
     )
     assert signing.sha256sums_comments(sums) == {'b.tar.gz': comment}
+
+
+def test_write_sha256sums_writes_exactly_sha256sums_bytes(
+    tmp_path: pathlib.Path,
+) -> None:
+    a: pathlib.Path = tmp_path / 'a.whl'
+    a.write_bytes(b'one')
+    comment: str = '# rebuilt from tag v1.0'
+    expected: bytes = signing.sha256sums_bytes([a], {'a.whl': comment})
+    sums: pathlib.Path = signing.write_sha256sums(
+        tmp_path, [a], {'a.whl': comment}
+    )
+    assert sums.read_bytes() == expected
+    # LF line ends on every platform, Windows included.
+    assert expected == (f'{comment}\n{common.sha256_of(a)}  a.whl\n'.encode())

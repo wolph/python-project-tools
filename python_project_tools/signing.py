@@ -304,6 +304,22 @@ def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
     return _existing_bundles(paths)
 
 
+def sha256sums_bytes(
+    files: list[pathlib.Path], rebuilt: dict[str, str]
+) -> bytes:
+    """The exact bytes ``write_sha256sums`` writes for these files.
+
+    UTF-8 with LF line ends on every platform, so a list on a release
+    can be compared byte for byte with the one a run would write.
+    """
+    lines: list[str] = []
+    for path in files:
+        if path.name in rebuilt:
+            lines.append(rebuilt[path.name])
+        lines.append(f'{common.sha256_of(path)}  {path.name}')
+    return ('\n'.join(lines) + '\n').encode('utf-8')
+
+
 def write_sha256sums(
     directory: pathlib.Path,
     files: list[pathlib.Path],
@@ -313,13 +329,8 @@ def write_sha256sums(
 
     ``rebuilt`` maps a file name to a comment line placed above its entry.
     """
-    lines: list[str] = []
-    for path in files:
-        if path.name in rebuilt:
-            lines.append(rebuilt[path.name])
-        lines.append(f'{common.sha256_of(path)}  {path.name}')
     target: pathlib.Path = directory / SHA256SUMS_NAME
-    target.write_text('\n'.join(lines) + '\n')
+    target.write_bytes(sha256sums_bytes(files, rebuilt))
     return target
 
 

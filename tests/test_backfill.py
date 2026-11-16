@@ -1652,9 +1652,12 @@ def test_an_interrupted_rebuild_resumes_from_the_release_files(
     assert {'SHA256SUMS', 'SHA256SUMS.asc', SDIST, WHEEL} <= set(
         world.asset_downloads
     )
-    assert verifier.calls == [
-        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
-    ]
+    # Once to resume from the listed files, once by ppt sign to keep the
+    # pair.
+    assert (
+        verifier.calls
+        == [('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)] * 2
+    )
     assert [[p.name for p in call] for call in signer.sigstore_calls] == [
         [SDIST, WHEEL]
     ]

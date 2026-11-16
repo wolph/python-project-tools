@@ -48,6 +48,15 @@ def sums_text(entries: dict[str, bytes]) -> bytes:
 
 
 BOTH_SUMS: bytes = sums_text({'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES})
+
+
+def asc_of(data: bytes, key: str = signing.DEFAULT_GPG_KEY) -> bytes:
+    """What the fake gpg_sign writes for ``data``, and its verify accepts."""
+    import hashlib
+
+    return f'sig {key} {hashlib.sha256(data).hexdigest()}'.encode()
+
+
 SDIST_SET: list[str] = [
     's.tar.gz',
     's.tar.gz.asc',
@@ -73,6 +82,8 @@ class World:
         self.signed: list[str] = []
         self.sigstore_calls: int = 0
         self.events: list[str] = []
+        # (list, signature, key) of every gpg_verify_key call.
+        self.verified: list[tuple[str, str, str]] = []
 
     @property
     def uploaded(self) -> list[str]:
@@ -144,10 +155,16 @@ def install(
 
     def gpg_sign(path: pathlib.Path, key: str) -> pathlib.Path:
         out: pathlib.Path = path.with_name(path.name + '.asc')
-        out.write_text(f'sig {key}')
+        out.write_bytes(asc_of(path.read_bytes(), key))
         world.signed.append(path.name)
         world.events.append(f'gpg {path.name}')
         return out
+
+    def gpg_verify_key(
+        path: pathlib.Path, signature: pathlib.Path, key: str
+    ) -> bool:
+        world.verified.append((path.name, signature.name, key))
+        return signature.read_bytes() == asc_of(path.read_bytes(), key)
 
     def sigstore_sign(paths: list[pathlib.Path]) -> list[pathlib.Path]:
         world.sigstore_calls += 1
@@ -180,6 +197,7 @@ def install(
 
     monkeypatch.setattr(pypi, 'download', download)
     monkeypatch.setattr(signing, 'gpg_sign', gpg_sign)
+    monkeypatch.setattr(signing, 'gpg_verify_key', gpg_verify_key)
     monkeypatch.setattr(signing, 'sigstore_sign', sigstore_sign)
     monkeypatch.setattr(github, 'download_asset', download_asset)
     monkeypatch.setattr(github, 'upload_assets', upload_assets)
@@ -213,7 +231,12 @@ def test_sign_release_is_idempotent(
 ) -> None:
     world, rec = install(
         monkeypatch,
-        {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES, 'SHA256SUMS': BOTH_SUMS},
+        {
+            's.whl': WHL_BYTES,
+            's.tar.gz': SDIST_BYTES,
+            'SHA256SUMS': BOTH_SUMS,
+            'SHA256SUMS.asc': asc_of(BOTH_SUMS),
+        },
     )
     signed: github.Release = release(
         ALL_NAMES, body=f'notes\n\n{sign.FOOTER_MARKER}\nSigned'
@@ -225,9 +248,15 @@ def test_sign_release_is_idempotent(
     assert world.uploads == []
     assert world.edits == []
     assert not any('release edit' in ' '.join(c) for c in rec.calls)
-    # Dist files and SHA256SUMS are compared by content, signatures are not
+    # Dist files and SHA256SUMS are compared by content and SHA256SUMS.asc
+    # is verified against the list, the other signatures are not
     # downloaded.
-    assert sorted(world.downloaded) == sorted([*DISTS, 'SHA256SUMS'])
+    assert sorted(world.downloaded) == sorted(
+        [*DISTS, 'SHA256SUMS', 'SHA256SUMS.asc']
+    )
+    assert world.verified == [
+        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
+    ]
     assert world.sigstore_calls == 0
     assert world.signed == []
 
@@ -1319,7 +1348,12 @@ def test_identical_sha256sums_keeps_the_pair(
 ) -> None:
     world, _ = install(
         monkeypatch,
-        {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES, 'SHA256SUMS': BOTH_SUMS},
+        {
+            's.whl': WHL_BYTES,
+            's.tar.gz': SDIST_BYTES,
+            'SHA256SUMS': BOTH_SUMS,
+            'SHA256SUMS.asc': asc_of(BOTH_SUMS),
+        },
     )
     have: list[str] = [n for n in ALL_NAMES if n != 's.whl.asc']
     out: sign.SignOutcome = sign.sign_release(
@@ -1385,6 +1419,172 @@ def test_stale_sums_without_gpg_refuses_to_orphan_the_signature(
         'it, so both need regenerating: run ppt sign without --sigstore-only'
     )
     assert world.uploads == []
+
+
+OLD_SUMS: bytes = sums_text({'s.tar.gz': SDIST_BYTES})
+SIGNED_PAIR: dict[str, bytes] = {
+    's.whl': WHL_BYTES,
+    's.tar.gz': SDIST_BYTES,
+    'SHA256SUMS': BOTH_SUMS,
+    'SHA256SUMS.asc': asc_of(BOTH_SUMS),
+}
+
+
+def test_interrupted_sums_pair_is_regenerated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    # The new list went up, the upload stopped before its signature.
+    world, _ = install(
+        monkeypatch, {**SIGNED_PAIR, 'SHA256SUMS.asc': asc_of(OLD_SUMS)}
+    )
+    out: sign.SignOutcome = sign.sign_release(
+        release(ALL_NAMES, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'signed', out.reason
+    assert world.verified == [
+        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
+    ]
+    assert world.signed == ['SHA256SUMS']
+    assert world.uploads == [Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True)]
+    assert 'SHA256SUMS' not in out.kept
+    assert 'SHA256SUMS.asc' not in out.kept
+
+
+def test_good_sums_pair_is_kept_after_one_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch, dict(SIGNED_PAIR))
+    out: sign.SignOutcome = sign.sign_release(
+        release(ALL_NAMES, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'already signed', out.reason
+    assert world.verified == [
+        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
+    ]
+    assert world.signed == []
+    assert world.uploads == []
+    assert {'SHA256SUMS', 'SHA256SUMS.asc'} <= set(out.kept)
+
+
+ORPHAN_ABSENT: str = (
+    'SHA256SUMS is missing from the release but SHA256SUMS.asc is there, '
+    'so the pair needs regenerating: run ppt sign without --sigstore-only'
+)
+ORPHAN_STALE: str = (
+    'SHA256SUMS on the release is out of date and SHA256SUMS.asc signs it, '
+    'so both need regenerating: run ppt sign without --sigstore-only'
+)
+ORPHAN_REPLACE: str = (
+    '--replace-assets would replace SHA256SUMS but not SHA256SUMS.asc, '
+    'which signs it, so the pair needs regenerating: run ppt sign without '
+    '--sigstore-only'
+)
+
+
+@pytest.mark.parametrize(
+    ('names', 'assets', 'replace', 'reason'),
+    [
+        (
+            [n for n in ALL_NAMES if n != 'SHA256SUMS'],
+            {'s.whl': WHL_BYTES, 's.tar.gz': SDIST_BYTES},
+            False,
+            ORPHAN_ABSENT,
+        ),
+        (
+            ALL_NAMES,
+            {**SIGNED_PAIR, 'SHA256SUMS': OLD_SUMS},
+            False,
+            ORPHAN_STALE,
+        ),
+        (ALL_NAMES, dict(SIGNED_PAIR), True, ORPHAN_REPLACE),
+    ],
+    ids=['list absent', 'stale list', 'replace assets'],
+)
+def test_sigstore_only_never_orphans_the_sums_signature(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+    names: list[str],
+    assets: dict[str, bytes],
+    replace: bool,
+    reason: str,
+) -> None:
+    world, _ = install(monkeypatch, assets)
+    options.gpg = False
+    options.replace_assets = replace
+    out: sign.SignOutcome = sign.sign_release(
+        release(names, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'failed'
+    assert out.reason == reason
+    assert 'SHA256SUMS' not in world.uploaded
+    assert world.uploads == []
+
+
+@pytest.mark.parametrize(
+    'listing',
+    [
+        b'\xff\xfe not utf-8\n',
+        b'not a sums line\n' + BOTH_SUMS,
+        sums_text({'s.tar.gz': SDIST_BYTES, 's.whl': WHL_BYTES}),
+    ],
+    ids=['not utf-8', 'malformed line', 'reordered'],
+)
+def test_sums_list_not_byte_identical_regenerates_the_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+    listing: bytes,
+) -> None:
+    world, _ = install(
+        monkeypatch,
+        {
+            **SIGNED_PAIR,
+            'SHA256SUMS': listing,
+            'SHA256SUMS.asc': asc_of(listing),
+        },
+    )
+    out: sign.SignOutcome = sign.sign_release(
+        release(ALL_NAMES, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'signed', out.reason
+    assert world.signed == ['SHA256SUMS']
+    assert world.uploads == [Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True)]
+    # The list differs, so its signature is not even looked at.
+    assert world.verified == []
+
+
+def test_all_survives_a_sums_list_that_is_not_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    listing: bytes = b'\xff\xfe not utf-8\n'
+    world, _ = install(
+        monkeypatch,
+        {**SIGNED_PAIR, 'SHA256SUMS': listing, 'SHA256SUMS.asc': b'old'},
+    )
+    unsigned: list[str] = [n for n in ALL_NAMES if n != 's.whl.asc']
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0': files})
+    )
+    monkeypatch.setattr(
+        github,
+        'releases',
+        lambda repo: [release(unsigned, body=sign.FOOTER_MARKER)],
+    )
+    code: int = sign.main(['--all', '--package', 's', '--sigstore-browser'])
+    assert code == 0, capsys.readouterr()
+    assert 'v1.0: signed' in capsys.readouterr().out
+    assert Upload(['SHA256SUMS', 'SHA256SUMS.asc'], True) in world.uploads
 
 
 def test_ci_late_wheel_regenerates_the_sums_pair(

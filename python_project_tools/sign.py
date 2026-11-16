@@ -258,20 +258,85 @@ def _needed(name: str, present: set[str], options: SignOptions) -> bool:
     return options.replace_assets or name not in present
 
 
-def _sums_match(
+SUMS_SIGNATURE: str = f'{SUMS_NAME}.asc'
+RERUN_WITH_GPG: str = 'run ppt sign without --sigstore-only'
+ORPHAN_ABSENT: str = (
+    f'{SUMS_NAME} is missing from the release but {SUMS_SIGNATURE} is '
+    f'there, so the pair needs regenerating: {RERUN_WITH_GPG}'
+)
+ORPHAN_STALE: str = (
+    f'{SUMS_NAME} on the release is out of date and {SUMS_SIGNATURE} signs '
+    f'it, so both need regenerating: {RERUN_WITH_GPG}'
+)
+ORPHAN_REPLACE: str = (
+    f'--replace-assets would replace {SUMS_NAME} but not {SUMS_SIGNATURE}, '
+    f'which signs it, so the pair needs regenerating: {RERUN_WITH_GPG}'
+)
+
+
+def _fetch_sums(
+    assets: dict[str, github.Asset], workdir: pathlib.Path
+) -> pathlib.Path:
+    """Download SHA256SUMS from the release."""
+    return github.download_asset(assets[SUMS_NAME], workdir / EXISTING_DIR)
+
+
+def _sums_identical(
     listing: pathlib.Path, dists: list[pathlib.Path], options: SignOptions
 ) -> bool:
-    """Whether ``listing`` has the entries write_sha256sums would write."""
-    entries: dict[str, str] = {p.name: common.sha256_of(p) for p in dists}
-    comments: dict[str, str] = {
-        p.name: options.rebuilt[p.name]
-        for p in dists
-        if p.name in options.rebuilt
-    }
-    return (
-        signing.parse_sha256sums(listing) == entries
-        and signing.sha256sums_comments(listing) == comments
+    """Whether ``listing`` has the bytes this run would write.
+
+    ppt is the only writer of the list, so any other bytes (other files,
+    digests, comments or order, a list that is not UTF-8 or has malformed
+    lines) mean the list is regenerated. Nothing is parsed, so such a list
+    never raises.
+    """
+    expected: bytes = signing.sha256sums_bytes(dists, options.rebuilt)
+    return listing.read_bytes() == expected
+
+
+def _sums_signed(
+    listing: pathlib.Path,
+    assets: dict[str, github.Asset],
+    workdir: pathlib.Path,
+    options: SignOptions,
+) -> bool:
+    """Whether SHA256SUMS.asc on the release signs ``listing``.
+
+    An upload stopped between the two files leaves a new list with the old
+    signature, which this catches.
+    """
+    signature: pathlib.Path = github.download_asset(
+        assets[SUMS_SIGNATURE], workdir / EXISTING_DIR
     )
+    return signing.gpg_verify_key(listing, signature, options.gpg_key)
+
+
+def _sums_unsigned_current(
+    assets: dict[str, github.Asset],
+    dists: list[pathlib.Path],
+    workdir: pathlib.Path,
+    options: SignOptions,
+) -> bool:
+    """``_sums_current`` without GPG: keep the list or regenerate it alone.
+
+    With SHA256SUMS.asc on the release any new list would orphan that
+    signature, so every case that would write the list raises
+    SigningError instead, before anything is uploaded.
+    """
+    if SUMS_SIGNATURE not in assets:
+        return (
+            not options.replace_assets
+            and SUMS_NAME in assets
+            and _sums_identical(_fetch_sums(assets, workdir), dists, options)
+        )
+    if options.replace_assets:
+        raise signing.SigningError(ORPHAN_REPLACE)
+    if SUMS_NAME not in assets:
+        raise signing.SigningError(ORPHAN_ABSENT)
+    if not _sums_identical(_fetch_sums(assets, workdir), dists, options):
+        raise signing.SigningError(ORPHAN_STALE)
+    return True
 
 
 def _sums_current(
@@ -282,30 +347,24 @@ def _sums_current(
 ) -> bool:
     """Whether the SHA256SUMS pair on the release can stay as it is.
 
-    The list and its signature are a pair: when either is missing, or the
-    list names other files, digests or comments than these dists get (a
-    late wheel, a partial first run), both are regenerated, so the uploaded
-    signature matches the uploaded list. Raises SigningError when the list
-    is out of date but GPG is off, which would orphan its signature.
+    The list and its signature are a pair: when either is missing, when
+    the list differs from the one these dists get (a late wheel, a partial
+    first run) or when the signature does not sign the list (an upload
+    stopped between the two), both are regenerated, so the uploaded
+    signature matches the uploaded list. Without GPG see
+    ``_sums_unsigned_current``.
     """
     assets: dict[str, github.Asset] = {a.name: a for a in release.assets}
-    signature: str = f'{SUMS_NAME}.asc'
-    if options.replace_assets or SUMS_NAME not in assets:
+    if not options.gpg:
+        return _sums_unsigned_current(assets, dists, workdir, options)
+    if options.replace_assets:
         return False
-    if options.gpg and signature not in assets:
+    if SUMS_NAME not in assets or SUMS_SIGNATURE not in assets:
         return False
-    listing: pathlib.Path = github.download_asset(
-        assets[SUMS_NAME], workdir / EXISTING_DIR
-    )
-    if _sums_match(listing, dists, options):
-        return True
-    if not options.gpg and signature in assets:
-        raise signing.SigningError(
-            f'{SUMS_NAME} on the release is out of date and {signature} '
-            'signs it, so both need regenerating: run ppt sign without '
-            '--sigstore-only'
-        )
-    return False
+    listing: pathlib.Path = _fetch_sums(assets, workdir)
+    if not _sums_identical(listing, dists, options):
+        return False
+    return _sums_signed(listing, assets, workdir, options)
 
 
 def _make_signatures(
@@ -371,7 +430,7 @@ def _split_signatures(
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """Produced files to upload plainly and with clobber, plus kept names."""
     new: list[pathlib.Path] = [p for p in produced if p.name not in present]
-    pair: set[str] = {SUMS_NAME, f'{SUMS_NAME}.asc'}
+    pair: set[str] = {SUMS_NAME, SUMS_SIGNATURE}
     clobber: list[pathlib.Path] = [
         p
         for p in produced

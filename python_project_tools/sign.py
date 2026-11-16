@@ -272,6 +272,10 @@ ORPHAN_REPLACE: str = (
     f'--replace-assets would replace {SUMS_NAME} but not {SUMS_SIGNATURE}, '
     f'which signs it, so the pair needs regenerating: {RERUN_WITH_GPG}'
 )
+ORPHAN_UNSIGNED: str = (
+    f'{SUMS_SIGNATURE} does not sign {SUMS_NAME} on the release, so the '
+    f'pair needs regenerating: {RERUN_WITH_GPG}'
+)
 
 
 def _fetch_sums(
@@ -322,7 +326,9 @@ def _sums_unsigned_current(
 
     With SHA256SUMS.asc on the release any new list would orphan that
     signature, so every case that would write the list raises
-    SigningError instead, before anything is uploaded.
+    SigningError instead, before anything is uploaded. A list that stays
+    must still be the one the signature signs, which needs only the
+    public key.
     """
     if SUMS_SIGNATURE not in assets:
         return (
@@ -334,8 +340,11 @@ def _sums_unsigned_current(
         raise signing.SigningError(ORPHAN_REPLACE)
     if SUMS_NAME not in assets:
         raise signing.SigningError(ORPHAN_ABSENT)
-    if not _sums_identical(_fetch_sums(assets, workdir), dists, options):
+    listing: pathlib.Path = _fetch_sums(assets, workdir)
+    if not _sums_identical(listing, dists, options):
         raise signing.SigningError(ORPHAN_STALE)
+    if not _sums_signed(listing, assets, workdir, options):
+        raise signing.SigningError(ORPHAN_UNSIGNED)
     return True
 
 

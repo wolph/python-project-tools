@@ -1599,6 +1599,10 @@ ORPHAN_REPLACE: str = (
     'which signs it, so the pair needs regenerating: run ppt sign without '
     '--sigstore-only'
 )
+ORPHAN_UNSIGNED: str = (
+    'SHA256SUMS.asc does not sign SHA256SUMS on the release, so the pair '
+    'needs regenerating: run ppt sign without --sigstore-only'
+)
 
 
 @pytest.mark.parametrize(
@@ -1617,8 +1621,14 @@ ORPHAN_REPLACE: str = (
             ORPHAN_STALE,
         ),
         (ALL_NAMES, dict(SIGNED_PAIR), True, ORPHAN_REPLACE),
+        (
+            ALL_NAMES,
+            {**SIGNED_PAIR, 'SHA256SUMS.asc': asc_of(OLD_SUMS)},
+            False,
+            ORPHAN_UNSIGNED,
+        ),
     ],
-    ids=['list absent', 'stale list', 'replace assets'],
+    ids=['list absent', 'stale list', 'replace assets', 'asc of old list'],
 )
 def test_sigstore_only_never_orphans_the_sums_signature(
     monkeypatch: pytest.MonkeyPatch,
@@ -1639,6 +1649,25 @@ def test_sigstore_only_never_orphans_the_sums_signature(
     assert out.status == 'failed'
     assert out.reason == reason
     assert 'SHA256SUMS' not in world.uploaded
+    assert world.uploads == []
+
+
+def test_sigstore_only_keeps_a_pair_whose_signature_signs_the_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    files: list[pypi.PypiFile],
+    options: sign.SignOptions,
+) -> None:
+    world, _ = install(monkeypatch, dict(SIGNED_PAIR))
+    options.gpg = False
+    out: sign.SignOutcome = sign.sign_release(
+        release(ALL_NAMES, body=sign.FOOTER_MARKER), files, tmp_path, options
+    )
+    assert out.status == 'already signed', out.reason
+    # Only the public key is needed to check the pair.
+    assert world.verified == [
+        ('SHA256SUMS', 'SHA256SUMS.asc', signing.DEFAULT_GPG_KEY)
+    ]
     assert world.uploads == []
 
 

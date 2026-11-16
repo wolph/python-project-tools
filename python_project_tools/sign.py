@@ -839,6 +839,30 @@ def _version_for(tag: str, project: pypi.Project) -> str | None:
     return None
 
 
+def _with_lagging_version(
+    project: pypi.Project, package: str, tag: str
+) -> pypi.Project:
+    """The project with the version of ``tag``, even when its JSON lags.
+
+    Right after an upload the project document can still miss the new
+    version while the document of the version has its files, so a tag
+    that matches no listed version is looked up there as well. A 404 there
+    leaves the project as it is, any other failure raises
+    common.FetchError.
+    """
+    if _version_for(tag, project) is not None:
+        return project
+    found: tuple[str, list[pypi.PypiFile]] | None = pypi.version_files(
+        package, versions.normalise(tag)
+    )
+    if found is None:
+        return project
+    version, files = found
+    return dataclasses.replace(
+        project, releases={**project.releases, version: files}
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         prog='ppt sign',
@@ -979,6 +1003,8 @@ def main(argv: list[str]) -> int:
         targets: list[github.Release] = _resolve_targets(
             args, options, project
         )
+        if not args.all:
+            project = _with_lagging_version(project, package, args.tag)
         if options.sigstore == 'ci' and targets:
             options.ci_workflow = ci_bundles.check_workflow(repo)
     except NoWorkflowError as error:

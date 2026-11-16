@@ -15,6 +15,7 @@ import typing
 from python_project_tools import common
 
 PYPI_JSON_URL: str = 'https://pypi.org/pypi/{package}/json'
+PYPI_VERSION_JSON_URL: str = 'https://pypi.org/pypi/{package}/{version}/json'
 GITHUB_REPO: re.Pattern[str] = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)')
 
 # Projects whose PyPI metadata does not point at the right repository.
@@ -126,6 +127,33 @@ def project(package: str) -> Project:
         releases=releases,
         repo=repo_from(info, package),
     )
+
+
+def version_files(
+    package: str, version: str
+) -> tuple[str, list[PypiFile]] | None:
+    """The version string and files of one release, from its own document.
+
+    PyPI serves the project document from a cache that can lag behind an
+    upload of a few seconds ago, while the document of the version itself
+    already lists its files. Returns None when PyPI says 404 and raises
+    common.FetchError on any other failure.
+    """
+    data: object | None = common.fetch_json(
+        PYPI_VERSION_JSON_URL.format(package=package, version=version)
+    )
+    if data is None:
+        return None
+    document: dict[str, object] = typing.cast('dict[str, object]', data)
+    info: dict[str, object] = typing.cast(
+        'dict[str, object]', document['info']
+    )
+    raw_files: list[dict[str, object]] = typing.cast(
+        'list[dict[str, object]]', document.get('urls') or []
+    )
+    return str(info.get('version') or version), [
+        _parse_file(raw) for raw in raw_files
+    ]
 
 
 def download(file: PypiFile, into: pathlib.Path) -> pathlib.Path:

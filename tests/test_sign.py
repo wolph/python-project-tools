@@ -642,6 +642,120 @@ def test_main_exits_one_when_a_version_fails(
     assert 'bad hash' in printed
 
 
+def raw_file(name: str, data: bytes) -> dict[str, object]:
+    """One file entry of a PyPI JSON document."""
+    import hashlib
+
+    return {
+        'filename': name,
+        'url': f'https://files.example/{name}',
+        'digests': {'sha256': hashlib.sha256(data).hexdigest()},
+        'size': len(data),
+        'yanked': False,
+        'upload_time_iso_8601': '2020-01-01T00:00:00Z',
+        'packagetype': 'sdist' if name.endswith('.gz') else 'bdist_wheel',
+    }
+
+
+PROJECT_URL: str = 'https://pypi.org/pypi/s/json'
+VERSION_URL: str = 'https://pypi.org/pypi/s/1.0/json'
+# The project document from the CDN cache, which does not list 1.0 yet.
+LAGGING_PROJECT: dict[str, object] = {
+    'info': {
+        'name': 's',
+        'version': '0.9',
+        'project_urls': {'Source': 'https://github.com/o/r'},
+    },
+    'releases': {'0.9': [raw_file('s-0.9.tar.gz', b'old')]},
+}
+VERSION_DOC: dict[str, object] = {
+    'info': {'name': 's', 'version': '1.0'},
+    'urls': [raw_file('s.whl', WHL_BYTES), raw_file('s.tar.gz', SDIST_BYTES)],
+}
+
+
+def fake_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    documents: dict[str, object | Exception | None],
+) -> list[str]:
+    """Serve ``documents`` by url as common.fetch_json, recording urls."""
+    asked: list[str] = []
+
+    def fetch(url: str) -> object | None:
+        asked.append(url)
+        found: object | Exception | None = documents[url]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+    monkeypatch.setattr(common, 'fetch_json', fetch)
+    return asked
+
+
+def test_main_signs_a_tag_the_project_json_does_not_list_yet(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    asked: list[str] = fake_fetch(
+        monkeypatch, {PROJECT_URL: LAGGING_PROJECT, VERSION_URL: VERSION_DOC}
+    )
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    code: int = sign.main(['v1.0', '--package', 's', '--sigstore-browser'])
+    assert code == 0, capsys.readouterr()
+    assert asked == [PROJECT_URL, VERSION_URL]
+    assert 'v1.0: signed (uploaded 8, kept 0, conflicts 0)' in (
+        capsys.readouterr().out
+    )
+    assert sorted(world.uploaded) == sorted(ALL_NAMES)
+
+
+def test_main_fails_a_tag_neither_json_knows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    fake_fetch(monkeypatch, {PROJECT_URL: LAGGING_PROJECT, VERSION_URL: None})
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    code: int = sign.main(['v1.0', '--package', 's', '--sigstore-browser'])
+    assert code == 1
+    assert (
+        'v1.0: failed (uploaded 0, kept 0, conflicts 0): v1.0 matches no '
+        'PyPI version'
+    ) in capsys.readouterr().out
+    assert world.uploads == []
+
+
+def test_main_fails_with_the_error_of_the_version_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world, _ = install(monkeypatch)
+    outage: common.FetchError = common.FetchError(
+        f'{VERSION_URL}: HTTP Error 503: Service Unavailable'
+    )
+    fake_fetch(
+        monkeypatch, {PROJECT_URL: LAGGING_PROJECT, VERSION_URL: outage}
+    )
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    code: int = sign.main(['v1.0', '--package', 's', '--sigstore-browser'])
+    assert code == 2
+    assert capsys.readouterr().err == f'{outage}\n'
+    assert world.uploads == []
+
+
+def test_all_never_asks_for_a_version_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install(monkeypatch)
+    asked: list[str] = fake_fetch(monkeypatch, {PROJECT_URL: LAGGING_PROJECT})
+    monkeypatch.setattr(github, 'releases', lambda repo: [release([])])
+    code: int = sign.main(['--all', '--package', 's', '--sigstore-browser'])
+    assert code == 0, capsys.readouterr()
+    assert asked == [PROJECT_URL]
+
+
 def test_main_refuses_without_package_or_repo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

@@ -158,3 +158,58 @@ def test_download_creates_missing_directory(
     good: pypi.PypiFile = _file(sha256=hashlib.sha256(body).hexdigest())
     result: pathlib.Path = pypi.download(good, tmp_path / 'a' / 'b')
     assert result.read_bytes() == body
+
+
+VERSION_JSON: dict[str, object] = {
+    'info': {'name': 'spam-eggs', 'version': '1.2'},
+    'urls': [
+        {
+            'filename': 'spam_eggs-1.2.tar.gz',
+            'url': 'https://files.example/spam_eggs-1.2.tar.gz',
+            'digests': {'sha256': 'c' * 64},
+            'size': 30,
+            'yanked': False,
+            'upload_time_iso_8601': '2024-03-02T03:04:05.123456Z',
+            'packagetype': 'sdist',
+        }
+    ],
+}
+
+
+def test_version_files_reads_the_version_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls: list[str] = []
+
+    def fetch(url: str) -> object | None:
+        urls.append(url)
+        return VERSION_JSON
+
+    monkeypatch.setattr(common, 'fetch_json', fetch)
+    found: tuple[str, list[pypi.PypiFile]] | None = pypi.version_files(
+        'spam-eggs', '1.2'
+    )
+    assert urls == ['https://pypi.org/pypi/spam-eggs/1.2/json']
+    assert found is not None
+    version, files = found
+    assert version == '1.2'
+    assert [f.filename for f in files] == ['spam_eggs-1.2.tar.gz']
+    assert files[0].sha256 == 'c' * 64
+
+
+def test_version_files_is_none_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, 'fetch_json', lambda url: None)
+    assert pypi.version_files('spam-eggs', '9.9') is None
+
+
+def test_version_files_raises_other_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fetch(url: str) -> object | None:
+        raise common.FetchError(f'{url}: HTTP Error 503')
+
+    monkeypatch.setattr(common, 'fetch_json', fetch)
+    with pytest.raises(common.FetchError, match='HTTP Error 503'):
+        pypi.version_files('spam-eggs', '1.2')

@@ -103,6 +103,29 @@ def test_gh_token_only_on_gh_steps() -> None:
         assert step['env']['GH_TOKEN'] == '${{ github.token }}'
 
 
+def test_zizmor_pedantic_clean() -> None:
+    """mt940 runs zizmor --pedantic over its workflows, sign.yml included."""
+    zizmor: str | None = shutil.which('zizmor')
+    if zizmor is None:
+        pytest.skip('zizmor is not installed')
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        [zizmor, '--pedantic', '--offline', str(TEMPLATE)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_job_is_named_and_permissions_explained() -> None:
+    job: dict[str, Any] = DOC['jobs']['sign']
+    assert job['name']
+    lines: list[str] = TEXT.splitlines()
+    for permission in ('contents: write', 'id-token: write'):
+        line: str = next(x for x in lines if x.strip().startswith(permission))
+        assert '#' in line, f'{permission} needs a comment'
+
+
 def test_actionlint_clean() -> None:
     actionlint: str | None = shutil.which('actionlint')
     if actionlint is None:

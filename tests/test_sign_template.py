@@ -52,6 +52,11 @@ def test_template_triggers_and_permissions() -> None:
     assert inputs['tag']['required'] is True
     assert inputs['package']['required'] is True
     assert inputs['request_id']['required'] is False
+    assert inputs['version']['required'] is False
+    assert inputs['version']['default'] == ''
+    assert inputs['version']['type'] == 'string'
+    env: dict[str, Any] = DOC['jobs']['sign']['env']
+    assert env['PYPI_VERSION'] == '${{ inputs.version }}'
     assert DOC['permissions'] == {}
     assert DOC['jobs']['sign']['permissions'] == {
         'contents': 'write',
@@ -148,6 +153,44 @@ def test_input_validation_accepts_normal(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
+def validate(tmp_path: Path, version: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['bash', '-c', step_run('Validate inputs')],
+        cwd=tmp_path,
+        env={
+            'TAG': 'v1.0',
+            'PACKAGE': 'pkg',
+            'PYPI_VERSION': version,
+            'PATH': '/usr/bin:/bin',
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    'version', ['1;touch pwned', '../1.0', '1.0/json', 'x1.0', '1.0 2.0']
+)
+def test_input_validation_rejects_a_bad_version(
+    tmp_path: Path, version: str
+) -> None:
+    result: subprocess.CompletedProcess[str] = validate(tmp_path, version)
+    assert result.returncode == 1
+    assert result.stderr == 'Invalid version input\n'
+    assert not (tmp_path / 'pwned').exists()
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize('version', ['', '1.0.post1', '2!1.0rc1+local'])
+def test_input_validation_accepts_a_version(
+    tmp_path: Path, version: str
+) -> None:
+    result: subprocess.CompletedProcess[str] = validate(tmp_path, version)
+    assert result.returncode == 0, result.stderr
+
+
 FILE_A: bytes = b'wheel bytes'
 FILE_B: bytes = b'sdist bytes'
 
@@ -173,7 +216,14 @@ class Plan:
         assets: list[str],
         urls: list[dict[str, Any]] | None = None,
         files_prefix: str | None = 'file://',
+        version: str | None = None,
+        served: str = '',
     ) -> subprocess.CompletedProcess[str]:
+        """Run the plan script against a fake PyPI.
+
+        With ``served`` the JSON is only at ``<package>/<served>/json``
+        under a URL template, so the version the plan asks for shows.
+        """
         if urls is None:
             urls = [
                 {
@@ -184,6 +234,13 @@ class Plan:
                 for name in ('a.whl', 'b.tar.gz')
             ]
         pypi: Path = self.tmp / 'pypi.json'
+        json_url: str = pypi.as_uri()
+        if served:
+            pypi = self.tmp / 'pypi' / 'pkg' / served / 'json'
+            pypi.parent.mkdir(parents=True)
+            json_url = (
+                self.tmp / 'pypi'
+            ).as_uri() + '/{package}/{version}/json'
         pypi.write_text(json.dumps({'urls': urls}))
         assets_json: Path = self.tmp / 'assets.json'
         assets_json.write_text(
@@ -192,7 +249,7 @@ class Plan:
         env: dict[str, str] = {
             'TAG': 'v1.0',
             'PACKAGE': 'pkg',
-            'PYPI_JSON_URL': pypi.as_uri(),
+            'PYPI_JSON_URL': json_url,
             'ASSETS_JSON': str(assets_json),
             'EXISTING_DIR': str(self.existing),
             'DIST_DIR': str(self.tmp / 'dist'),
@@ -200,6 +257,8 @@ class Plan:
         }
         if files_prefix is not None:
             env['PYPI_FILES_PREFIX'] = files_prefix
+        if version is not None:
+            env['PYPI_VERSION'] = version
         return subprocess.run(
             [shutil.which('python3') or sys.executable, '-I', '-'],
             input=plan_script(),
@@ -226,6 +285,32 @@ def test_plan_downloads_and_lists(tmp_path: Path) -> None:
     assert set(outputs['to_sign'].split()) == {'a.whl', 'b.tar.gz'}
     assert set(outputs['to_upload'].split()) == {'a.whl', 'b.tar.gz'}
     assert (tmp_path / 'dist' / 'a.whl').read_bytes() == FILE_A
+
+
+@pytest.mark.parametrize(
+    ('version', 'served'),
+    [(None, '1.0'), ('', '1.0'), ('1.0.0', '1.0.0')],
+    ids=['no input', 'empty input', 'version input'],
+)
+def test_plan_asks_pypi_for_the_version_input(
+    tmp_path: Path, version: str | None, served: str
+) -> None:
+    plan: Plan = Plan(tmp_path)
+    result: subprocess.CompletedProcess[str] = plan.run(
+        [], version=version, served=served
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(plan.outputs()['to_sign'].split()) == {'a.whl', 'b.tar.gz'}
+
+
+def test_plan_does_not_strip_the_tag_when_given_a_version(
+    tmp_path: Path,
+) -> None:
+    plan: Plan = Plan(tmp_path)
+    result: subprocess.CompletedProcess[str] = plan.run(
+        [], version='1.0.0', served='1.0'
+    )
+    assert result.returncode != 0
 
 
 def test_plan_skips_bundled_and_present(tmp_path: Path) -> None:

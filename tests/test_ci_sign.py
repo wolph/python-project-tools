@@ -69,11 +69,12 @@ def test_dispatch_finds_own_run_among_others(
         }
     )
     monkeypatch.setattr(common, 'run', rec)
-    run: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+    run: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
     assert run == ci_sign.Run(101, 'https://example.com/runs/101')
     assert rec.calls[0] == [
         'gh', 'workflow', 'run', 'sign.yml', '-R', REPO, '--ref', 'master',
-        '-f', 'tag=v1.0', '-f', 'package=spam', '-f', f'request_id={OURS}',
+        '-f', 'tag=v1.0', '-f', 'package=spam', '-f', 'version=1.0',
+        '-f', f'request_id={OURS}',
     ]  # fmt: skip
 
 
@@ -89,8 +90,12 @@ def test_two_dispatches_in_flight_find_own_runs(
         }
     )
     monkeypatch.setattr(common, 'run', rec)
-    first: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
-    second: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+    first: ci_sign.Run = ci_sign.dispatch(
+        REPO, 'v1.0', 'spam', 'master', '1.0'
+    )
+    second: ci_sign.Run = ci_sign.dispatch(
+        REPO, 'v1.0', 'spam', 'master', '1.0'
+    )
     assert first.id == 101
     assert second.id == 100
 
@@ -108,7 +113,7 @@ def test_dispatch_ignores_prefix_and_substring(
     )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match=r'sign\.yml'):
-        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
 
 
 def test_dispatch_polls_until_run_appears(
@@ -128,7 +133,7 @@ def test_dispatch_polls_until_run_appears(
         hooks={LIST: hook},
     )
     monkeypatch.setattr(common, 'run', rec)
-    run: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+    run: ci_sign.Run = ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
     assert run.id == 100
     lists: list[list[str]] = [c for c in rec.calls if c[2:3] == ['list']]
     assert len(lists) == 2
@@ -146,7 +151,7 @@ def test_dispatch_gives_up(
     )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match=r'sign\.yml') as info:
-        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
     assert clock.now >= ci_sign.FIND_SECONDS
     assert str(info.value) == (
         f'sign.yml run for request_id {OURS} did not appear within 120 s. '
@@ -167,7 +172,7 @@ def test_dispatch_list_failure_raises_at_once(
     )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match='HTTP 502') as info:
-        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
     assert OURS in str(info.value)
     assert 'already dispatched' in str(info.value)
     assert clock.now == 0
@@ -185,7 +190,7 @@ def test_dispatch_list_invalid_json_raises(
     )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match='invalid JSON') as info:
-        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
     assert OURS in str(info.value)
     assert clock.now == 0
 
@@ -198,7 +203,29 @@ def test_dispatch_failure_raises(
     )
     monkeypatch.setattr(common, 'run', rec)
     with pytest.raises(signing.SigningError, match='no such workflow'):
-        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master')
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
+
+
+def test_dispatch_to_an_old_sign_yml_says_to_update_it(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    stderr: str = (
+        'could not create workflow dispatch event: HTTP 422: Unexpected '
+        'inputs provided: ["version"] (https://api.github.com/repos/'
+        f'{REPO}/actions/workflows/7/dispatches)\n'
+    )
+    rec: Recorder = Recorder(
+        {'gh workflow run': completed(returncode=1, stderr=stderr)}
+    )
+    monkeypatch.setattr(common, 'run', rec)
+    with pytest.raises(signing.SigningError) as info:
+        ci_sign.dispatch(REPO, 'v1.0', 'spam', 'master', '1.0')
+    assert str(info.value) == (
+        f'the sign.yml of {REPO} is older than templates/sign.yml of '
+        'python-project-tools and must be updated: copy templates/sign.yml '
+        'to .github/workflows/sign.yml on master. gh said: ' + stderr.strip()
+    )
+    assert len(rec.calls) == 1
 
 
 def test_watch_failure_names_url(monkeypatch: pytest.MonkeyPatch) -> None:

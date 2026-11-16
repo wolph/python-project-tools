@@ -121,20 +121,42 @@ def _find_run(repo: str, request_id: str) -> Run | None:
     return None
 
 
-def dispatch(repo: str, tag: str, package: str, branch: str) -> Run:
-    """Start sign.yml for a tag and return the run it created."""
+# What GitHub answers a dispatch with an input the workflow does not have.
+UNEXPECTED_INPUTS: str = 'Unexpected inputs provided'
+
+
+def _dispatch_error(repo: str, branch: str, stderr: str) -> SigningError:
+    """Why ``gh workflow run`` failed, naming an outdated sign.yml."""
+    if UNEXPECTED_INPUTS in stderr:
+        return SigningError(
+            f'the {WORKFLOW} of {repo} is older than templates/sign.yml of '
+            f'python-project-tools and must be updated: copy '
+            f'templates/sign.yml to {WORKFLOW_PATH} on {branch}. gh said: '
+            f'{stderr}'
+        )
+    return SigningError(f'cannot start {WORKFLOW} in {repo}: {stderr}')
+
+
+def dispatch(
+    repo: str, tag: str, package: str, branch: str, version: str
+) -> Run:
+    """Start sign.yml for a tag and return the run it created.
+
+    ``version`` is the PyPI version of the tag, '' to let sign.yml take
+    the tag without its leading v. A sign.yml without that input makes gh
+    fail, which raises SigningError saying to update it.
+    """
     request_id: str = uuid.uuid4().hex
     done: subprocess.CompletedProcess[str] = common.run(
         [
             'gh', 'workflow', 'run', WORKFLOW, '-R', repo, '--ref', branch,
             '-f', f'tag={tag}', '-f', f'package={package}',
+            '-f', f'version={version}',
             '-f', f'request_id={request_id}',
         ]
     )  # fmt: skip
     if done.returncode != 0:
-        raise SigningError(
-            f'cannot start {WORKFLOW} in {repo}: {(done.stderr or "").strip()}'
-        )
+        raise _dispatch_error(repo, branch, (done.stderr or '').strip())
     deadline: float = time.monotonic() + FIND_SECONDS
     while True:
         run: Run | None = _find_run(repo, request_id)

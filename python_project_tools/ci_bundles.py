@@ -143,6 +143,8 @@ class Target:
     dists: list[pathlib.Path]
     rebuilt: bool
     conflicts: list[str]
+    # The PyPI version of the dists, '' when the caller does not know it.
+    version: str = ''
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,7 +195,7 @@ def ensure(
             + ', '.join(target.conflicts)
         )
     run: ci_sign.Run = ci_sign.dispatch(
-        repo, release.tag, package, workflow.branch
+        repo, release.tag, package, workflow.branch, target.version
     )
     ci_sign.watch(repo, run)
     fresh: github.Release = _reread(repo, release.tag)

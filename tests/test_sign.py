@@ -937,7 +937,7 @@ class Ci:
         self.current: dict[str, github.Release] = {r.tag: r for r in releases}
         self.verdicts: dict[str, identities.Identity | None] = verdicts or {}
         self.since: dt.date | None = since
-        self.dispatches: list[tuple[str, str, str, str]] = []
+        self.dispatches: list[tuple[str, str, str, str, str]] = []
         self.watches: list[ci_sign.Run] = []
         self.checked: list[list[str]] = []
         self.since_calls: int = 0
@@ -959,9 +959,9 @@ class Ci:
         return self.since
 
     def dispatch(
-        self, repo: str, tag: str, package: str, branch: str
+        self, repo: str, tag: str, package: str, branch: str, version: str
     ) -> ci_sign.Run:
-        self.dispatches.append((repo, tag, package, branch))
+        self.dispatches.append((repo, tag, package, branch, version))
         self.world.events.append(f'dispatch {tag}')
         return ci_sign.Run(7, RUN_URL)
 
@@ -1050,7 +1050,7 @@ def test_ci_missing_dispatches_then_signs(
         target, files, tmp_path, ci_options
     )
     assert out.status == 'signed', out.reason
-    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master')]
+    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master', '')]
     assert ci.watches == [ci_sign.Run(7, RUN_URL)]
     # Only the bundles that were missing are checked after the run.
     assert ci.checked == [['s.whl', 's.tar.gz']]
@@ -1730,6 +1730,23 @@ def test_ci_late_wheel_regenerates_the_sums_pair(
     ]
 
 
+def test_ci_dispatch_carries_the_matched_pypi_version(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[pypi.PypiFile],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The tag strips to 1.0-post1, PyPI knows the version as 1.0.post1.
+    world, _ = install(monkeypatch)
+    target: github.Release = release([], tag='v1.0-post1', created_at=AFTER)
+    ci: Ci = Ci(monkeypatch, world, [target])
+    monkeypatch.setattr(
+        pypi, 'project', lambda package: project_with({'1.0.post1': files})
+    )
+    code: int = sign.main(['v1.0-post1', '--package', 's', '--repo', 'o/r'])
+    assert code == 0, capsys.readouterr()
+    assert ci.dispatches == [('o/r', 'v1.0-post1', 's', 'master', '1.0.post1')]
+
+
 def test_ci_partial_bundles_dispatch_once_for_the_missing_one(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -1743,7 +1760,7 @@ def test_ci_partial_bundles_dispatch_once_for_the_missing_one(
         target, files, tmp_path, ci_options
     )
     assert out.status == 'signed', out.reason
-    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master')]
+    assert ci.dispatches == [('o/r', 'v1.0', 's', 'master', '')]
     assert ci.checked == [['s.whl'], ['s.tar.gz']]
     assert 's.whl.sigstore.json' in out.kept
     assert 's.tar.gz.sigstore.json' in out.uploaded

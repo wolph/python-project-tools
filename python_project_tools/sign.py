@@ -665,14 +665,18 @@ def sign_release(
     files: list[pypi.PypiFile] | list[pathlib.Path],
     workdir: pathlib.Path,
     options: SignOptions,
+    version: str = '',
 ) -> SignOutcome:
     """Sign one release, never raising for the handled failure kinds.
 
     Works in ``workdir / release.tag`` and removes it afterwards.
+    ``version`` is the PyPI version of ``files``, which sign.yml fetches
+    the files of, '' when unknown (sign.yml then takes the tag without
+    its leading v).
     """
     outcome: SignOutcome = SignOutcome(
         tag=release.tag,
-        version=versions.normalise(release.tag),
+        version=version or versions.normalise(release.tag),
         uploaded=[],
         kept=[],
         conflicts=[],
@@ -690,7 +694,7 @@ def sign_release(
     try:
         release_dir.mkdir(parents=True, exist_ok=True)
         if not _sign_files(
-            release, files, release_dir, workdir, options, outcome
+            release, files, release_dir, workdir, options, outcome, version
         ):
             return outcome
     except HANDLED_ERRORS as error:
@@ -707,6 +711,7 @@ def _sign_files(
     workdir: pathlib.Path,
     options: SignOptions,
     outcome: SignOutcome,
+    version: str,
 ) -> bool:
     """The steps of ``sign_release``, False when conflicts stop it.
 
@@ -728,7 +733,7 @@ def _sign_files(
     by_workflow: bool = False
     if options.sigstore == 'ci':
         release, new, by_workflow = _take_ci_bundles(
-            release, files, dists, new, release_dir, options, outcome
+            release, files, dists, new, release_dir, options, outcome, version
         )
     present: set[str] = {a.name for a in release.assets}
     refresh: bool = not _sums_current(release, dists, release_dir, options)
@@ -759,6 +764,7 @@ def _take_ci_bundles(
     release_dir: pathlib.Path,
     options: SignOptions,
     outcome: SignOutcome,
+    version: str,
 ) -> tuple[github.Release, list[pathlib.Path], bool]:
     """Have sign.yml supply the missing bundles before anything is signed.
 
@@ -766,7 +772,8 @@ def _take_ci_bundles(
     has to upload and whether sign.yml made every bundle of the release
     (see ``ci_bundles.Settled``). The dists and bundles sign.yml added count as
     uploaded by this run, and the dists it added must match the local
-    PyPI bytes (see ``_check_ci_dists``).
+    PyPI bytes (see ``_check_ci_dists``). sign.yml fetches the files of
+    ``version`` from PyPI (see ``sign_release``).
     """
     workflow: ci_bundles.Workflow = (
         options.ci_workflow or ci_bundles.check_workflow(options.repo)
@@ -776,6 +783,7 @@ def _take_ci_bundles(
         dists=dists,
         rebuilt=_is_rebuilt(files),
         conflicts=list(outcome.conflicts),
+        version=version,
     )
     settled: ci_bundles.Settled = ci_bundles.ensure(
         target, release_dir, options.repo, options.package, workflow
@@ -932,11 +940,9 @@ def _sign_one(
             status='failed',
             reason=f'{release.tag} matches no PyPI version',
         )
-    outcome: SignOutcome = sign_release(
-        release, pypi.files_for(project, version), workdir, options
+    return sign_release(
+        release, pypi.files_for(project, version), workdir, options, version
     )
-    outcome.version = version
-    return outcome
 
 
 def _sign_all(
